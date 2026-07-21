@@ -1,0 +1,13 @@
+[project]
+name = "x-sql-marimo"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "datafusion>=54.0.0",
+    "h3ronpy>=0.22.0",
+    "marimo>=0.23.14",
+    "pyarrow>=25.0.0",
+    "xarray-sql>=0.3.2",
+]

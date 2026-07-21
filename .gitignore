@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# marimo
+__marimo__/
+.marimo.toml
+
+# Local COG/VRT/gpkg catalog cache (fetched at runtime, never committed)
+.cache/
+
+# Claude memory (per global rule: workspace-local, gitignored)
+.claude/memory/
+
+# OS
+.DS_Store
