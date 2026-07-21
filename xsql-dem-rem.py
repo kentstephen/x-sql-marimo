@@ -155,21 +155,37 @@ def _(ET, pathlib, urllib):
 
 
 @app.cell
-def _(XarrayContext, coordinates_to_cells, pa, udf):
+def _(Emrld_7, XarrayContext, apply_continuous_cmap, coordinates_to_cells, np, pa, udf):
     # xarray-sql is the point of this notebook: query the DEM raster AS a table with SQL,
     # no manual flattening. XarrayContext IS a DataFusion session with one extra trick,
     # from_dataset(): an xarray Dataset's dimension coords (lat, lon) become columns and
     # its data variables (elevation) become columns, so `SELECT lat, lon, elevation FROM
-    # dem` unravels the grid for you. We register the H3 UDF on it (inherited DataFusion
-    # method); it returns a UBIGINT (uint64) cell id, exactly what lonboard's H3HexagonLayer
-    # consumes with high_precision=True. Bigint in, bigint on the GPU, no string round-trip.
+    # dem` unravels the grid for you. We register two UDFs on it (inherited DataFusion
+    # method):
     #
-    # A factory (fresh context per stream) keeps the per-tile table names from colliding
-    # across re-runs, and keeps the UDF registration in one obvious place.
+    #   h3_latlng_to_cell(lat, lon, res) -> UBIGINT   the H3 cell id (bigint -> GPU direct)
+    #   hypsometric(value, lo, hi, reverse) -> [u8;4]  the Emrld ramp, IN SQL
+    #
+    # hypsometric is why colour never leaves arrow: the query returns an RGBA column
+    # (FixedSizeList<uint8,4>) that lonboard's get_fill_color takes directly. numpy still
+    # does the palette lookup, but INSIDE the UDF, run by the engine as part of the plan,
+    # not as a separate notebook stage. A factory (fresh context per stream) keeps the
+    # per-tile table names from colliding across re-runs.
     def _latlng_to_cell(lat, lng, res):
         return pa.array(
             coordinates_to_cells(lat.to_numpy(), lng.to_numpy(), res[0].as_py())
         )
+
+    def _hypsometric(value, lo, hi, reverse):
+        v = np.asarray(value).astype("float64")
+        lo0, hi0 = lo[0].as_py(), hi[0].as_py()
+        norm = np.clip((v - lo0) / max(hi0 - lo0, 1e-6), 0.0, 1.0)
+        if reverse[0].as_py():
+            norm = 1.0 - norm
+        rgb = apply_continuous_cmap(norm, Emrld_7, alpha=1.0)  # Nx3 uint8
+        if rgb.shape[1] == 3:
+            rgb = np.concatenate([rgb, np.full((len(rgb), 1), 255, "uint8")], axis=1)
+        return pa.FixedSizeListArray.from_arrays(pa.array(rgb.reshape(-1), pa.uint8()), 4)
 
     def make_h3_context():
         ctx = XarrayContext()
@@ -182,9 +198,18 @@ def _(XarrayContext, coordinates_to_cells, pa, udf):
                 name="h3_latlng_to_cell",
             )
         )
+        ctx.register_udf(
+            udf(
+                _hypsometric,
+                [pa.float64(), pa.float64(), pa.float64(), pa.bool_()],
+                pa.list_(pa.uint8(), 4),
+                "stable",
+                name="hypsometric",
+            )
+        )
         return ctx
 
-    print("xarray-sql context factory ready; UDF: h3_latlng_to_cell(lat, lon, res) -> UBIGINT")
+    print("xarray-sql context factory ready; UDFs: h3_latlng_to_cell, hypsometric")
     return (make_h3_context,)
 
 
@@ -412,13 +437,28 @@ async def _(
         _rhs = np.array([_s["sz"][0], _s["sxz"][0], _s["syz"][0]], dtype="float64")
         _a, _b, _c = np.linalg.lstsq(_A, _rhs, rcond=None)[0]  # robust if degenerate
 
-        # Pass 3: REM = elevation - plane, per cell, entirely in SQL.
+        # Pass 3: REM = elevation - plane, then colour, all in SQL. rem_cells subtracts the
+        # plane per cell; domain is the percentile-clamped ramp bounds over EVERY cell (one
+        # global lo/hi, so former tile edges are invisible); hypsometric maps rem -> Emrld
+        # RGBA. We emit BOTH ramp directions as columns so the Reverse toggle downstream is
+        # a live arrow-column swap, never a re-query. Colour never leaves arrow.
         h3_table = ctx.sql(
             f"""
-            SELECT hex, elevation,
-                   elevation - (({_a}) + ({_b}) * (clon - ({_mlon}))
-                                       + ({_c}) * (clat - ({_mlat}))) AS rem
-            FROM cells
+            WITH rem_cells AS (
+                SELECT hex, elevation,
+                       elevation - (({_a}) + ({_b}) * (clon - ({_mlon}))
+                                           + ({_c}) * (clat - ({_mlat}))) AS rem
+                FROM cells
+            ),
+            domain AS (
+                SELECT approx_percentile_cont(rem, 0.02) AS lo,
+                       approx_percentile_cont(rem, 0.98) AS hi
+                FROM rem_cells
+            )
+            SELECT r.hex, r.elevation, r.rem,
+                   hypsometric(r.rem, d.lo, d.hi, false) AS rgba_fwd,
+                   hypsometric(r.rem, d.lo, d.hi, true)  AS rgba_rev
+            FROM rem_cells r CROSS JOIN domain d
             """
         ).to_arrow_table()
         _slope = (_b * _b + _c * _c) ** 0.5 / 111.32  # m per degree -> m per km
@@ -429,6 +469,8 @@ async def _(
                 "hex": pa.array([], pa.uint64()),
                 "elevation": pa.array([], pa.float64()),
                 "rem": pa.array([], pa.float64()),
+                "rgba_fwd": pa.array([], pa.list_(pa.uint8(), 4)),
+                "rgba_rev": pa.array([], pa.list_(pa.uint8(), 4)),
             }
         )
         print("no DEM pixels for this AOI")
@@ -445,47 +487,27 @@ def _(
     NavigationControl,
     ScaleControl,
     Table,
-    Emrld_7,
-    apply_continuous_cmap,
     bbox,
     h3_table,
-    np,
 ):
     # The output scene: extruded H3 hexagons, coloured by REM (height above the fitted
-    # trend surface). CARTOColors Emrld is a green ramp that is monotonic in lightness, so
-    # under deuteranopia it reads as a clean light->dark ramp: low ground (near the local
-    # base level) light, high ground dark. Extrusion still uses TRUE elevation, so the 3D
-    # landform is real and only the colour is detrended.
+    # trend surface). The colour is NOT computed here: it arrives as two arrow RGBA columns
+    # (rgba_fwd, rgba_rev) straight out of the hypsometric UDF in the aggregation SQL, so
+    # the whole path is dataset -> arrow -> lonboard with no numpy detour. Emrld is a green
+    # ramp monotonic in lightness (deuteranope-safe); extrusion uses TRUE elevation, so the
+    # 3D landform is real and only the colour is detrended.
     #
-    # The domain is percentile-clamped (2nd..98th) over ALL cells so a single peak or pit
-    # doesn't spend the whole ramp; it's one global (lo, hi), so former tile boundaries are
-    # invisible (cells were merged before colouring).
-    #
-    # This cell deliberately references NEITHER elevation_scale NOR fill_opacity. marimo
-    # re-runs any cell that reads a UI element, and a re-run here would rebuild the Map
-    # (and re-stream). So the layer is built ONCE with static initial values, and the tiny
-    # cell below only nudges the live traits, which lonboard syncs to the running widget.
-    # Precompute BOTH ramp directions once. Reversing the ramp is purely presentational,
-    # so it must not touch the stream or the SQL: the Reverse toggle below just swaps which
-    # of these two colour arrays is on the layer (a live get_fill_color trait update, no
-    # Map rebuild, no re-compute). Reversed is (1 - norm) through the same palette.
-    _rem = np.asarray(h3_table["rem"]).astype("float64")
-    if _rem.size:
-        _lo, _hi = (float(v) for v in np.percentile(_rem, [2, 98]))
-        _norm = np.clip((_rem - _lo) / max(_hi - _lo, 1e-6), 0.0, 1.0)
-        colors_fwd = apply_continuous_cmap(_norm, Emrld_7, alpha=1.0)
-        colors_rev = apply_continuous_cmap(1.0 - _norm, Emrld_7, alpha=1.0)
-    else:
-        _lo = _hi = 0.0
-        colors_fwd = np.zeros((0, 4), dtype="uint8")
-        colors_rev = np.zeros((0, 4), dtype="uint8")
-
-    _table = Table.from_arrow(h3_table)
+    # This cell references NEITHER elevation_scale NOR fill_opacity NOR the reverse toggle.
+    # marimo re-runs any cell that reads a UI element, and a re-run here would rebuild the
+    # Map. So the layer is built ONCE (reversed ramp by default) and the tiny cell below
+    # only nudges live traits, including swapping rgba_fwd/rgba_rev on get_fill_color, which
+    # lonboard syncs to the running widget: no Map rebuild, no re-query.
+    color_table = Table.from_arrow(h3_table)
     h3_layer = H3HexagonLayer(
-        table=_table,
-        get_hexagon=_table["hex"],
-        get_fill_color=colors_rev,  # reversed by default; toggle below flips it live
-        get_elevation=_table["elevation"],
+        table=color_table,
+        get_hexagon=color_table["hex"],
+        get_fill_color=color_table["rgba_rev"],  # reversed default; toggle flips it live
+        get_elevation=color_table["elevation"],
         high_precision=True,
         extruded=True,
         stroked=False,
@@ -510,9 +532,9 @@ def _(
         ],
         parameters={"depthTest": True, "blend": True},
     )
-    print(f"scene: {h3_table.num_rows:,} hexes, REM ramp {_lo:.1f} to {_hi:.1f} m")
+    print(f"scene: {h3_table.num_rows:,} hexes, colour from SQL (rgba_fwd/rgba_rev)")
     scene
-    return colors_fwd, colors_rev, h3_layer
+    return color_table, h3_layer
 
 
 @app.cell
@@ -534,14 +556,16 @@ def _(mo):
 
 
 @app.cell
-def _(colors_fwd, colors_rev, elevation_scale, fill_opacity, h3_layer, reverse_ramp):
+def _(color_table, elevation_scale, fill_opacity, h3_layer, reverse_ramp):
     # The only thing the controls do: nudge live traits on the running layer. No Map
     # rebuild, no re-stream, no re-SQL. This is the cell that reads the UI elements, so it
-    # is the only one marimo re-runs when they change. Reverse just picks which precomputed
-    # colour array the layer shows.
+    # is the only one marimo re-runs when they change. Reverse just swaps which of the two
+    # SQL-produced arrow RGBA columns feeds get_fill_color, live.
     h3_layer.elevation_scale = elevation_scale.value
     h3_layer.opacity = fill_opacity.value
-    h3_layer.get_fill_color = colors_rev if reverse_ramp.value else colors_fwd
+    h3_layer.get_fill_color = (
+        color_table["rgba_rev"] if reverse_ramp.value else color_table["rgba_fwd"]
+    )
     return
 
 
