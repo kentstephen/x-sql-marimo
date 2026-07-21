@@ -511,7 +511,7 @@ def _(
             "pitch": 55,
             "bearing": -20,
         },
-        basemap=MaplibreBasemap(style=CartoBasemap.DarkMatterNoLabels),
+        basemap=MaplibreBasemap(style=CartoBasemap.DarkMatter),
         controls=[
             FullscreenControl(position="top-right"),
             NavigationControl(),
