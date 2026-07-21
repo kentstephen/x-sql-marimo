@@ -103,20 +103,10 @@ def _():
 @app.cell
 def _(mo):
     mo.md(r"""
-    # DEM &rarr; H3 &rarr; REM, all in SQL
+    # DEM to H3
 
-    **Hold Ctrl/Cmd and drag** on the picker to draw an AOI anywhere in the USA. The
-    USGS 3DEP **10m** seamless DEM streams from object storage (`obstore`) into **xarray**
-    Datasets, and **xarray-sql** folds the pixels into **H3** cells. Then one more SQL step
-    fits a **trend surface** (a plane, by least squares) to the cell elevations and
-    subtracts it: the **Relative Elevation Model**. Each hex is colored by height above
-    that local trend (CARTOColors **Emrld**), so on a river valley the water surface
-    flattens and terraces / old channels stand up. Extrusion still uses true elevation, so
-    the landform is real; only the color is detrended.
-
-    REM shows best on floodplains: the default is **Mount Washington** and the
-    Presidentials, which reads as height above the ravine floors. Draw over a river reach
-    (Connecticut, Androscoggin) to see the classic detrended-valley look.
+    Draw a box (Ctrl/Cmd + drag) anywhere in the lower 48. The 10m elevation streams in,
+    bins into H3 hexagons, and renders extruded and colored by elevation.
     """)
     return
 
@@ -223,12 +213,10 @@ def _(mo):
 
 @app.cell
 def _(mo):
-    mo.md(
-        r"""
-        *Coverage: all of CONUS. The 10m seamless DEM tiles the entire lower 48, so you
-        can draw a box anywhere on the map below.*
-        """
-    )
+    mo.md(r"""
+    *Coverage: all of CONUS. The 10m seamless DEM tiles the entire lower 48, so you
+    can draw a box anywhere on the map below.*
+    """)
     return
 
 
