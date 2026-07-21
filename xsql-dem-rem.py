@@ -25,7 +25,7 @@ Elevation Model. After folding pixels into H3 cells, SQL fits a trend surface (a
 by least squares) to the cell elevations and subtracts it, so each cell carries its
 height ABOVE the local trend rather than absolute elevation. On a valley or floodplain
 the plane approximates the river's longitudinal slope, so the REM reads as height above
-water and terraces / paleochannels / meander scars pop out. Coloured with CARTOColors
+water and terraces / paleochannels / meander scars pop out. Colored with CARTOColors
 Emrld (a luminance-monotonic green ramp, deuteranope-safe).
 
 Run:  uv run marimo edit xsql-dem-rem.py --sandbox
@@ -73,6 +73,7 @@ def _():
         AioHTTPAdapter,
         CartoBasemap,
         ET,
+        Emrld_7,
         FullscreenControl,
         GeoTIFF,
         GeocoderControl,
@@ -81,7 +82,6 @@ def _():
         MaplibreBasemap,
         NavigationControl,
         Photon,
-        Emrld_7,
         S3Store,
         ScaleControl,
         Table,
@@ -109,10 +109,10 @@ def _(mo):
     USGS 3DEP **10m** seamless DEM streams from object storage (`obstore`) into **xarray**
     Datasets, and **xarray-sql** folds the pixels into **H3** cells. Then one more SQL step
     fits a **trend surface** (a plane, by least squares) to the cell elevations and
-    subtracts it: the **Relative Elevation Model**. Each hex is coloured by height above
+    subtracts it: the **Relative Elevation Model**. Each hex is colored by height above
     that local trend (CARTOColors **Emrld**), so on a river valley the water surface
     flattens and terraces / old channels stand up. Extrusion still uses true elevation, so
-    the landform is real; only the colour is detrended.
+    the landform is real; only the color is detrended.
 
     REM shows best on floodplains: the default is **Mount Washington** and the
     Presidentials, which reads as height above the ravine floors. Draw over a river reach
@@ -164,9 +164,9 @@ def _(XarrayContext, coordinates_to_cells, pa, udf):
     # method); it returns a UBIGINT (uint64) cell id, exactly what lonboard's H3HexagonLayer
     # consumes with high_precision=True. Bigint in, bigint on the GPU, no string round-trip.
     #
-    # Colour is deliberately NOT here: this cell + the aggregation below are the expensive
+    # Color is deliberately NOT here: this cell + the aggregation below are the expensive
     # ETL that builds the hexagons, and it must NOT re-run when you only change the ramp.
-    # Colour lives in its own cheap cell downstream, so tuning it never re-streams or
+    # Color lives in its own cheap cell downstream, so tuning it never re-streams or
     # re-aggregates. A factory (fresh context per stream) keeps per-tile table names from
     # colliding across re-runs.
     def _latlng_to_cell(lat, lng, res):
@@ -416,7 +416,7 @@ async def _(
         _a, _b, _c = np.linalg.lstsq(_A, _rhs, rcond=None)[0]  # robust if degenerate
 
         # Pass 3: REM = elevation - plane, per cell, entirely in SQL. This is the end of the
-        # ETL: h3_table carries hex + true elevation + rem, and NOTHING about colour. Colour
+        # ETL: h3_table carries hex + true elevation + rem, and NOTHING about color. Color
         # is a separate downstream cell, so changing the ramp never re-runs this stream/fold.
         h3_table = ctx.sql(
             f"""
@@ -442,15 +442,15 @@ async def _(
 
 @app.cell
 def _(Emrld_7, apply_continuous_cmap, h3_table, np):
-    # COLOUR CELL: separate from the ETL on purpose. This depends only on h3_table["rem"],
+    # COLOR CELL: separate from the ETL on purpose. This depends only on h3_table["rem"],
     # so it re-runs when the HEXAGONS change (new AOI / resolution) but the expensive stream
-    # + H3 fold above never re-runs because of anything colour-related. This is where the
+    # + H3 fold above never re-runs because of anything color-related. This is where the
     # ramp lives, so a future palette / domain control would re-run only this cheap cell.
     #
     # Emrld is a green ramp monotonic in lightness (deuteranope-safe). Domain is percentile-
     # clamped (2nd..98th) over ALL cells: one global lo/hi, so former tile edges are
     # invisible. Both ramp directions are precomputed so the Reverse toggle downstream is a
-    # live trait swap, not a recompute. numpy here is deliberate: colour is now an explicit
+    # live trait swap, not a recompute. numpy here is deliberate: color is now an explicit
     # host-side presentation step (not "in SQL"), and apply_continuous_cmap is the one-liner
     # for it; a few ms for 240k cells is noise next to streaming.
     _rem = np.asarray(h3_table["rem"]).astype("float64")
@@ -481,13 +481,13 @@ def _(
 ):
     # The output scene: extruded H3 hexagons. Geometry (hex) and height (true elevation) come
     # straight from h3_table as arrow columns; the initial fill is the reversed ramp from the
-    # colour cell. Extrusion uses TRUE elevation, so the 3D landform is real and only the
-    # colour is detrended.
+    # color cell. Extrusion uses TRUE elevation, so the 3D landform is real and only the
+    # color is detrended.
     #
     # This cell references NEITHER elevation_scale NOR fill_opacity NOR the reverse toggle.
     # marimo re-runs any cell that reads a UI element, and a re-run here would rebuild the
     # Map. So the layer is built ONCE and the tiny cell below only nudges live traits,
-    # including swapping colours_fwd/rev on get_fill_color, which lonboard syncs to the
+    # including swapping colors_fwd/rev on get_fill_color, which lonboard syncs to the
     # running widget: no Map rebuild, no re-stream, no re-fold.
     scene_table = Table.from_arrow(h3_table)
     h3_layer = H3HexagonLayer(
@@ -519,7 +519,7 @@ def _(
         ],
         parameters={"depthTest": True, "blend": True},
     )
-    print(f"scene: {h3_table.num_rows:,} hexes, colour from the separate colour cell")
+    print(f"scene: {h3_table.num_rows:,} hexes, color from the separate color cell")
     scene
     return (h3_layer,)
 
@@ -530,7 +530,7 @@ def _(mo):
     # for the ramp. mo.ui.number renders native increment arrows. Changing any of these
     # re-runs ONLY the trait-update cell below, never the map cell, so the scene updates in
     # place (lonboard's whole point). Reverse in particular does NOT touch the stream or the
-    # SQL: it just swaps a precomputed colour array onto the live layer.
+    # SQL: it just swaps a precomputed color array onto the live layer.
     elevation_scale = mo.ui.number(
         start=0.0, stop=50.0, step=0.1, value=3.0, label="Elevation scale"
     )
@@ -543,11 +543,18 @@ def _(mo):
 
 
 @app.cell
-def _(colors_fwd, colors_rev, elevation_scale, fill_opacity, h3_layer, reverse_ramp):
+def _(
+    colors_fwd,
+    colors_rev,
+    elevation_scale,
+    fill_opacity,
+    h3_layer,
+    reverse_ramp,
+):
     # The only thing the controls do: nudge live traits on the running layer. No Map
-    # rebuild, no re-stream, no re-fold, no re-colour. This is the cell that reads the UI
+    # rebuild, no re-stream, no re-fold, no re-color. This is the cell that reads the UI
     # elements, so it is the only one marimo re-runs when they change. Reverse just swaps
-    # which precomputed colour array feeds get_fill_color, live.
+    # which precomputed color array feeds get_fill_color, live.
     h3_layer.elevation_scale = elevation_scale.value
     h3_layer.opacity = fill_opacity.value
     h3_layer.get_fill_color = colors_rev if reverse_ramp.value else colors_fwd

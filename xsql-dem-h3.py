@@ -25,7 +25,7 @@ seamless COGs cover it from a nationwide VRT (a local bbox intersection, no STAC
 streams only the overview window the AOI needs straight from the public `prd-tnm` S3
 bucket with obstore, turns each valid pixel into (lat, lng, elevation), and aggregates
 to H3 cells with a DataFusion SQL UDF. The result renders as extruded lonboard H3
-hexagons on a colourblind-safe viridis elevation ramp. No tiling server, no pixels
+hexagons on a colorblind-safe viridis elevation ramp. No tiling server, no pixels
 touched in Python beyond the aggregation.
 
 Run:  uv run marimo edit xsql-dem-h3.py --sandbox
@@ -402,9 +402,9 @@ def _(
     h3_table,
     np,
 ):
-    # The output scene: extruded H3 hexagons, coloured by mean elevation. Viridis is a
+    # The output scene: extruded H3 hexagons, colored by mean elevation. Viridis is a
     # luminance ramp (deuteranope-safe), and the extrusion height carries the same signal
-    # redundantly, so the terrain reads by shape as well as colour.
+    # redundantly, so the terrain reads by shape as well as color.
     #
     # This cell deliberately references NEITHER elevation_scale NOR fill_opacity. marimo
     # re-runs any cell that reads a UI element, and a re-run here would rebuild the Map
