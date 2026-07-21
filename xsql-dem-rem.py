@@ -442,21 +442,19 @@ async def _(
 
 @app.cell
 def _(Emrld_7, apply_continuous_cmap, h3_table, np):
-    # COLOR CELL: separate from the ETL on purpose. This depends only on h3_table["rem"],
-    # so it re-runs when the HEXAGONS change (new AOI / resolution) but the expensive stream
-    # + H3 fold above never re-runs because of anything color-related. This is where the
-    # ramp lives, so a future palette / domain control would re-run only this cheap cell.
+    # COLOR CELL: separate from the ETL on purpose. Colors each hex by its actual
+    # ELEVATION. This depends only on h3_table["elevation"], so it re-runs when the hexagons
+    # change (new AOI / resolution) but the expensive stream + H3 fold above never re-runs
+    # because of anything color-related. This is where the ramp lives, so a future palette /
+    # domain control would re-run only this cheap cell.
     #
     # Emrld is a green ramp monotonic in lightness (deuteranope-safe). Domain is percentile-
-    # clamped (2nd..98th) over ALL cells: one global lo/hi, so former tile edges are
-    # invisible. Both ramp directions are precomputed so the Reverse toggle downstream is a
-    # live trait swap, not a recompute. numpy here is deliberate: color is now an explicit
-    # host-side presentation step (not "in SQL"), and apply_continuous_cmap is the one-liner
-    # for it; a few ms for 240k cells is noise next to streaming.
-    _rem = np.asarray(h3_table["rem"]).astype("float64")
-    if _rem.size:
-        _lo, _hi = (float(v) for v in np.percentile(_rem, [2, 98]))
-        _norm = np.clip((_rem - _lo) / max(_hi - _lo, 1e-6), 0.0, 1.0)
+    # clamped (2nd..98th) so a lone peak doesn't wash out the ramp. Both ramp directions are
+    # precomputed so the Reverse toggle downstream is a live trait swap, not a recompute.
+    _elev = np.asarray(h3_table["elevation"]).astype("float64")
+    if _elev.size:
+        _lo, _hi = (float(v) for v in np.percentile(_elev, [2, 98]))
+        _norm = np.clip((_elev - _lo) / max(_hi - _lo, 1e-6), 0.0, 1.0)
         colors_fwd = apply_continuous_cmap(_norm, Emrld_7, alpha=1.0)
         colors_rev = apply_continuous_cmap(1.0 - _norm, Emrld_7, alpha=1.0)
     else:
