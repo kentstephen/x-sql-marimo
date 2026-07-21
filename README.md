@@ -1,7 +1,12 @@
 # x-sql-marimo
 
-Free-fly across the USA: draw a box anywhere on a map and see the terrain rise as
-extruded H3 hexagons, computed in SQL.
+Draw a box anywhere in the lower 48 and see the terrain rise as extruded H3 hexagons.
+
+**What runs where (honest version):** most of this is Python, one step is SQL. Streaming
+the elevation tiles (obstore + async-geotiff), turning the raster into a table, coloring,
+and rendering (numpy + lonboard) are all Python. The one SQL step is the binning: xarray-sql
+(DataFusion under the hood) runs a query that folds the pixels into H3 cells and averages
+elevation per cell, with H3 wired in as an h3ronpy UDF.
 
 Draw an AOI, and the notebook streams the **USGS 3DEP 10m (1/3 arc-second) seamless
 DEM** for that box directly from the public `prd-tnm` S3 bucket with

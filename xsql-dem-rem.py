@@ -107,6 +107,11 @@ def _(mo):
 
     Draw a box (Ctrl/Cmd + drag) anywhere in the lower 48. The 10m elevation streams in,
     bins into H3 hexagons, and renders extruded and colored by elevation.
+
+    How it works: stream the tiles (obstore + async-geotiff), then one SQL query bins the
+    pixels into hexagons (xarray-sql / DataFusion, with H3 via an h3ronpy UDF). Coloring
+    and drawing are Python (numpy + lonboard). The SQL part is the binning; the rest is
+    Python.
     """)
     return
 
