@@ -5,8 +5,10 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "aiohttp>=3.10",
     "async-geotiff>=0.4",
     "datafusion>=54.0.0",
+    "geopy>=2.5.0",
     "h3ronpy>=0.22.0",
     "lonboard>=0.16.0",
     "marimo>=0.23.14",

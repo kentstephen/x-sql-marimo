@@ -10,6 +10,8 @@
 #     "lonboard>=0.16.0",
 #     "palettable>=3.3",
 #     "matplotlib",
+#     "geopy>=2.4",
+#     "aiohttp>=3.10",
 #     "arro3-core",
 #     "numpy",
 # ]
@@ -50,21 +52,31 @@ def _():
     from datafusion import SessionContext, udf
     from h3ronpy.vector import coordinates_to_cells
 
+    from geopy.adapters import AioHTTPAdapter
+    from geopy.geocoders import Photon
     from lonboard import Map, H3HexagonLayer
     from lonboard.basemap import CartoBasemap, MaplibreBasemap
     from lonboard.colormap import apply_continuous_cmap
-    from lonboard.controls import FullscreenControl, NavigationControl, ScaleControl
+    from lonboard.controls import (
+        FullscreenControl,
+        GeocoderControl,
+        NavigationControl,
+        ScaleControl,
+    )
     from palettable.matplotlib import Viridis_20
 
     return (
+        AioHTTPAdapter,
         CartoBasemap,
         ET,
         FullscreenControl,
         GeoTIFF,
+        GeocoderControl,
         H3HexagonLayer,
         Map,
         MaplibreBasemap,
         NavigationControl,
+        Photon,
         S3Store,
         ScaleControl,
         SessionContext,
@@ -189,21 +201,31 @@ def _(mo):
 
 @app.cell
 def _(
+    AioHTTPAdapter,
     CartoBasemap,
     FullscreenControl,
+    GeocoderControl,
     Map,
     MaplibreBasemap,
     NavigationControl,
+    Photon,
     ScaleControl,
     set_bbox,
 ):
     # 2D picker. Draw a box (Ctrl/Cmd + drag) -> selected_bounds -> set_bbox. Built once,
     # never references a reactive UI element, so pan/zoom/AOI survive every downstream run.
+    #
+    # Photon (komoot): free, keyless, OSM-backed geocoder. Search a place to fly there,
+    # then draw the box. geopy must run in async mode (AioHTTPAdapter) for lonboard.
+    _geocoder = GeocoderControl.from_geopy(
+        Photon(adapter_factory=AioHTTPAdapter, user_agent="x-sql-marimo"),
+    )
     picker = Map(
         layers=[],
         view_state={"longitude": -71.30, "latitude": 44.25, "zoom": 8, "pitch": 0},
         basemap=MaplibreBasemap(style=CartoBasemap.Positron),
         controls=[
+            _geocoder,
             FullscreenControl(position="top-right"),
             NavigationControl(),
             ScaleControl(),
