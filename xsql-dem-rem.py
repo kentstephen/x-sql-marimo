@@ -448,12 +448,13 @@ def _(Emrld_7, apply_continuous_cmap, h3_table, np):
     # because of anything color-related. This is where the ramp lives, so a future palette /
     # domain control would re-run only this cheap cell.
     #
-    # Emrld is a green ramp monotonic in lightness (deuteranope-safe). Domain is percentile-
-    # clamped (2nd..98th) so a lone peak doesn't wash out the ramp. Both ramp directions are
-    # precomputed so the Reverse toggle downstream is a live trait swap, not a recompute.
+    # Emrld is a green ramp monotonic in lightness (deuteranope-safe). Domain is RELATIVE to
+    # the scene: the ramp spans this AOI's actual elevation min -> max, so the full palette
+    # is always used across whatever is in view (draw a new box and it re-stretches). Both
+    # ramp directions are precomputed so the Reverse toggle downstream is a live trait swap.
     _elev = np.asarray(h3_table["elevation"]).astype("float64")
     if _elev.size:
-        _lo, _hi = (float(v) for v in np.percentile(_elev, [2, 98]))
+        _lo, _hi = float(_elev.min()), float(_elev.max())
         _norm = np.clip((_elev - _lo) / max(_hi - _lo, 1e-6), 0.0, 1.0)
         colors_fwd = apply_continuous_cmap(_norm, Emrld_7, alpha=1.0)
         colors_rev = apply_continuous_cmap(1.0 - _norm, Emrld_7, alpha=1.0)
