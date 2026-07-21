@@ -3,6 +3,8 @@
 # dependencies = [
 #     "marimo",
 #     "datafusion>=54.0.0",
+#     "xarray-sql>=0.3.2",
+#     "xarray",
 #     "h3ronpy>=0.22.0",
 #     "pyarrow>=25.0.0",
 #     "obstore>=0.9.2",
@@ -10,7 +12,7 @@
 #     "lonboard>=0.16.0",
 #     "palettable>=3.3",
 #     "matplotlib",
-#     "geopy>=2.4",
+#     "geopy==2.5.0",
 #     "aiohttp>=3.10",
 #     "arro3-core",
 #     "numpy",
@@ -44,12 +46,14 @@ def _():
 
     import numpy as np
     import pyarrow as pa
+    import xarray as xr
     import marimo as mo
 
     from arro3.core import Table
     from obstore.store import S3Store
     from async_geotiff import GeoTIFF, Window
-    from datafusion import SessionContext, udf
+    from datafusion import udf
+    from xarray_sql import XarrayContext
     from h3ronpy.vector import coordinates_to_cells
 
     from geopy.adapters import AioHTTPAdapter
@@ -79,10 +83,10 @@ def _():
         Photon,
         S3Store,
         ScaleControl,
-        SessionContext,
         Table,
         Viridis_20,
         Window,
+        XarrayContext,
         apply_continuous_cmap,
         asyncio,
         coordinates_to_cells,
@@ -92,6 +96,7 @@ def _():
         pathlib,
         udf,
         urllib,
+        xr,
     )
 
 
@@ -102,9 +107,10 @@ def _(mo):
 
     **Hold Ctrl/Cmd and drag** on the picker to draw an AOI anywhere in the USA. The
     USGS 3DEP **10m** seamless DEM for that box streams straight from object storage
-    (`obstore`), every valid pixel becomes a `(lat, lng, elevation)` row, and a
-    **DataFusion** SQL UDF folds them into **H3** cells. The scene below is those
-    cells, extruded by mean elevation on a viridis ramp.
+    (`obstore`) into **xarray** Datasets, and **xarray-sql** queries the raster grid
+    directly: one SQL statement unravels `elevation` over its `lat`/`lon` coords and an
+    **H3** UDF folds the pixels into cells. The scene below is those cells, extruded by
+    mean elevation on a viridis ramp. No manual flatten, the raster *is* the table.
 
     Starting over **Mount Washington** and the Presidential Range, White Mountains, NH.
     """)
@@ -145,29 +151,37 @@ def _(ET, pathlib, urllib):
 
 
 @app.cell
-def _(SessionContext, coordinates_to_cells, pa, udf):
-    # One DataFusion session for the whole notebook, with the H3 UDF registered. The UDF
-    # takes lat, lng and an H3 resolution and returns a UBIGINT (uint64) cell id, which is
-    # exactly what lonboard's H3HexagonLayer consumes with high_precision=True. No string
-    # round-trip: bigint in, bigint on the GPU.
-    ctx = SessionContext()
-
+def _(XarrayContext, coordinates_to_cells, pa, udf):
+    # xarray-sql is the point of this notebook: query the DEM raster AS a table with SQL,
+    # no manual flattening. XarrayContext IS a DataFusion session with one extra trick,
+    # from_dataset(): an xarray Dataset's dimension coords (lat, lon) become columns and
+    # its data variables (elevation) become columns, so `SELECT lat, lon, elevation FROM
+    # dem` unravels the grid for you. We register the H3 UDF on it (inherited DataFusion
+    # method); it returns a UBIGINT (uint64) cell id, exactly what lonboard's H3HexagonLayer
+    # consumes with high_precision=True. Bigint in, bigint on the GPU, no string round-trip.
+    #
+    # A factory (fresh context per stream) keeps the per-tile table names from colliding
+    # across re-runs, and keeps the UDF registration in one obvious place.
     def _latlng_to_cell(lat, lng, res):
         return pa.array(
             coordinates_to_cells(lat.to_numpy(), lng.to_numpy(), res[0].as_py())
         )
 
-    ctx.register_udf(
-        udf(
-            _latlng_to_cell,
-            [pa.float64(), pa.float64(), pa.int32()],
-            pa.uint64(),
-            "stable",
-            name="h3_latlng_to_cell",
+    def make_h3_context():
+        ctx = XarrayContext()
+        ctx.register_udf(
+            udf(
+                _latlng_to_cell,
+                [pa.float64(), pa.float64(), pa.int32()],
+                pa.uint64(),
+                "stable",
+                name="h3_latlng_to_cell",
+            )
         )
-    )
-    print("registered UDF: h3_latlng_to_cell(lat, lng, res) -> UBIGINT")
-    return (ctx,)
+        return ctx
+
+    print("xarray-sql context factory ready; UDF: h3_latlng_to_cell(lat, lon, res) -> UBIGINT")
+    return (make_h3_context,)
 
 
 @app.cell
@@ -264,16 +278,19 @@ async def _(
     Window,
     asyncio,
     bbox,
-    ctx,
     h3_res,
+    make_h3_context,
     np,
     pa,
     tiles,
+    xr,
 ):
-    # Stream the covering COGs and aggregate to H3, in SQL. For each tile: pick an overview
-    # whose ground sampling roughly matches the H3 cell (so we neither oversample nor
-    # starve cells), read ONLY the AOI window, turn valid pixels into (lat, lng, elevation),
-    # and hand the batch to DataFusion. The UDF groups them into UBIGINT H3 cells.
+    # Stream the covering COGs and aggregate to H3 with xarray-sql. For each tile: pick an
+    # overview whose ground sampling roughly matches the H3 cell (so we neither oversample
+    # nor starve cells), read ONLY the AOI window as an xarray Dataset (elevation over
+    # lat/lon coords, nodata -> NaN), and register it as a SQL table. Then ONE SQL statement
+    # unravels every tile's grid, unions them, and folds pixels into UBIGINT H3 cells via
+    # the UDF. No manual flatten-to-pyarrow: the raster IS the table.
     _store = S3Store(bucket="prd-tnm", region="us-west-2", skip_signature=True)
     _res = h3_res.value
     _w, _s, _e, _n = bbox
@@ -282,13 +299,6 @@ async def _(
     _edge_m = {8: 461.0, 9: 174.0, 10: 66.0, 11: 25.0, 12: 9.0}[_res]
     _target_deg = (_edge_m / 2.0) / 111320.0
     _PIXEL_BUDGET = 3_000_000  # per-tile window cap; step coarser if exceeded
-
-    def _pick_reader(g):
-        # Candidates: full res plus every overview. Choose the coarsest whose pixel size
-        # is still <= target (no oversampling); if none is fine enough, take the finest.
-        cands = sorted([g, *g.overviews], key=lambda r: r.res[0])
-        fit = [r for r in cands if r.res[0] <= _target_deg]
-        return fit[-1] if fit else cands[0]
 
     def _window(reader, tw, ts, te, tn):
         # AOI clipped to this reader's extent, in pixel coords.
@@ -324,41 +334,44 @@ async def _(
                 break
         r = await reader.read(window=win)
         ma = r.as_masked()[0]
-        elev = ma.data.astype("float32")
-        mask = np.ma.getmaskarray(ma)
+        elev = np.ma.filled(ma.astype("float32"), np.nan)  # nodata -> NaN
+        if not np.isfinite(elev).any():
+            return None
         rw, rs, re_, rn = r.bounds
         h, w = elev.shape
-        lng = rw + (np.arange(w) + 0.5) * (re_ - rw) / w
+        # Pixel-centre coords. lat descends (north-up raster), lon ascends.
         lat = rn - (np.arange(h) + 0.5) * (rn - rs) / h
-        LNG, LAT = np.meshgrid(lng, lat)
-        v = ~mask
-        if not v.any():
-            return None
-        return (
-            LAT[v].astype("float64"),
-            LNG[v].astype("float64"),
-            elev[v].astype("float64"),
+        lon = rw + (np.arange(w) + 0.5) * (re_ - rw) / w
+        return xr.Dataset(
+            {"elevation": (("lat", "lon"), elev)},
+            coords={"lat": lat, "lon": lon},
         )
 
-    _reads = [x for x in await asyncio.gather(*[_read_tile(t) for t in tiles]) if x]
-    if _reads:
-        _lat = np.concatenate([r[0] for r in _reads])
-        _lng = np.concatenate([r[1] for r in _reads])
-        _elev = np.concatenate([r[2] for r in _reads])
-        print(f"streamed {_lat.size:,} valid pixels from {len(_reads)} tile(s)")
+    _datasets = [d for d in await asyncio.gather(*[_read_tile(t) for t in tiles]) if d]
+    if _datasets:
+        _px = sum(int(d["elevation"].size) for d in _datasets)
+        print(f"streamed {_px:,} pixels as {len(_datasets)} xarray Dataset(s)")
 
-        _px = pa.table({"lat": _lat, "lng": _lng, "elevation": _elev})
-        ctx.register_record_batches("px", [_px.to_batches()])
+        # Register each tile's grid as a SQL table on the xarray-sql context, then let ONE
+        # statement do the work: unravel every grid to (lat, lon, elevation) rows, drop
+        # NaN nodata (elevation = elevation is false for NaN), union the tiles, and group
+        # by H3 cell. This is the demonstration: SQL straight over xarray, UDF and all.
+        ctx = make_h3_context()
+        for _i, _d in enumerate(_datasets):
+            ctx.from_dataset(f"dem_{_i}", _d, chunks={"lat": 1024})
+        _union = " UNION ALL ".join(
+            f"SELECT lat, lon, elevation FROM dem_{_i} WHERE elevation = elevation"
+            for _i in range(len(_datasets))
+        )
         h3_table = ctx.sql(
             f"""
-            SELECT h3_latlng_to_cell(lat, lng, CAST({_res} AS INT)) AS hex,
+            SELECT h3_latlng_to_cell(lat, lon, CAST({_res} AS INT)) AS hex,
                    avg(elevation) AS elevation,
                    count(*)       AS n
-            FROM px
+            FROM ({_union})
             GROUP BY 1
             """
         ).to_arrow_table()
-        ctx.deregister_table("px")
         print(f"H3 res {_res}: {h3_table.num_rows:,} cells")
     else:
         h3_table = pa.table(
