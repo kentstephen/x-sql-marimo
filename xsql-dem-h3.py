@@ -186,9 +186,10 @@ def _(XarrayContext, coordinates_to_cells, pa, udf):
 
 @app.cell
 def _(mo):
-    # Reactive AOI. Default: the White Mountains broadly, with Mount Washington and the
-    # Presidential Range at its heart. Wide on purpose; draw a smaller box to zoom detail.
-    get_bbox, set_bbox = mo.state((-72.0, 43.7, -70.6, 44.8))
+    # Reactive AOI. Default: a tight box on Mount Washington and the Presidential Range,
+    # White Mountains NH. Small on purpose so the first render is quick; draw a bigger box
+    # (or search elsewhere) to fly the rest of the country.
+    get_bbox, set_bbox = mo.state((-71.36, 44.22, -71.22, 44.33))
     return get_bbox, set_bbox
 
 
@@ -236,7 +237,7 @@ def _(
     )
     picker = Map(
         layers=[],
-        view_state={"longitude": -71.30, "latitude": 44.25, "zoom": 8, "pitch": 0},
+        view_state={"longitude": -71.29, "latitude": 44.27, "zoom": 11, "pitch": 0},
         basemap=MaplibreBasemap(style=CartoBasemap.Positron),
         controls=[
             _geocoder,
@@ -438,7 +439,7 @@ def _(
         view_state={
             "longitude": (bbox[0] + bbox[2]) / 2,
             "latitude": (bbox[1] + bbox[3]) / 2,
-            "zoom": 9,
+            "zoom": 11,
             "pitch": 55,
             "bearing": -20,
         },
