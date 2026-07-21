@@ -67,13 +67,11 @@ def _():
         NavigationControl,
         ScaleControl,
     )
-    from palettable.cartocolors.sequential import Emrld_7
 
     return (
         AioHTTPAdapter,
         CartoBasemap,
         ET,
-        Emrld_7,
         FullscreenControl,
         GeoTIFF,
         GeocoderControl,
@@ -445,23 +443,52 @@ async def _(
 
 
 @app.cell
-def _(Emrld_7, apply_continuous_cmap, h3_table, np):
-    # COLOR CELL: separate from the ETL on purpose. Colors each hex by its actual
-    # ELEVATION. This depends only on h3_table["elevation"], so it re-runs when the hexagons
-    # change (new AOI / resolution) but the expensive stream + H3 fold above never re-runs
-    # because of anything color-related. This is where the ramp lives, so a future palette /
-    # domain control would re-run only this cheap cell.
+def _():
+    # Palette registry: matplotlib + CARTOColors sequential ramps. All are luminance-
+    # monotonic (deuteranope-safe: no red/green opposition). The dropdown at the bottom
+    # picks one.
+    from palettable.matplotlib import Viridis_20, Inferno_20, Magma_20, Plasma_20
+    from palettable.cartocolors.sequential import (
+        Emrld_7,
+        Teal_7,
+        BluYl_7,
+        Mint_7,
+        Sunset_7,
+        PurpOr_7,
+    )
+
+    PALETTES = {
+        "Viridis": Viridis_20,
+        "Plasma": Plasma_20,
+        "Inferno": Inferno_20,
+        "Magma": Magma_20,
+        "Emrld": Emrld_7,
+        "Teal": Teal_7,
+        "BluYl": BluYl_7,
+        "Mint": Mint_7,
+        "Sunset": Sunset_7,
+        "PurpOr": PurpOr_7,
+    }
+    return (PALETTES,)
+
+
+@app.cell
+def _(PALETTES, apply_continuous_cmap, h3_table, np, palette):
+    # COLOR CELL: separate from the ETL on purpose. Colors each hex by its actual ELEVATION,
+    # through the palette picked in the dropdown at the bottom. Depends only on
+    # h3_table["elevation"] + the palette, so it re-runs when the hexagons change (new AOI /
+    # resolution) or you switch palette, but the expensive stream + H3 fold never re-runs.
     #
-    # Emrld is a green ramp monotonic in lightness (deuteranope-safe). Domain is RELATIVE to
-    # the scene: the ramp spans this AOI's actual elevation min -> max, so the full palette
-    # is always used across whatever is in view (draw a new box and it re-stretches). Both
-    # ramp directions are precomputed so the Reverse toggle downstream is a live trait swap.
+    # Domain is RELATIVE to the scene: the ramp spans this AOI's actual elevation min -> max,
+    # so the full palette is always used across whatever is in view. Both ramp directions are
+    # precomputed so the Reverse toggle downstream is a live trait swap.
+    _cmap = PALETTES[palette.value]
     _elev = np.asarray(h3_table["elevation"]).astype("float64")
     if _elev.size:
         _lo, _hi = float(_elev.min()), float(_elev.max())
         _norm = np.clip((_elev - _lo) / max(_hi - _lo, 1e-6), 0.0, 1.0)
-        colors_fwd = apply_continuous_cmap(_norm, Emrld_7, alpha=1.0)
-        colors_rev = apply_continuous_cmap(1.0 - _norm, Emrld_7, alpha=1.0)
+        colors_fwd = apply_continuous_cmap(_norm, _cmap, alpha=1.0)
+        colors_rev = apply_continuous_cmap(1.0 - _norm, _cmap, alpha=1.0)
     else:
         colors_fwd = np.zeros((0, 4), dtype="uint8")
         colors_rev = np.zeros((0, 4), dtype="uint8")
@@ -479,24 +506,22 @@ def _(
     ScaleControl,
     Table,
     bbox,
-    colors_rev,
     h3_table,
 ):
     # The output scene: extruded H3 hexagons. Geometry (hex) and height (true elevation) come
-    # straight from h3_table as arrow columns; the initial fill is the reversed ramp from the
-    # color cell. Extrusion uses TRUE elevation, so the 3D landform is real and only the
-    # color is detrended.
+    # straight from h3_table as arrow columns.
     #
-    # This cell references NEITHER elevation_scale NOR fill_opacity NOR the reverse toggle.
-    # marimo re-runs any cell that reads a UI element, and a re-run here would rebuild the
-    # Map. So the layer is built ONCE and the tiny cell below only nudges live traits,
-    # including swapping colors_fwd/rev on get_fill_color, which lonboard syncs to the
-    # running widget: no Map rebuild, no re-stream, no re-fold.
+    # This cell references NEITHER the colors NOR the palette NOR any control. marimo re-runs
+    # any cell that reads a UI element or a changed value, and a re-run here would rebuild the
+    # Map (losing view state). So the layer is built ONCE with a placeholder fill, and the
+    # update cell below paints it (and repaints on every palette / reverse change) as a live
+    # get_fill_color trait swap: no Map rebuild, no re-stream, no re-fold. Only a new AOI /
+    # resolution (which changes h3_table) rebuilds the scene.
     scene_table = Table.from_arrow(h3_table)
     h3_layer = H3HexagonLayer(
         table=scene_table,
         get_hexagon=scene_table["hex"],
-        get_fill_color=colors_rev,  # reversed default; toggle flips it live below
+        get_fill_color=[136, 136, 136],  # placeholder; update cell paints it live below
         get_elevation=scene_table["elevation"],
         high_precision=True,
         extruded=True,
@@ -528,12 +553,14 @@ def _(
 
 
 @app.cell
-def _(mo):
-    # Right below the map: float inputs with up/down steppers at 0.1, plus a Reverse toggle
-    # for the ramp. mo.ui.number renders native increment arrows. Changing any of these
-    # re-runs ONLY the trait-update cell below, never the map cell, so the scene updates in
-    # place (lonboard's whole point). Reverse in particular does NOT touch the stream or the
-    # SQL: it just swaps a precomputed color array onto the live layer.
+def _(PALETTES, mo):
+    # Right below the map: palette picker + float inputs (0.1 steppers) + toggles. Changing
+    # the palette re-runs the color cell (cheap) then the update cell; scale / opacity /
+    # reverse / extruded re-run only the update cell. None of them touch the stream, the SQL,
+    # or rebuild the map, so the scene updates in place (lonboard's whole point).
+    palette = mo.ui.dropdown(
+        options=list(PALETTES), value="Emrld", label="Palette"
+    )
     elevation_scale = mo.ui.number(
         start=0.0, stop=50.0, step=0.1, value=3.0, label="Elevation scale"
     )
@@ -543,10 +570,10 @@ def _(mo):
     reverse_ramp = mo.ui.switch(value=True, label="Reverse ramp")
     extruded = mo.ui.switch(value=True, label="Extruded")
     mo.hstack(
-        [elevation_scale, fill_opacity, reverse_ramp, extruded],
+        [palette, elevation_scale, fill_opacity, reverse_ramp, extruded],
         justify="start", gap=2,
     )
-    return elevation_scale, extruded, fill_opacity, reverse_ramp
+    return elevation_scale, extruded, fill_opacity, palette, reverse_ramp
 
 
 @app.cell
