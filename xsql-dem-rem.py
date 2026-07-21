@@ -222,6 +222,17 @@ def _(mo):
 
 
 @app.cell
+def _(mo):
+    mo.md(
+        r"""
+        *Coverage: all of CONUS. The 10m seamless DEM tiles the entire lower 48, so you
+        can draw a box anywhere on the map below.*
+        """
+    )
+    return
+
+
+@app.cell
 def _(
     AioHTTPAdapter,
     CartoBasemap,
