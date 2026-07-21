@@ -537,8 +537,12 @@ def _(mo):
         start=0.0, stop=1.0, step=0.1, value=0.9, label="Opacity"
     )
     reverse_ramp = mo.ui.switch(value=True, label="Reverse ramp")
-    mo.hstack([elevation_scale, fill_opacity, reverse_ramp], justify="start", gap=2)
-    return elevation_scale, fill_opacity, reverse_ramp
+    extruded = mo.ui.switch(value=True, label="Extruded")
+    mo.hstack(
+        [elevation_scale, fill_opacity, reverse_ramp, extruded],
+        justify="start", gap=2,
+    )
+    return elevation_scale, extruded, fill_opacity, reverse_ramp
 
 
 @app.cell
@@ -546,6 +550,7 @@ def _(
     colors_fwd,
     colors_rev,
     elevation_scale,
+    extruded,
     fill_opacity,
     h3_layer,
     reverse_ramp,
@@ -553,10 +558,11 @@ def _(
     # The only thing the controls do: nudge live traits on the running layer. No Map
     # rebuild, no re-stream, no re-fold, no re-color. This is the cell that reads the UI
     # elements, so it is the only one marimo re-runs when they change. Reverse just swaps
-    # which precomputed color array feeds get_fill_color, live.
+    # which precomputed color array feeds get_fill_color, live; Extruded flips 3D vs flat.
     h3_layer.elevation_scale = elevation_scale.value
     h3_layer.opacity = fill_opacity.value
     h3_layer.get_fill_color = colors_rev if reverse_ramp.value else colors_fwd
+    h3_layer.extruded = extruded.value
     return
 
 
