@@ -58,6 +58,7 @@ def _():
 
     return (
         CartoBasemap,
+        ET,
         FullscreenControl,
         GeoTIFF,
         H3HexagonLayer,
@@ -73,7 +74,6 @@ def _():
         apply_continuous_cmap,
         asyncio,
         coordinates_to_cells,
-        ET,
         mo,
         np,
         pa,
@@ -85,19 +85,17 @@ def _():
 
 @app.cell
 def _(mo):
-    mo.md(
-        r"""
-        # DEM &rarr; H3, streamed and aggregated in SQL
+    mo.md(r"""
+    # DEM &rarr; H3, streamed and aggregated in SQL
 
-        **Hold Ctrl/Cmd and drag** on the picker to draw an AOI anywhere in the USA. The
-        USGS 3DEP **10m** seamless DEM for that box streams straight from object storage
-        (`obstore`), every valid pixel becomes a `(lat, lng, elevation)` row, and a
-        **DataFusion** SQL UDF folds them into **H3** cells. The scene below is those
-        cells, extruded by mean elevation on a viridis ramp.
+    **Hold Ctrl/Cmd and drag** on the picker to draw an AOI anywhere in the USA. The
+    USGS 3DEP **10m** seamless DEM for that box streams straight from object storage
+    (`obstore`), every valid pixel becomes a `(lat, lng, elevation)` row, and a
+    **DataFusion** SQL UDF folds them into **H3** cells. The scene below is those
+    cells, extruded by mean elevation on a viridis ramp.
 
-        Starting over **Mount Washington** and the Presidential Range, White Mountains, NH.
-        """
-    )
+    Starting over **Mount Washington** and the Presidential Range, White Mountains, NH.
+    """)
     return
 
 
@@ -162,8 +160,9 @@ def _(SessionContext, coordinates_to_cells, pa, udf):
 
 @app.cell
 def _(mo):
-    # Reactive AOI. Default: Mount Washington + the Presidential Range, White Mountains NH.
-    get_bbox, set_bbox = mo.state((-71.42, 44.20, -71.18, 44.38))
+    # Reactive AOI. Default: the White Mountains broadly, with Mount Washington and the
+    # Presidential Range at its heart. Wide on purpose; draw a smaller box to zoom detail.
+    get_bbox, set_bbox = mo.state((-72.0, 43.7, -70.6, 44.8))
     return get_bbox, set_bbox
 
 
@@ -181,7 +180,7 @@ def _(mo):
             "res 11 ·  ~25 m hex": 11,
             "res 12 ·  ~9 m hex (near native)": 12,
         },
-        value="res 10 ·  ~66 m hex",
+        value="res 11 ·  ~25 m hex",
         label="H3 resolution",
     )
     h3_res
@@ -202,7 +201,7 @@ def _(
     # never references a reactive UI element, so pan/zoom/AOI survive every downstream run.
     picker = Map(
         layers=[],
-        view_state={"longitude": -71.30, "latitude": 44.29, "zoom": 10, "pitch": 0},
+        view_state={"longitude": -71.30, "latitude": 44.25, "zoom": 8, "pitch": 0},
         basemap=MaplibreBasemap(style=CartoBasemap.Positron),
         controls=[
             FullscreenControl(position="top-right"),
@@ -352,20 +351,6 @@ async def _(
 
 
 @app.cell
-def _(mo):
-    # Elevation exaggeration + fill opacity for the extruded scene. Own cell so tweaking
-    # them re-runs only the tiny update cell below, not the whole stream.
-    elevation_scale = mo.ui.slider(
-        start=0.5, stop=20.0, step=0.5, value=6.0, label="Elevation scale"
-    )
-    fill_opacity = mo.ui.slider(
-        start=0.1, stop=1.0, step=0.05, value=0.9, label="Opacity"
-    )
-    mo.hstack([elevation_scale, fill_opacity], justify="start", gap=2)
-    return elevation_scale, fill_opacity
-
-
-@app.cell
 def _(
     CartoBasemap,
     FullscreenControl,
@@ -378,15 +363,19 @@ def _(
     Viridis_20,
     apply_continuous_cmap,
     bbox,
-    elevation_scale,
-    fill_opacity,
     h3_table,
     np,
 ):
     # The output scene: extruded H3 hexagons, coloured by mean elevation. Viridis is a
     # luminance ramp (deuteranope-safe), and the extrusion height carries the same signal
-    # redundantly, so the terrain reads by shape as well as colour. Rebuilds per AOI (the
-    # whole point: draw a box, get a new scene); the slider cell below only nudges traits.
+    # redundantly, so the terrain reads by shape as well as colour.
+    #
+    # This cell deliberately references NEITHER elevation_scale NOR fill_opacity. marimo
+    # re-runs any cell that reads a UI element, and a re-run here would rebuild the Map
+    # (and re-stream). So the layer is built ONCE with static initial values, and the tiny
+    # cell below only nudges the live traits, which lonboard syncs to the running widget:
+    # scale/opacity change the scene with no rebuild and no re-stream. Only a new AOI or a
+    # new H3 resolution (which change h3_table) rebuilds the scene.
     _elev = np.asarray(h3_table["elevation"]).astype("float64")
     if _elev.size:
         _lo, _hi = float(np.min(_elev)), float(np.max(_elev))
@@ -405,8 +394,8 @@ def _(
         high_precision=True,
         extruded=True,
         stroked=False,
-        elevation_scale=elevation_scale.value,
-        opacity=fill_opacity.value,
+        elevation_scale=6.0,  # initial; the number input below nudges this live
+        opacity=0.9,          # initial; the number input below nudges this live
     )
 
     scene = Map(
@@ -414,7 +403,7 @@ def _(
         view_state={
             "longitude": (bbox[0] + bbox[2]) / 2,
             "latitude": (bbox[1] + bbox[3]) / 2,
-            "zoom": 11,
+            "zoom": 9,
             "pitch": 55,
             "bearing": -20,
         },
@@ -432,8 +421,25 @@ def _(
 
 
 @app.cell
+def _(mo):
+    # Right below the map: float inputs with up/down steppers at 0.1. mo.ui.number renders
+    # native increment arrows. Changing either re-runs ONLY the trait-update cell below,
+    # never the map cell, so the scene updates in place (lonboard's whole point).
+    elevation_scale = mo.ui.number(
+        start=0.0, stop=50.0, step=0.1, value=6.0, label="Elevation scale"
+    )
+    fill_opacity = mo.ui.number(
+        start=0.0, stop=1.0, step=0.1, value=0.9, label="Opacity"
+    )
+    mo.hstack([elevation_scale, fill_opacity], justify="start", gap=2)
+    return elevation_scale, fill_opacity
+
+
+@app.cell
 def _(elevation_scale, fill_opacity, h3_layer):
-    # The only thing the sliders do: nudge live traits. No Map rebuild, no re-stream.
+    # The only thing the number inputs do: nudge live traits on the running layer. No Map
+    # rebuild, no re-stream. This is the cell that reads the UI elements, so it is the only
+    # one marimo re-runs when they change.
     h3_layer.elevation_scale = elevation_scale.value
     h3_layer.opacity = fill_opacity.value
     return
