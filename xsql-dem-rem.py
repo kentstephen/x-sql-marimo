@@ -193,7 +193,7 @@ def _(mo):
     # Reactive AOI. Default: a tight box on Mount Washington and the Presidential Range,
     # White Mountains NH. Small on purpose so the first render is quick; draw a bigger box
     # (or search elsewhere) to fly the rest of the country.
-    get_bbox, set_bbox = mo.state((-71.36, 44.22, -71.22, 44.33))
+    get_bbox, set_bbox = mo.state((-71.43, 44.165, -71.15, 44.385))
     return get_bbox, set_bbox
 
 
@@ -241,7 +241,7 @@ def _(
     )
     picker = Map(
         layers=[],
-        view_state={"longitude": -71.29, "latitude": 44.27, "zoom": 11, "pitch": 0},
+        view_state={"longitude": -71.29, "latitude": 44.275, "zoom": 10, "pitch": 0},
         basemap=MaplibreBasemap(style=CartoBasemap.Positron),
         controls=[
             _geocoder,
@@ -465,25 +465,31 @@ def _(
     # re-runs any cell that reads a UI element, and a re-run here would rebuild the Map
     # (and re-stream). So the layer is built ONCE with static initial values, and the tiny
     # cell below only nudges the live traits, which lonboard syncs to the running widget.
+    # Precompute BOTH ramp directions once. Reversing the ramp is purely presentational,
+    # so it must not touch the stream or the SQL: the Reverse toggle below just swaps which
+    # of these two colour arrays is on the layer (a live get_fill_color trait update, no
+    # Map rebuild, no re-compute). Reversed is (1 - norm) through the same palette.
     _rem = np.asarray(h3_table["rem"]).astype("float64")
     if _rem.size:
         _lo, _hi = (float(v) for v in np.percentile(_rem, [2, 98]))
         _norm = np.clip((_rem - _lo) / max(_hi - _lo, 1e-6), 0.0, 1.0)
-        _colors = apply_continuous_cmap(_norm, Emrld_7, alpha=1.0)
+        colors_fwd = apply_continuous_cmap(_norm, Emrld_7, alpha=1.0)
+        colors_rev = apply_continuous_cmap(1.0 - _norm, Emrld_7, alpha=1.0)
     else:
         _lo = _hi = 0.0
-        _colors = np.zeros((0, 4), dtype="uint8")
+        colors_fwd = np.zeros((0, 4), dtype="uint8")
+        colors_rev = np.zeros((0, 4), dtype="uint8")
 
     _table = Table.from_arrow(h3_table)
     h3_layer = H3HexagonLayer(
         table=_table,
         get_hexagon=_table["hex"],
-        get_fill_color=_colors,
+        get_fill_color=colors_rev,  # reversed by default; toggle below flips it live
         get_elevation=_table["elevation"],
         high_precision=True,
         extruded=True,
         stroked=False,
-        elevation_scale=6.0,  # initial; the number input below nudges this live
+        elevation_scale=3.0,  # initial; the number input below nudges this live
         opacity=0.9,          # initial; the number input below nudges this live
     )
 
@@ -492,7 +498,7 @@ def _(
         view_state={
             "longitude": (bbox[0] + bbox[2]) / 2,
             "latitude": (bbox[1] + bbox[3]) / 2,
-            "zoom": 11,
+            "zoom": 10,
             "pitch": 55,
             "bearing": -20,
         },
@@ -506,31 +512,36 @@ def _(
     )
     print(f"scene: {h3_table.num_rows:,} hexes, REM ramp {_lo:.1f} to {_hi:.1f} m")
     scene
-    return (h3_layer,)
+    return colors_fwd, colors_rev, h3_layer
 
 
 @app.cell
 def _(mo):
-    # Right below the map: float inputs with up/down steppers at 0.1. mo.ui.number renders
-    # native increment arrows. Changing either re-runs ONLY the trait-update cell below,
-    # never the map cell, so the scene updates in place (lonboard's whole point).
+    # Right below the map: float inputs with up/down steppers at 0.1, plus a Reverse toggle
+    # for the ramp. mo.ui.number renders native increment arrows. Changing any of these
+    # re-runs ONLY the trait-update cell below, never the map cell, so the scene updates in
+    # place (lonboard's whole point). Reverse in particular does NOT touch the stream or the
+    # SQL: it just swaps a precomputed colour array onto the live layer.
     elevation_scale = mo.ui.number(
-        start=0.0, stop=50.0, step=0.1, value=6.0, label="Elevation scale"
+        start=0.0, stop=50.0, step=0.1, value=3.0, label="Elevation scale"
     )
     fill_opacity = mo.ui.number(
         start=0.0, stop=1.0, step=0.1, value=0.9, label="Opacity"
     )
-    mo.hstack([elevation_scale, fill_opacity], justify="start", gap=2)
-    return elevation_scale, fill_opacity
+    reverse_ramp = mo.ui.switch(value=True, label="Reverse ramp")
+    mo.hstack([elevation_scale, fill_opacity, reverse_ramp], justify="start", gap=2)
+    return elevation_scale, fill_opacity, reverse_ramp
 
 
 @app.cell
-def _(elevation_scale, fill_opacity, h3_layer):
-    # The only thing the number inputs do: nudge live traits on the running layer. No Map
-    # rebuild, no re-stream. This is the cell that reads the UI elements, so it is the only
-    # one marimo re-runs when they change.
+def _(colors_fwd, colors_rev, elevation_scale, fill_opacity, h3_layer, reverse_ramp):
+    # The only thing the controls do: nudge live traits on the running layer. No Map
+    # rebuild, no re-stream, no re-SQL. This is the cell that reads the UI elements, so it
+    # is the only one marimo re-runs when they change. Reverse just picks which precomputed
+    # colour array the layer shows.
     h3_layer.elevation_scale = elevation_scale.value
     h3_layer.opacity = fill_opacity.value
+    h3_layer.get_fill_color = colors_rev if reverse_ramp.value else colors_fwd
     return
 
 
