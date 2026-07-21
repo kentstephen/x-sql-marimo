@@ -310,7 +310,7 @@ async def _(
     # AOI area / H3 cell area BEFORE streaming (an upper bound: assumes full land coverage),
     # and stop if it exceeds the cap. Cheap pre-check, so a too-big AOI fails fast instead of
     # streaming for nothing. Reduce the H3 resolution or draw a smaller box.
-    HEX_LIMIT = 8_000_000
+    HEX_LIMIT = 5_000_000
     _cell_km2 = {8: 0.7373, 9: 0.10533, 10: 0.015047, 11: 0.0021496, 12: 0.00030712}[_res]
     _latm = (_s + _n) / 2
     _area_km2 = (
