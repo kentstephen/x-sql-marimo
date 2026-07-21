@@ -290,6 +290,7 @@ async def _(
     bbox,
     h3_res,
     make_h3_context,
+    mo,
     np,
     pa,
     tiles,
@@ -304,6 +305,27 @@ async def _(
     _store = S3Store(bucket="prd-tnm", region="us-west-2", skip_signature=True)
     _res = h3_res.value
     _w, _s, _e, _n = bbox
+
+    # Guard: refuse to build a scene the browser can't render. Estimate the cell count from
+    # AOI area / H3 cell area BEFORE streaming (an upper bound: assumes full land coverage),
+    # and stop if it exceeds the cap. Cheap pre-check, so a too-big AOI fails fast instead of
+    # streaming for nothing. Reduce the H3 resolution or draw a smaller box.
+    HEX_LIMIT = 8_000_000
+    _cell_km2 = {8: 0.7373, 9: 0.10533, 10: 0.015047, 11: 0.0021496, 12: 0.00030712}[_res]
+    _latm = (_s + _n) / 2
+    _area_km2 = (
+        abs(_e - _w) * 111.32 * np.cos(np.radians(_latm)) * abs(_n - _s) * 111.32
+    )
+    _est = _area_km2 / _cell_km2
+    mo.stop(
+        _est > HEX_LIMIT,
+        mo.md(
+            f"### Too many hexagons\n"
+            f"This AOI at this resolution is ~**{_est / 1e6:.1f}M** cells "
+            f"(limit **{HEX_LIMIT / 1e6:.0f}M**). Lower the H3 resolution or draw a "
+            f"smaller box."
+        ),
+    )
 
     # Target ground sampling ~ half the H3 edge, in degrees (1 deg lat ~ 111320 m).
     _edge_m = {8: 461.0, 9: 174.0, 10: 66.0, 11: 25.0, 12: 9.0}[_res]
