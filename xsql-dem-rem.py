@@ -18,15 +18,13 @@
 #     "numpy",
 # ]
 # ///
-"""Free-fly the USA: draw a box, stream the 10m DEM, aggregate to H3, detrend to a REM.
+"""Free-fly the USA: draw a box, stream the 10m DEM, aggregate to H3, render extruded.
 
-Same streaming/xarray-sql spine as xsql-dem-h3.py, with one added step: a Relative
-Elevation Model. After folding pixels into H3 cells, SQL fits a trend surface (a plane,
-by least squares) to the cell elevations and subtracts it, so each cell carries its
-height ABOVE the local trend rather than absolute elevation. On a valley or floodplain
-the plane approximates the river's longitudinal slope, so the REM reads as height above
-water and terraces / paleochannels / meander scars pop out. Colored with CARTOColors
-Emrld (a luminance-monotonic green ramp, deuteranope-safe).
+Same streaming/xarray-sql spine as xsql-dem-h3.py. After folding pixels into H3 cells,
+each cell's elevation is re-based to the scene: SQL subtracts the AOI minimum so the
+lowest cell sits at 0 and height reads RELATIVE to what's in view, not as absolute height
+above sea level. Colored with CARTOColors Emrld (a luminance-monotonic green ramp,
+deuteranope-safe), which normalizes over the scene's min -> max.
 
 Run:  uv run marimo edit xsql-dem-rem.py --sandbox
 """
@@ -396,72 +394,64 @@ async def _(
             for _i in range(len(_datasets))
         )
 
-        # Pass 1: fold pixels into cells, carrying each cell's centroid so the trend
-        # surface can be fit against position in the next pass.
-        _cells = ctx.sql(
-            f"""
-            SELECT h3_latlng_to_cell(lat, lon, CAST({_res} AS INT)) AS hex,
-                   avg(lat)       AS clat,
-                   avg(lon)       AS clon,
-                   avg(elevation) AS elevation,
-                   count(*)       AS n
-            FROM ({_union})
-            GROUP BY 1
-            """
-        ).to_arrow_table()
-        ctx.register_record_batches("cells", [_cells.to_batches()])
-
-        # Pass 2: least-squares plane fit  z ~ a + b*(lon-mlon) + c*(lat-mlat). SQL builds
-        # the normal-equation sums (centred on the mean position for conditioning); numpy
-        # solves the tiny 3x3. This is the REM's trend surface: on a floodplain the plane
-        # tracks the river's downstream slope, so subtracting it leaves height above water.
-        _m = ctx.sql("SELECT avg(clon) mlon, avg(clat) mlat FROM cells").to_arrow_table()
-        _mlon = float(_m["mlon"][0].as_py())
-        _mlat = float(_m["mlat"][0].as_py())
-        _s = ctx.sql(
-            f"""
-            SELECT count(*) n,
-                   sum(x)   sx,  sum(y)   sy,  sum(z)  sz,
-                   sum(x*x) sxx, sum(y*y) syy, sum(x*y) sxy,
-                   sum(x*z) sxz, sum(y*z) syz
-            FROM (SELECT clon - ({_mlon}) AS x, clat - ({_mlat}) AS y,
-                         elevation AS z FROM cells)
-            """
-        ).to_arrow_table().to_pydict()
-        _A = np.array(
-            [
-                [_s["n"][0],   _s["sx"][0],  _s["sy"][0]],
-                [_s["sx"][0],  _s["sxx"][0], _s["sxy"][0]],
-                [_s["sy"][0],  _s["sxy"][0], _s["syy"][0]],
-            ],
-            dtype="float64",
-        )
-        _rhs = np.array([_s["sz"][0], _s["sxz"][0], _s["syz"][0]], dtype="float64")
-        _a, _b, _c = np.linalg.lstsq(_A, _rhs, rcond=None)[0]  # robust if degenerate
-
-        # Pass 3: REM = elevation - plane, per cell, entirely in SQL. This is the end of the
-        # ETL: h3_table carries hex + true elevation + rem, and NOTHING about color. Color
-        # is a separate downstream cell, so changing the ramp never re-runs this stream/fold.
+        # Fold pixels into H3 cells, then re-base each cell's elevation to the scene:
+        # subtract the AOI minimum so the lowest cell sits at 0 and height reads RELATIVE to
+        # what's in view, not as absolute height above sea level. Color normalizes min->max
+        # downstream so it's unaffected; this is what makes the extrusion scene-relative.
         h3_table = ctx.sql(
             f"""
-            SELECT hex, elevation,
-                   elevation - (({_a}) + ({_b}) * (clon - ({_mlon}))
-                                       + ({_c}) * (clat - ({_mlat}))) AS rem
-            FROM cells
+            SELECT hex, elevation - MIN(elevation) OVER () AS elevation
+            FROM (
+                SELECT h3_latlng_to_cell(lat, lon, CAST({_res} AS INT)) AS hex,
+                       avg(elevation) AS elevation
+                FROM ({_union})
+                GROUP BY 1
+            )
             """
         ).to_arrow_table()
-        _slope = (_b * _b + _c * _c) ** 0.5 / 111.32  # m per degree -> m per km
-        print(f"H3 res {_res}: {h3_table.num_rows:,} cells; trend slope {_slope:.2f} m/km")
+
+        # flow = how far each hex sits below the ground around it. grid_disk gives each cell's
+        # ring; average the ring's elevation and subtract the cell, so a low spot where water
+        # collects comes out positive (bright) and ridges come out negative (dark).
+        import h3ronpy
+        _hx = np.asarray(h3_table["hex"])
+        _ev = np.asarray(h3_table["elevation"], dtype="float64")
+        _lut = dict(zip(_hx.tolist(), _ev.tolist()))
+        _disk = h3ronpy.grid_disk(_hx, 1)
+        try:
+            _rings = _disk.to_pylist()
+        except AttributeError:
+            _rings = pa.array(_disk).to_pylist()
+        _flow = np.empty(len(_hx), dtype="float64")
+        for _i, _r in enumerate(_rings):
+            _vals = [_lut[c] for c in _r if c in _lut]
+            _flow[_i] = sum(_vals) / len(_vals) - _ev[_i]
+        h3_table = h3_table.append_column("flow", pa.array(_flow))
+        print(f"H3 res {_res}: {h3_table.num_rows:,} cells")
     else:
         h3_table = pa.table(
             {
                 "hex": pa.array([], pa.uint64()),
                 "elevation": pa.array([], pa.float64()),
-                "rem": pa.array([], pa.float64()),
+                "flow": pa.array([], pa.float64()),
             }
         )
         print("no DEM pixels for this AOI")
     return (h3_table,)
+
+
+@app.cell
+def _(h3_table):
+    # Quick peek: scene-relative elevation vs flow (below-neighbors depth) per hex.
+    h3_table.select(["elevation", "flow"]).slice(0, 15)
+
+    return
+
+
+@app.cell
+def _(describe, h3_table):
+    describe(h3_table)
+    return
 
 
 @app.cell
@@ -495,17 +485,19 @@ def _():
 
 
 @app.cell
-def _(PALETTES, apply_continuous_cmap, h3_table, np, palette):
-    # COLOR CELL: separate from the ETL on purpose. Colors each hex by its actual ELEVATION,
-    # through the palette picked in the dropdown at the bottom. Depends only on
-    # h3_table["elevation"] + the palette, so it re-runs when the hexagons change (new AOI /
-    # resolution) or you switch palette, but the expensive stream + H3 fold never re-runs.
+def _(PALETTES, apply_continuous_cmap, flow_gain, h3_table, np, palette):
+    # COLOR CELL: separate from the ETL on purpose. Base is scene-relative ELEVATION; flow is
+    # added as an OFFSET (flow_gain * flow) so drainage etches into the elevation shading
+    # without losing the overall terrain read. Gain 0 = pure elevation. Depends on h3_table +
+    # palette + gain, so it re-runs on those but never re-streams / re-folds.
     #
-    # Domain is RELATIVE to the scene: the ramp spans this AOI's actual elevation min -> max,
-    # so the full palette is always used across whatever is in view. Both ramp directions are
-    # precomputed so the Reverse toggle downstream is a live trait swap.
+    # Domain is RELATIVE to the scene: the ramp spans this AOI's blended min -> max, so the
+    # full palette is always used. Both directions precomputed for the live Reverse swap.
     _cmap = PALETTES[palette.value]
-    _elev = np.asarray(h3_table["elevation"]).astype("float64")
+    _elev = (
+        np.asarray(h3_table["elevation"]).astype("float64")
+        + flow_gain.value * np.asarray(h3_table["flow"]).astype("float64")
+    )
     if _elev.size:
         _lo, _hi = float(_elev.min()), float(_elev.max())
         _norm = np.clip((_elev - _lo) / max(_hi - _lo, 1e-6), 0.0, 1.0)
@@ -530,8 +522,8 @@ def _(
     bbox,
     h3_table,
 ):
-    # The output scene: extruded H3 hexagons. Geometry (hex) and height (true elevation) come
-    # straight from h3_table as arrow columns.
+    # The output scene: extruded H3 hexagons. Geometry (hex) and height (scene-relative
+    # elevation) come straight from h3_table as arrow columns.
     #
     # This cell references NEITHER the colors NOR the palette NOR any control. marimo re-runs
     # any cell that reads a UI element or a changed value, and a re-run here would rebuild the
@@ -586,16 +578,19 @@ def _(PALETTES, mo):
     elevation_scale = mo.ui.number(
         start=0.0, stop=50.0, step=0.1, value=3.0, label="Elevation scale"
     )
+    flow_gain = mo.ui.number(
+        start=0.0, stop=50.0, step=0.5, value=8.0, label="Flow offset"
+    )
     fill_opacity = mo.ui.number(
         start=0.0, stop=1.0, step=0.1, value=0.9, label="Opacity"
     )
     reverse_ramp = mo.ui.switch(value=True, label="Reverse ramp")
     extruded = mo.ui.switch(value=True, label="Extruded")
     mo.hstack(
-        [palette, elevation_scale, fill_opacity, reverse_ramp, extruded],
+        [palette, elevation_scale, flow_gain, fill_opacity, reverse_ramp, extruded],
         justify="start", gap=2,
     )
-    return elevation_scale, extruded, fill_opacity, palette, reverse_ramp
+    return elevation_scale, extruded, fill_opacity, flow_gain, palette, reverse_ramp
 
 
 @app.cell
