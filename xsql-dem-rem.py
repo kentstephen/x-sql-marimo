@@ -569,7 +569,7 @@ def _(
         ],
         parameters={"depthTest": True, "blend": True},
     )
-    print(f"scene: {h3_table.num_rows:,} hexes, color from the separate color cell")
+    print(f"scene: {h3_table.num_rows:,} hexes")
     scene
     return (h3_layer,)
 
