@@ -28,7 +28,11 @@ server, no STAC API, no pixels leave object storage until the AOI asks for them.
 ## Run
 
 ```bash
-uv run marimo edit <notebook>.py --sandbox
+# DEM -> H3 (elevation)
+uv run marimo edit xsql-dem-h3.py --sandbox
+
+# DEM -> H3 with a flow offset on the elevation shading
+uv run marimo edit xsql-dem-rem.py --sandbox
 ```
 
 See `CLAUDE.md` for architecture and the reference-repo lineage.

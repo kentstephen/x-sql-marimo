@@ -249,7 +249,9 @@ def _(
         controls=[
             _geocoder,
             FullscreenControl(position="top-right"),
-            NavigationControl(),
+            # visualize_pitch makes the compass button call resetNorthPitch(): one click
+            # snaps back to north-up AND flat (pitch 0), not just north-up.
+            NavigationControl(visualize_pitch=True),
             ScaleControl(),
         ],
     )
@@ -444,13 +446,6 @@ async def _(
 def _(h3_table):
     # Quick peek: scene-relative elevation vs flow (below-neighbors depth) per hex.
     h3_table.select(["elevation", "flow"]).slice(0, 15)
-
-    return
-
-
-@app.cell
-def _(describe, h3_table):
-    describe(h3_table)
     return
 
 
@@ -485,21 +480,30 @@ def _():
 
 
 @app.cell
-def _(PALETTES, apply_continuous_cmap, flow_gain, h3_table, np, palette):
+def _(
+    PALETTES,
+    apply_continuous_cmap,
+    contrast,
+    flow_gain,
+    h3_table,
+    np,
+    palette,
+):
     # COLOR CELL: separate from the ETL on purpose. Base is scene-relative ELEVATION; flow is
     # added as an OFFSET (flow_gain * flow) so drainage etches into the elevation shading
     # without losing the overall terrain read. Gain 0 = pure elevation. Depends on h3_table +
-    # palette + gain, so it re-runs on those but never re-streams / re-folds.
+    # palette + gain + contrast, so it re-runs on those but never re-streams / re-folds.
     #
-    # Domain is RELATIVE to the scene: the ramp spans this AOI's blended min -> max, so the
-    # full palette is always used. Both directions precomputed for the live Reverse swap.
+    # Domain is the CONTRAST WINDOW: a sub-range of the scene's own elevation min..max (never
+    # CONUS), so dragging the handles in spends the whole palette on a narrower band. Both
+    # directions precomputed for the live Reverse swap.
     _cmap = PALETTES[palette.value]
     _elev = (
         np.asarray(h3_table["elevation"]).astype("float64")
         + flow_gain.value * np.asarray(h3_table["flow"]).astype("float64")
     )
     if _elev.size:
-        _lo, _hi = float(_elev.min()), float(_elev.max())
+        _lo, _hi = float(contrast.value[0]), float(contrast.value[1])
         _norm = np.clip((_elev - _lo) / max(_hi - _lo, 1e-6), 0.0, 1.0)
         colors_fwd = apply_continuous_cmap(_norm, _cmap, alpha=1.0)
         colors_rev = apply_continuous_cmap(1.0 - _norm, _cmap, alpha=1.0)
@@ -556,7 +560,9 @@ def _(
         basemap=MaplibreBasemap(style=CartoBasemap.DarkMatter),
         controls=[
             FullscreenControl(position="top-right"),
-            NavigationControl(),
+            # Compass click -> north-up and flat (resetNorthPitch), the way out of a
+            # tilted 3D view without dragging the pitch back by hand.
+            NavigationControl(visualize_pitch=True),
             ScaleControl(),
         ],
         parameters={"depthTest": True, "blend": True},
@@ -564,6 +570,33 @@ def _(
     print(f"scene: {h3_table.num_rows:,} hexes")
     scene
     return (h3_layer,)
+
+
+@app.cell
+def _(h3_table, mo, np):
+    # Contrast window for the color domain. Its bounds ARE this scene's elevation min..max, so
+    # it depends on h3_table and resets to the full range on every new AOI (right behavior:
+    # bounds change per scene). Drag the handles in to spend the whole palette on a narrower
+    # band, a live recolor, never a re-stream.
+    _elev = np.asarray(h3_table["elevation"]).astype("float64")
+    if _elev.size:
+        _clo, _chi = float(np.floor(_elev.min())), float(np.ceil(_elev.max()))
+    else:
+        _clo, _chi = 0.0, 1.0
+    if _chi <= _clo:
+        _chi = _clo + 1.0
+    contrast = mo.ui.range_slider(
+        start=_clo,
+        stop=_chi,
+        value=[_clo, _chi],
+        step=max((_chi - _clo) / 200.0, 0.1),
+        label="Elevation contrast (m)",
+        show_value=True,
+        full_width=True,
+        debounce=True,  # recolor on release, not every drag tick (one buffer push, not dozens)
+    )
+    contrast
+    return (contrast,)
 
 
 @app.cell
@@ -576,13 +609,13 @@ def _(PALETTES, mo):
         options=list(PALETTES), value="Emrld", label="Palette"
     )
     elevation_scale = mo.ui.number(
-        start=0.0, stop=50.0, step=0.1, value=3.0, label="Elevation scale"
+        start=0.0, stop=50.0, step=0.1, value=3.0, debounce=True, label="Elevation scale"
     )
     flow_gain = mo.ui.number(
-        start=0.0, stop=50.0, step=0.5, value=8.0, label="Flow offset"
+        start=0.0, stop=50.0, step=0.5, value=8.0, debounce=True, label="Flow offset"
     )
     fill_opacity = mo.ui.number(
-        start=0.0, stop=1.0, step=0.1, value=0.9, label="Opacity"
+        start=0.0, stop=1.0, step=0.1, value=0.9, debounce=True, label="Opacity"
     )
     reverse_ramp = mo.ui.switch(value=True, label="Reverse ramp")
     extruded = mo.ui.switch(value=True, label="Extruded")
@@ -590,7 +623,14 @@ def _(PALETTES, mo):
         [palette, elevation_scale, flow_gain, fill_opacity, reverse_ramp, extruded],
         justify="start", gap=2,
     )
-    return elevation_scale, extruded, fill_opacity, flow_gain, palette, reverse_ramp
+    return (
+        elevation_scale,
+        extruded,
+        fill_opacity,
+        flow_gain,
+        palette,
+        reverse_ramp,
+    )
 
 
 @app.cell
