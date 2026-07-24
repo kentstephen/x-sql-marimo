@@ -1,4 +1,4 @@
-# `xsql-dem-1m.py` — context and open work
+# `xsql-dem-1m.py`: context and open work
 
 Working notes for the 1-meter notebook. The 10m notebook (`xsql-dem-rem.py`) reads the
 **seamless** DEM, where one nationwide VRT gives one answer per AOI. The 1m product is
@@ -33,26 +33,44 @@ not an edge case. Streaming first and asking questions later is the wrong defaul
 
 ### What it should do instead
 
-The user must **see the candidates and choose** before anything streams:
+**The notebook has to STOP at the picker map.** Not "load less", not "warn earlier".
+Execution halts there and waits for the user. Nothing downstream of the picker runs until
+a person has drawn an AOI and chosen tiles.
 
-- Show footprints and previews first. Streaming into H3 happens only on an explicit
-  action (a run button / explicit confirm), never as a reactive consequence of moving the
-  AOI or changing a dropdown.
-- Selection should be explicit and multi-select at the tile level, not "whatever the
-  project grouping produced". The user decides which tiles compose the surface.
-- Surface the cost *before* committing: estimated hexagon count, pixel count, and number
-  of COGs, so the choice is informed rather than discovered by the guard tripping.
-- Stop calling a set of intersecting tiles a "mosaic" unless it has actually been shown to
-  be contiguous. Say what is known: N tiles from project X covering M% of the AOI.
+The required order, with a hard stop between each stage:
 
-The existing hexagon guard stays, but it should be a last-resort backstop rather than the
-primary feedback mechanism.
+1. **Nothing loads until an AOI is drawn.** No default AOI streaming on open. The picker
+   comes up empty and waits.
+2. **AOI drawn** -> resolve and display candidates only: footprints, tile outlines,
+   coarse previews. This stage reads overviews at most. It must never touch full
+   resolution.
+3. **Tiles selected explicitly.** The user picks the individual tiles, or composes a
+   mosaic from them, or picks exactly one tile to look at. Multi-select at the *tile*
+   level. Not "whatever the project grouping produced".
+4. **Explicit trigger** (run button) -> only now does the scene build and stream.
+
+The failure this prevents: silently pulling ~18 tiles at millions of points each because
+they happened to intersect the box. That is not a mosaic, it is everything that touched
+the AOI, and at 1m it is an enormous amount of data to move on an accidental drag of the
+mouse.
+
+Supporting requirements:
+
+- Surface the cost *before* committing: tile count, estimated pixels, estimated hexagons.
+  The user should decide with the number in front of them.
+- Stop calling a set of intersecting tiles a "mosaic" unless it has been shown to be
+  contiguous. Say what is actually known: N tiles from project X covering M% of the AOI.
+- The 5M-hexagon guard stays, but demoted to a last-resort backstop. It is currently doing
+  the job that explicit selection should be doing, which is why it fires so routinely.
+
+`mo.stop` at the picker is the marimo-native way to enforce the halt, with the selection
+UI and the run button gating everything below it.
 
 ---
 
 ## Catalogs (two, deliberately not joined)
 
-### TNM Access API — what actually streams
+### TNM Access API (what actually streams)
 `https://tnmaccess.nationalmap.gov/api/v1/products`, dataset
 `Digital Elevation Model (DEM) 1 meter`. AOI-scoped, keyless, and every item carries its
 COG's `prd-tnm` S3 URL plus a lon/lat footprint. Throws intermittent 500s, so the query
@@ -62,7 +80,7 @@ Chosen over the alternatives because there is no nationwide VRT for 1m the way t
 for 1/3 arc-second, and `1m/FullExtentSpatialMetadata/FESM_1m.gpkg` is **1.86 GB**, far
 too heavy to pull per AOI.
 
-### 3DEP Elevation Index layer 18 — the discovery overlay
+### 3DEP Elevation Index layer 18 (the discovery overlay)
 `https://index.nationalmap.gov/arcgis/rest/services/3DEPElevationIndex/MapServer/18/query`
 ("1 Meter"). Real project footprint polygons: the same service the National Map downloader
 draws. Three hard-won quirks:
@@ -116,21 +134,21 @@ themselves are the problem, so no amount of serialisation fixes it.
 
 ### Nothing in the Rust stack fills the gap
 
-- **geodatafusion** — no `ST_Transform` in the function tables, and no proj crate in
+- **geodatafusion**: no `ST_Transform` in the function tables, and no proj crate in
   `Cargo.toml` (it pulls `geo`, `geos`, `geoarrow`). Has Python bindings, so it remains
   interesting for other spatial predicates.
-- **geoarrow-rs** — `GeoType` carries CRS *metadata* only (`crs`, `with_crs`). No proj
+- **geoarrow-rs**: `GeoType` carries CRS *metadata* only (`crs`, `with_crs`). No proj
   crate anywhere in the workspace.
-- **async-tiff / async-geotiff** — pixel-to-CRS mapping only (`crs`, `transform`, `xy`,
+- **async-tiff / async-geotiff**: pixel-to-CRS mapping only (`crs`, `transform`, `xy`,
   `index`). `crs` returns a pyproj object; there is no CRS-to-CRS transform.
 
 ### Three options, and the one chosen
 
-1. **Inline polynomial in SQL** — transform in SQL, but ~20 magic float literals per tile
+1. **Inline polynomial in SQL**: transform in SQL, but ~20 magic float literals per tile
    in the query text. Rejected as unreadable.
-2. **Reproject in Python before SQL** — `SELECT lat, lon, elevation FROM dem_n`. Cleanest
+2. **Reproject in Python before SQL**: `SELECT lat, lon, elevation FROM dem_n`. Cleanest
    SQL, but the transform sits outside the query. Known-good fallback.
-3. **Per-tile closure UDF — CHOSEN.**
+3. **Per-tile closure UDF. CHOSEN.**
 
 Option 3 fits the projection rather than calling it. Inverse transverse Mercator is smooth
 over a 10 km tile, so lon and lat are each an order-3 polynomial in `(x - cx, y - cy)`.
