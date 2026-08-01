@@ -89,11 +89,17 @@ Defaults: hillshade 0.7, relief smooth 4, colour smooth 2, density 1024.
 
 ## Unverified, needs eyes
 
-- **Texture V orientation.** Image row 0 is built as SOUTH, because mesh `tex_coord` v runs
-  0..1 south to north and WebGL samples v=0 at the first row. If the scene renders mirrored
-  vertically, flip `_lat` in the texel-index cell. This has never been confirmed visually.
+- **Is the colouring flipped north-south?** In plain terms: the texture might be applied
+  upside down, so the colours from the north end of the AOI land on the south end and vice
+  versa. The relief would still look right, only the colour would be wrong, which is why it
+  is easy to miss. Image row 0 is built as SOUTH, on the assumption that mesh `tex_coord` v
+  runs 0..1 south to north and WebGL samples v=0 at the first row. Never confirmed visually.
+  If it is wrong, flip `_lat` in the texel-index cell. Stephen looked and it seemed fine, so
+  this is low priority.
 - Whether the current defaults actually read as terrain. Stephen's last look was before the
   hillshade and relief-smooth landed.
+- Stephen changed the texture size while looking; the committed default may not be what he
+  settled on.
 
 ## NEXT: joining vector data (buildings) on H3
 
@@ -153,3 +159,47 @@ is sub-texel and invisible.
 Which points at option 3 for anything where the building should look like a building, and
 options 1-2 for anything where buildings are an aggregate statistic (density, mean height,
 built fraction per cell). That choice is Stephen's and has not been made.
+
+## NEXT ORDER OF BUSINESS: drape NAIP over a wide swath
+
+Not today. Stated goal: take NAIP imagery and drape it over the terrain surface across a
+**wide swath**, wherever NAIP is available, rather than a small AOI.
+
+Areas he wants to look at:
+
+- the White Mountains (New Hampshire, i.e. the current Mt Washington neighbourhood)
+- other mountainous country: New Mexico, Wyoming, Montana
+
+Why this fits the surface layer specifically: draping imagery is exactly what a textured mesh
+is FOR. The texture stops being a colour ramp over an H3 fold and becomes actual photography,
+and the mesh underneath stays the same fixed cost regardless of swath size. This is the
+use case the render path was heading toward without anyone saying so.
+
+Things that will come up, noted now so they are not surprises:
+
+- **Wide swath vs texture ceiling.** The texture caps out (2048 over 7 km is already 3.5 m
+  per texel). A wide swath at NAIP's 0.6-1 m native resolution cannot fit in one texture, so
+  this probably wants either several SurfaceLayers tiled side by side, or an accepted coarse
+  ground sample, or the `RasterLayer` tile-callback path that was found and parked earlier in
+  the session (see MEMORY: it takes arbitrary Python `_fetch_tile` / `_render_tile` and the
+  frontend drives it from the viewport).
+- NAIP lives on `prd-tnm` too, and there is prior art: `deck-terrain-naip-marimo/` and
+  `3dep-seamless-duckdb-h3/naip_usgs_join_h3_1m.py` in the reference repos.
+- NAIP and S1M do not share a grid or a vintage, so the two have to be co-registered. The
+  existing per-tile fitted lon/lat UDF handles the projection side.
+
+## GIVE UP: per-feature picking
+
+Recorded as abandoned, not deferred. There is no click-a-thing-and-see-its-values in this
+notebook and there is not going to be one.
+
+- `SimpleMeshLayer` has no per-feature hit test, so the surface cannot be picked at all.
+- lonboard has no selection model for `H3HexagonLayer` either, so nothing was lost by
+  switching renderers.
+- Earlier in the project two selection UIs were built and both were rejected as unusable
+  (`mo.ui.table` multi-select over a tile list, and py-maplibregl click-to-toggle
+  footprints). The conclusion then was that a linked list + map + cart is an APPLICATION,
+  not a notebook, and Stephen did not want to build that.
+
+Inverse lookup (screen point -> lon/lat -> `latLngToCell` -> the table) remains technically
+possible if this is ever revived, but it is not on the list.
