@@ -52,7 +52,7 @@ Run:  uv run marimo edit xsql-s1m-h3.py --sandbox
 
 import marimo
 
-__generated_with = "0.23.15"
+__generated_with = "0.23.16"
 app = marimo.App(width="full")
 
 
@@ -463,7 +463,7 @@ def _(mo):
             "res 12 ·  ~9.4 m hex": 12,
             "res 13 ·  ~3.6 m hex": 13,
             "res 14 ·  ~1.35 m hex (near native)": 14,
-            "res 15 ·  ~0.5 m hex (sub-native)": 15,
+         #   "res 15 ·  ~0.5 m hex (sub-native)": 15,
         },
         value="res 12 ·  ~9.4 m hex",
         label="H3 resolution",
@@ -550,15 +550,36 @@ def _(Transformer, get_bbox, h3_res, mo, np, tiles_albers, tiles_all):
     )
 
     # Size each tile's read before it happens, and print it. The read is a window on ONE
-    # overview, picked the same way the streaming cell picks it: the coarsest level whose
-    # ground sampling still sits at or under half the H3 edge. S1M tiles are uniform
-    # (10000 x 10000 at 1 m with the standard power-of-two overview ladder), so the pixel
-    # count in the log is what actually gets pulled.
-    _edge_m = {11: 25.0, 12: 9.4, 13: 3.6, 14: 1.35, 15: 0.51}[h3_res.value]
-    _target_m = _edge_m / 2.0
+    # overview, and WHICH overview is the thing that decides whether the scene comes out
+    # solid or full of holes. It is chosen here, once, for the whole scene, and the
+    # streaming cell honors it exactly.
+    #
+    # The rule is geometric, not statistical. Pixel centres form a square lattice of spacing
+    # p, whose covering radius is p/sqrt(2): every point in the plane lies within that
+    # distance of a lattice point, so any convex shape containing a disk of radius p/sqrt(2)
+    # must contain at least one pixel centre. An H3 cell of area A has apothem
+    # 0.5373*sqrt(A). Set that at or above p/sqrt(2) and EVERY cell is guaranteed a pixel:
+    #
+    #     p <= sqrt(2) * 0.5373 * sqrt(A) = 0.76 * sqrt(A)
+    #
+    # SAFETY pulls that back to 0.6 to absorb H3's per-cell area spread and the small
+    # stretch between Albers metres and the sphere. Res 13 lands on the 2 m overview, res 14
+    # on 1 m, res 12 on 8 m, res 11 on 16 m: all CHEAPER than the old edge/2 rule, and
+    # correct rather than approximately correct.
+    #
+    # Why this matters more than it looks: a cell that receives no pixel is not a null row.
+    # It never becomes a GROUP BY key at all, so it is simply absent from the layer and
+    # reads as a hole. Nothing downstream can tell it apart from ground that was never in
+    # the AOI, which is why the level is fixed here and never renegotiated per tile.
+    H3_CELL_M2 = {11: 2149.6, 12: 307.09, 13: 43.870, 14: 6.2673, 15: 0.89532}
+    SAFETY = 0.6
+    _target_m = SAFETY * np.sqrt(H3_CELL_M2[h3_res.value])
     OVERVIEW_RES = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0]
     _fit = [r for r in OVERVIEW_RES if r <= _target_m]
+    # No level fits only at res 15 (needs 0.57 m from a 1 m product), which is why res 15 is
+    # not in the dropdown: it cannot be filled from S1M at any AOI size.
     read_res_m = _fit[-1] if _fit else OVERVIEW_RES[0]
+    px_per_hex = H3_CELL_M2[h3_res.value] / read_res_m**2
 
     candidates = []
     for _i in np.flatnonzero(_hit):
@@ -581,7 +602,8 @@ def _(Transformer, get_bbox, h3_res, mo, np, tiles_albers, tiles_all):
 
     print(
         f"AOI {tuple(round(v, 4) for v in bbox)} -> {len(candidates)} S1M tile(s) · "
-        f"reading the {read_res_m:g} m overview for H3 res {h3_res.value}"
+        f"reading the {read_res_m:g} m overview for H3 res {h3_res.value} "
+        f"(~{px_per_hex:.0f} px per hex; >= 1 in every cell is guaranteed)"
     )
     for _c in candidates:
         print(
@@ -650,9 +672,19 @@ async def _(
         ),
     )
 
+    # The 5M-hex stop above is the ONLY gate on scene size, deliberately. There used to be a
+    # second one here, a 3M-pixel per-tile budget that walked to coarser overviews until the
+    # window fit. It was the bug: it silently overrode the level the resolution needs, it ran
+    # per tile against each tile's clipped window (so one scene could read 2 m on one tile
+    # and 8 m on its neighbour, solid on one side of a tile seam and gappy on the other), and
+    # the log above had already printed the level it was ABOUT to abandon. Two independent
+    # caps that disagreed, and the quiet one won.
+    #
+    # It is not needed. The hex cap already bounds the read, because pixels per hex is now
+    # fixed per resolution: 5M cells is at most ~55M pixels at res 13 (2 m), ~31M at res 14
+    # (1 m), ~24M at res 12 (8 m). Bounded by the thing you can actually see on screen.
     _store = S3Store(bucket="prd-tnm", region="us-west-2", skip_signature=True)
     _res = h3_res.value
-    _PIXEL_BUDGET = 3_000_000  # per-tile window cap; step coarser if exceeded
 
     def _window(reader, aoi_proj):
         # AOI (already in Albers) clipped to the reader's extent, in pixel coords.
@@ -675,15 +707,14 @@ async def _(
     async def _read_tile(tile):
         g = await GeoTIFF.open(tile["key"], store=_store)
         cands = sorted([g, *g.overviews], key=lambda r: r.res[0])
+        # The coarsest level at or under read_res_m, and NOTHING coarser. Every tile in the
+        # scene resolves to the same ground sampling this way, so there is no seam where one
+        # tile fills its cells and the next does not.
         fit_lvls = [r for r in cands if r.res[0] <= read_res_m]
-        start = cands.index(fit_lvls[-1]) if fit_lvls else 0
-        # Walk from the matched overview toward coarser until the window fits the budget.
-        for reader in (cands[start:] if fit_lvls else cands):
-            win = _window(reader, aoi_albers)
-            if win is None:
-                return None
-            if win.width * win.height <= _PIXEL_BUDGET or reader is cands[-1]:
-                break
+        reader = fit_lvls[-1] if fit_lvls else cands[0]
+        win = _window(reader, aoi_albers)
+        if win is None:
+            return None
         r = await reader.read(window=win)
         ma = r.as_masked()[0]
         elev = np.ma.filled(ma.astype("float32"), np.nan)  # nodata -> NaN
@@ -701,7 +732,9 @@ async def _(
         # The one pyproj call for this tile, here on the main thread: fit lon/lat over the
         # window actually read (not the full tile, so the fit is if anything easier).
         fit, err_mm = fit_lonlat(g.crs, (left, bottom, right, top))
-        return ds, g.crs.to_epsg(), fit, err_mm
+        # Carry the level ACTUALLY read so the summary can state it. The old code printed an
+        # intent and then read something else; nothing in the output contradicted it.
+        return ds, g.crs.to_epsg(), fit, err_mm, float(reader.res[0])
 
     # Exactly which objects this scene reads, spelled out in full and BEFORE the reads, so
     # the list is there to compare against even if a fetch fails. obstore addresses the
@@ -712,10 +745,13 @@ async def _(
 
     _datasets = [d for d in await asyncio.gather(*[_read_tile(t) for t in candidates]) if d]
     if _datasets:
-        _px = sum(int(d["elevation"].size) for d, _, _, _ in _datasets)
-        _worst = max(err for *_, err in _datasets)
+        _px = sum(int(d[0]["elevation"].size) for d in _datasets)
+        _worst = max(d[3] for d in _datasets)
+        _levels = sorted({d[4] for d in _datasets})
         print(
             f"streamed {_px:,} pixels from {len(_datasets)}/{len(candidates)} tile(s) · "
+            f"read at {'/'.join(f'{v:g}' for v in _levels)} m "
+            f"(asked {read_res_m:g} m) · "
             f"EPSG 6350 · lon/lat fit worst case {_worst:.4f} mm"
         )
 
@@ -728,7 +764,7 @@ async def _(
         # subquery and read as p.lon / p.lat in the outer one: one transform per pixel, not
         # one per ordinate.
         ctx = make_h3_context()
-        for _i, (_d, _, _fit, _) in enumerate(_datasets):
+        for _i, (_d, _, _fit, _, _) in enumerate(_datasets):
             ctx.from_dataset(f"dem_{_i}", _d, chunks={"y": 1024})
             ctx.register_udf(make_lonlat_udf(f"to_lonlat_{_i}", _fit))
         _union = " UNION ALL ".join(
@@ -942,8 +978,33 @@ def _(h3_table, mo, np):
         full_width=True,
         debounce=True,  # recolor on release, not every drag tick
     )
-    contrast
+    # NOT displayed here. The cell below renders it under a strip of the live palette, so
+    # this cell can keep depending on h3_table ALONE: palette and reverse must never reach
+    # it, or picking a new palette would rebuild the slider and throw away the window you
+    # dragged.
     return (contrast,)
+
+
+@app.cell
+def _(PALETTES, contrast, mo, palette, reverse_ramp):
+    # The slider paints the ramp it controls. Same palette and same DIRECTION as the scene,
+    # so "reversed" is something you see rather than something you infer from a switch, and
+    # the strip doubles as the scene's legend: left end is the low handle's elevation, right
+    # end is the high handle's, everything outside the window is clamped to those ends.
+    #
+    # Its own cell so the slider above is never rebuilt. This one depends on palette and
+    # reverse_ramp; the slider depends only on h3_table. Repainting the strip therefore costs
+    # nothing and preserves the dragged window, the same split the scene/color cells use.
+    _hex = PALETTES[palette.value].hex_colors
+    if reverse_ramp.value:
+        _hex = _hex[::-1]
+    _strip = mo.Html(
+        '<div style="height:14px;width:100%;border-radius:3px;'
+        'border:1px solid rgba(128,128,128,0.35);'
+        f'background:linear-gradient(to right,{",".join(_hex)});"></div>'
+    )
+    mo.vstack([_strip, contrast], gap=0)
+    return
 
 
 @app.cell

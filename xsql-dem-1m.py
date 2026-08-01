@@ -298,7 +298,7 @@ def _(mo):
             "res 14 ·  ~1.35 m hex (near native)": 14,
             "res 15 ·  ~0.5 m hex (sub-native)": 15,
         },
-        value="res 13 ·  ~3.6 m hex",
+        value="res 12 ·  ~9.4 m hex",
         label="H3 resolution",
     )
     h3_res
