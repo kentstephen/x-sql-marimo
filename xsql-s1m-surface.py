@@ -323,7 +323,7 @@ def _(Transformer, XarrayContext, coordinates_to_cells, h3ronpy, np, pa, udf):
 
 
 @app.cell
-def _(np, pathlib, sqlite3, struct):
+def _(Transformer, np, pathlib, sqlite3, struct):
     # Verbatim from xsql-s1m-h3.py: the national S1M index is one ~15 MB GeoPackage, which
     # is SQLite, so stdlib sqlite3 reads it and every AOI is answered from a local file.
     S3_BASE = "https://prd-tnm.s3.amazonaws.com/"
@@ -793,10 +793,6 @@ async def _(
     return (h3_table,)
 
 
-
-
-
-
 @app.cell
 def _():
     # Palette registry: matplotlib + CARTOColors sequential ramps. All luminance-monotonic
@@ -1228,7 +1224,15 @@ def _(PALETTES, contrast, mo, palette, reverse_ramp):
 
 
 @app.cell
-def _(fill_opacity, positions, surface, tex_coords, texture, triangles, wireframe):
+def _(
+    fill_opacity,
+    positions,
+    surface,
+    tex_coords,
+    texture,
+    triangles,
+    wireframe,
+):
     # The only thing the controls do: swap traits on the running layer. No Map rebuild, no
     # re-stream, no re-fold, no re-bin.
     #
