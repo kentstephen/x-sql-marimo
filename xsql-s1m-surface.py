@@ -49,6 +49,18 @@ The honest trade, stated up front:
     plateaus; below it, the surface interpolates between cell heights while the texture
     keeps full hex detail. The slider lets you find where that stops mattering.
 
+SMOOTHING. "Can we smooth the hexes" has an answer that is not "go to a finer resolution"
+(each H3 level is 7x the cells). Because the styling is now an image, the shading VALUE can
+be blurred in texture space before it is coloured, which softens the plateau walls without
+touching mesh height and without refolding anything. The `smooth` slider does that, NaN-aware
+so the blur cannot bleed zeros in from outside the scene. At 0 you get hard hex edges.
+
+CONTROLS. The full viz set from `xsql-s1m-h3.py` is here: palette, elevation scale, flow
+offset, opacity, reverse, and the contrast range slider under a strip of the live ramp that
+doubles as the legend. None of them rebuild the Map. The layer is built once from placeholder
+geometry and the update cell at the bottom swaps traits on it, so the view you flew to
+survives every adjustment. Only the renderer radio rebuilds.
+
 `SurfaceLayer` is experimental and unexported (it is not in `lonboard.experimental.__init__`,
 only `TextLayer` is). It works. One bug is patched below; see the PARQUET PATCH cell.
 
@@ -522,20 +534,32 @@ async def _(
     return (h3_table,)
 
 
+
+
 @app.cell
 def _():
+    # Palette registry: matplotlib + CARTOColors sequential ramps. All luminance-monotonic
+    # and free of red/green opposition, so they survive a deuteranope simulation.
     from palettable.matplotlib import Viridis_20, Inferno_20, Magma_20, Plasma_20
-    from palettable.cartocolors.sequential import BluYl_7, Teal_7, Mint_7, PurpOr_7
+    from palettable.cartocolors.sequential import (
+        Emrld_7,
+        Teal_7,
+        BluYl_7,
+        Mint_7,
+        Sunset_7,
+        PurpOr_7,
+    )
 
-    # All luminance-monotonic, no red/green opposition.
     PALETTES = {
-        "BluYl": BluYl_7,
         "Viridis": Viridis_20,
         "Plasma": Plasma_20,
         "Inferno": Inferno_20,
         "Magma": Magma_20,
+        "Emrld": Emrld_7,
         "Teal": Teal_7,
+        "BluYl": BluYl_7,
         "Mint": Mint_7,
+        "Sunset": Sunset_7,
         "PurpOr": PurpOr_7,
     }
     return (PALETTES,)
@@ -543,60 +567,61 @@ def _():
 
 @app.cell
 def _(PALETTES, mo):
-    palette = mo.ui.dropdown(
-        options=list(PALETTES), value="BluYl", label="Palette"
+    # The viz controls, ported from xsql-s1m-h3.py. None of them touch the stream or the SQL,
+    # and none of them rebuild the Map: the update cell at the bottom swaps traits on the
+    # running layer instead, so the view you flew to survives every adjustment.
+    palette = mo.ui.dropdown(options=list(PALETTES), value="Emrld", label="Palette")
+    elevation_scale = mo.ui.number(
+        start=0.0, stop=50.0, step=0.1, value=3.0, debounce=True, label="Elevation scale"
     )
-    reverse_ramp = mo.ui.checkbox(value=True, label="Reverse ramp")
     flow_gain = mo.ui.number(
-        start=0.0, stop=20.0, step=0.5, value=8.0, label="Flow gain"
+        start=0.0, stop=50.0, step=0.5, value=8.0, debounce=True, label="Flow offset"
     )
-    mo.hstack([palette, reverse_ramp, flow_gain], justify="start", gap=2)
-    return flow_gain, palette, reverse_ramp
+    fill_opacity = mo.ui.number(
+        start=0.0, stop=1.0, step=0.1, value=1.0, debounce=True, label="Opacity"
+    )
+    reverse_ramp = mo.ui.switch(value=True, label="Reverse ramp")
+    wireframe = mo.ui.switch(value=False, label="Wireframe")
+    mo.hstack(
+        [palette, elevation_scale, flow_gain, fill_opacity, reverse_ramp, wireframe],
+        justify="start",
+        gap=2,
+    )
+    return elevation_scale, fill_opacity, flow_gain, palette, reverse_ramp, wireframe
 
 
 @app.cell
-def _(
-    PALETTES,
-    apply_continuous_cmap,
-    flow_gain,
-    h3_table,
-    np,
-    palette,
-    reverse_ramp,
-):
-    # COLOUR, identical in spirit to the real notebook: scene-relative elevation with flow
-    # added as an OFFSET so drainage etches into the terrain shading. This array is what
-    # `get_fill_color` receives in the H3 path and what gets PAINTED INTO THE TEXTURE in the
-    # surface path, so both renderers below are showing the exact same numbers.
-    _cmap = PALETTES[palette.value]
-    _v = np.asarray(h3_table["elevation"]).astype("float64") + flow_gain.value * np.asarray(
-        h3_table["flow"]
-    ).astype("float64")
-    if _v.size:
-        _lo, _hi = float(_v.min()), float(_v.max())
-        _norm = np.clip((_v - _lo) / max(_hi - _lo, 1e-6), 0.0, 1.0)
-        if reverse_ramp.value:
-            _norm = 1.0 - _norm
-        _rgb = np.asarray(apply_continuous_cmap(_norm, _cmap, alpha=1.0))
-        # apply_continuous_cmap returns RGB for some palettes and RGBA for others. The
-        # texture path indexes into a fixed 4-wide array, so normalise here rather than
-        # branching downstream.
-        if _rgb.shape[1] == 3:
-            _rgb = np.concatenate(
-                [_rgb, np.full((_rgb.shape[0], 1), 255, dtype=_rgb.dtype)], axis=1
-            )
-        cell_colors = _rgb.astype("uint8")
-    else:
-        cell_colors = np.zeros((0, 4), dtype="uint8")
-    return (cell_colors,)
+def _(mo):
+    # THE TWO COSTS, each on its own control, which is the whole point of this notebook.
+    #
+    # mesh_density is GEOMETRY. 256 is 66k vertices whether the fold produced 40k cells or
+    # 4M. tex_size is STYLING, one image upload.
+    #
+    # smooth is the answer to "can we smooth the hexes". It is a box blur on the SHADING
+    # VALUE, applied in texture space, so it softens the ramp without touching mesh height
+    # and without going to a finer H3 resolution (which would be 7x the cells per level).
+    # At 0 it is a no-op and you get hard hex edges.
+    mesh_density = mo.ui.slider(
+        start=32, stop=768, step=32, value=256,
+        label="Mesh density (cells/side)", show_value=True,
+    )
+    tex_size = mo.ui.dropdown(
+        options={"1024": 1024, "2048": 2048, "4096": 4096},
+        value="2048",
+        label="Texture size",
+    )
+    smooth = mo.ui.slider(
+        start=0, stop=12, step=1, value=0, label="Smooth (texels)", show_value=True
+    )
+    mo.hstack([mesh_density, tex_size, smooth], justify="start", gap=2)
+    return mesh_density, smooth, tex_size
 
 
 @app.cell
 def _(h3_table, np):
-    # The one lookup both the mesh and the texture go through: an H3 cell id -> its row in
-    # h3_table. Sort once, then every sample is a searchsorted. `ok` is False for cells that
-    # are not in the scene at all (AOI corners, nodata holes), which the texture turns into
-    # transparent texels and the mesh turns into zero height.
+    # Cell id -> row in h3_table. Sort once, then every sample is a searchsorted. `ok` is
+    # False for cells not in the scene at all (AOI corners, nodata holes), which the texture
+    # turns transparent and the mesh turns into zero height.
     _hex = np.asarray(h3_table["hex"]).astype("uint64")
     _order = np.argsort(_hex)
     _sorted = _hex[_order]
@@ -613,72 +638,191 @@ def _(h3_table, np):
 
 
 @app.cell
-def _(mo):
-    # The two knobs this notebook is actually about.
-    #
-    # mesh_density is the GEOMETRY cost and it is the whole point: it does not move when the
-    # cell count moves. 256 means 257^2 = 66k vertices and 131k triangles no matter whether
-    # the H3 fold produced 40k cells or 4M.
-    #
-    # tex_size is the STYLING cost, one image upload. 2048 is 16 MB of RGBA and shows hex
-    # edges cleanly at res 12 over this AOI.
-    mesh_density = mo.ui.slider(
-        start=32, stop=768, step=32, value=256, label="Mesh density (cells/side)",
-        show_value=True,
+def _(flow_gain, h3_table, np):
+    # THE SHADING VALUE, per cell: scene-relative elevation with flow added as an OFFSET so
+    # drainage etches into the terrain shading. Gain 0 is pure elevation. Both renderers and
+    # the contrast slider read this one array, so they cannot disagree.
+    cell_shade = np.asarray(h3_table["elevation"]).astype("float64") + flow_gain.value * (
+        np.asarray(h3_table["flow"]).astype("float64")
     )
-    tex_size = mo.ui.dropdown(
-        options={"512": 512, "1024": 1024, "2048": 2048, "4096": 4096},
-        value="2048",
-        label="Texture size",
-    )
-    elevation_scale = mo.ui.number(
-        start=0.5, stop=10.0, step=0.5, value=3.0, label="Elevation scale"
-    )
-    mo.hstack([mesh_density, tex_size, elevation_scale], justify="start", gap=2)
-    return elevation_scale, mesh_density, tex_size
+    return (cell_shade,)
 
 
 @app.cell
-def _(
-    bbox,
-    cell_colors,
-    cell_rows,
-    coordinates_to_cells,
-    h3_res,
-    np,
-    pa,
-    tex_size,
-):
-    # THE TEXTURE. A regular lon/lat lattice over the AOI, every texel pushed through
-    # coordinates_to_cells to find the H3 cell that contains it, then painted with that
-    # cell's colour. Nearest-neighbour by construction, so hexagon edges come out crisp
-    # rather than blurred: you are seeing the actual cell boundaries, drawn for free.
-    #
-    # Row 0 of the image is the SOUTH edge, because the mesh's tex_coord v runs 0..1 south
-    # to north and WebGL samples v=0 at the first row. If the scene comes out mirrored
-    # vertically, that assumption is the thing to flip.
-    _T = tex_size.value
-    _lon = np.linspace(bbox[0], bbox[2], _T)
-    _lat = np.linspace(bbox[1], bbox[3], _T)
-    _LON, _LAT = np.meshgrid(_lon, _lat)
+def _(cell_shade, mo, np):
+    # Contrast window over the shading value. Its bounds ARE this scene's range, so it resets
+    # per AOI and per flow offset. Own cell, depending on cell_shade alone: palette and
+    # reverse must never reach it, or picking a palette would rebuild the slider and throw
+    # away the window you dragged.
+    if cell_shade.size:
+        _lo, _hi = float(np.floor(cell_shade.min())), float(np.ceil(cell_shade.max()))
+    else:
+        _lo, _hi = 0.0, 1.0
+    if _hi <= _lo:
+        _hi = _lo + 1.0
+    contrast = mo.ui.range_slider(
+        start=_lo, stop=_hi, value=[_lo, _hi],
+        step=max((_hi - _lo) / 200.0, 0.1),
+        label="Shading contrast (m)",
+        show_value=True, full_width=True, debounce=True,
+    )
+    return (contrast,)
 
+
+@app.cell
+def _(PALETTES, contrast, mo, palette, reverse_ramp):
+    # The slider paints the ramp it controls: same palette, same DIRECTION as the scene, so
+    # "reversed" is something you see rather than infer, and the strip doubles as the legend.
+    _hex = PALETTES[palette.value].hex_colors
+    if reverse_ramp.value:
+        _hex = _hex[::-1]
+    _strip = mo.Html(
+        '<div style="height:14px;width:100%;border-radius:3px;'
+        'border:1px solid rgba(128,128,128,0.35);'
+        f'background:linear-gradient(to right,{",".join(_hex)});"></div>'
+    )
+    mo.vstack([_strip, contrast], gap=0)
+    return
+
+
+@app.cell
+def _(bbox, cell_rows, coordinates_to_cells, h3_res, np, pa, tex_size):
+    # TEXEL -> CELL, computed once and cached here on its own.
+    #
+    # This is the expensive part of the texture (a coordinates_to_cells call and a
+    # searchsorted over every texel: 4.2M of each at 2048), and it depends only on the
+    # geometry of the problem, never on the palette or the contrast window. Splitting it out
+    # means changing a colour is a colormap over an existing index, not a re-binning.
+    #
+    # Row 0 of the image is the SOUTH edge, because the mesh's tex_coord v runs 0..1 south to
+    # north and WebGL samples v=0 at the first row. If the scene comes out mirrored
+    # vertically, this assumption is the thing to flip.
+    _T = tex_size.value
+    _LON, _LAT = np.meshgrid(
+        np.linspace(bbox[0], bbox[2], _T), np.linspace(bbox[1], bbox[3], _T)
+    )
     _cells = np.asarray(
         pa.array(
             coordinates_to_cells(_LAT.ravel(), _LON.ravel(), h3_res.value)
         ).to_numpy(zero_copy_only=False)
     ).astype("uint64")
     _rows, _ok = cell_rows(_cells)
+    texel_rows = _rows.reshape(_T, _T)
+    texel_ok = _ok.reshape(_T, _T)
+    print(f"texel index: {_T}x{_T} · {texel_ok.mean() * 100:.1f}% landed on a cell")
+    return texel_ok, texel_rows
 
-    texture = np.zeros((_T, _T, 4), dtype="uint8")
-    if cell_colors.shape[0]:
-        _flat = texture.reshape(-1, 4)
-        _flat[_ok] = cell_colors[_rows[_ok]]
-        _flat[~_ok, 3] = 0  # outside the scene -> transparent
-    print(
-        f"texture: {_T}x{_T} ({texture.nbytes / 1e6:.1f} MB) · "
-        f"{_ok.sum() / _ok.size * 100:.1f}% of texels landed on a cell"
+
+@app.cell
+def _(
+    PALETTES,
+    apply_continuous_cmap,
+    cell_shade,
+    contrast,
+    np,
+    palette,
+    reverse_ramp,
+    smooth,
+    texel_ok,
+    texel_rows,
+):
+    # THE TEXTURE. Paint the shading value into texture space, optionally blur it, then
+    # colormap. Blurring the VALUE rather than the finished RGB is what makes "smooth" behave
+    # like a coarser fold instead of like a soft-focus filter: the ramp still spans the same
+    # contrast window, the hex plateaus just stop having hard walls.
+    #
+    # NaN-aware on purpose. Blurring straight through the holes would bleed zeros in from
+    # outside the scene and draw a dark rind around every edge, so the value and the validity
+    # mask are blurred separately and divided (a normalised convolution): edges stay put and
+    # only real data contributes.
+    _shade = np.where(texel_ok, cell_shade[texel_rows] if cell_shade.size else 0.0, 0.0)
+    _mask = texel_ok.astype("float64")
+
+    _k = int(smooth.value)
+    if _k > 0:
+        def _box(a, r):
+            # Separable box blur by cumulative sums: O(n) per axis, no scipy.
+            for axis in (0, 1):
+                pad = np.pad(a, [(r + 1, r) if i == axis else (0, 0) for i in range(2)])
+                c = np.cumsum(pad, axis=axis)
+                lo = np.take(c, np.arange(0, a.shape[axis]), axis=axis)
+                hi = np.take(c, np.arange(2 * r + 1, a.shape[axis] + 2 * r + 1), axis=axis)
+                a = hi - lo
+            return a
+
+        _shade = _box(_shade, _k)
+        _mask = _box(_mask, _k)
+    _shade = np.divide(_shade, _mask, out=np.zeros_like(_shade), where=_mask > 0)
+
+    _lo, _hi = float(contrast.value[0]), float(contrast.value[1])
+    _norm = np.clip((_shade - _lo) / max(_hi - _lo, 1e-6), 0.0, 1.0)
+    if reverse_ramp.value:
+        _norm = 1.0 - _norm
+
+    _rgb = np.asarray(
+        apply_continuous_cmap(_norm.ravel(), PALETTES[palette.value], alpha=1.0)
     )
+    # apply_continuous_cmap returns RGB for some palettes and RGBA for others.
+    if _rgb.shape[1] == 3:
+        _rgb = np.concatenate(
+            [_rgb, np.full((_rgb.shape[0], 1), 255, dtype=_rgb.dtype)], axis=1
+        )
+    texture = _rgb.astype("uint8").reshape(*texel_ok.shape, 4)
+    # Holes stay transparent. With smooth > 0 the blur widens the valid region by k texels,
+    # so keep the ORIGINAL mask here or the scene grows a soft fringe past its own edge.
+    texture[~texel_ok, 3] = 0
+    print(f"texture: {texture.shape[1]}x{texture.shape[0]} ({texture.nbytes / 1e6:.1f} MB)")
     return (texture,)
+
+
+@app.cell
+def _(PALETTES, apply_continuous_cmap, cell_shade, contrast, np, palette, reverse_ramp):
+    # The same colours per CELL, for the H3HexagonLayer comparison path. Unsmoothed: blurring
+    # is a texture-space operation and there is nothing to blur into on a hexagon.
+    if cell_shade.size:
+        _lo, _hi = float(contrast.value[0]), float(contrast.value[1])
+        _norm = np.clip((cell_shade - _lo) / max(_hi - _lo, 1e-6), 0.0, 1.0)
+        if reverse_ramp.value:
+            _norm = 1.0 - _norm
+        _rgb = np.asarray(
+            apply_continuous_cmap(_norm, PALETTES[palette.value], alpha=1.0)
+        )
+        if _rgb.shape[1] == 3:
+            _rgb = np.concatenate(
+                [_rgb, np.full((_rgb.shape[0], 1), 255, dtype=_rgb.dtype)], axis=1
+            )
+        cell_colors = _rgb.astype("uint8")
+    else:
+        cell_colors = np.zeros((0, 4), dtype="uint8")
+    return (cell_colors,)
+
+
+@app.cell
+def _(mesh_density, np):
+    # MESH TOPOLOGY. Vertex count is (n+1)^2 and triangle count is 2n^2, fixed by the slider
+    # and independent of everything else in the notebook. Own cell so moving the elevation
+    # scale re-uploads positions without rebuilding indices.
+    #
+    # tex_coords are the grid in normalised [0,1], which is also how the vertices are laid
+    # out, so mesh and texture register with no extra bookkeeping.
+    #
+    # Vectorised: lonboard's own generate_mesh_grid() writes these indices with a Python
+    # double loop, a quarter of a million iterations at density 512.
+    _n = mesh_density.value
+    _u = np.linspace(0.0, 1.0, _n + 1, dtype="float32")
+    _UU, _VV = np.meshgrid(_u, _u)
+    tex_coords = np.stack([_UU.ravel(), _VV.ravel()], axis=-1).astype("float32")
+
+    _i = np.arange(_n)
+    _r, _c = np.meshgrid(_i, _i, indexing="ij")
+    _bl = (_r * (_n + 1) + _c).ravel()
+    _br = _bl + 1
+    _tl = _bl + (_n + 1)
+    _tr = _tl + 1
+    triangles = np.empty((_n * _n * 2, 3), dtype="uint32")
+    triangles[0::2] = np.stack([_bl, _br, _tl], axis=-1)
+    triangles[1::2] = np.stack([_br, _tr, _tl], axis=-1)
+    return tex_coords, triangles
 
 
 @app.cell
@@ -689,34 +833,13 @@ def _(
     elevation_scale,
     h3_res,
     h3_table,
-    mesh_density,
     np,
     pa,
+    tex_coords,
 ):
-    # THE MESH. A regular grid over the same AOI, vertex z sampled from the H3 field through
-    # the same lookup the texture uses. Vertex count is (n+1)^2 and triangle count is 2n^2,
-    # both fixed by the slider and INDEPENDENT of how many cells the fold produced. That
-    # independence is the entire argument for this notebook.
-    #
-    # tex_coords are the grid in normalised [0,1], which is also exactly how the vertices
-    # were laid out, so mesh and texture register with no extra bookkeeping.
-    _n = mesh_density.value
-    _u = np.linspace(0.0, 1.0, _n + 1, dtype="float32")
-    _UU, _VV = np.meshgrid(_u, _u)
-    tex_coords = np.stack([_UU.ravel(), _VV.ravel()], axis=-1).astype("float32")
-
-    # Triangle indices, vectorised. generate_mesh_grid() in lonboard does this with a Python
-    # double loop, which is a quarter of a million iterations at density 512.
-    _i = np.arange(_n)
-    _r, _c = np.meshgrid(_i, _i, indexing="ij")
-    _bl = (_r * (_n + 1) + _c).ravel()
-    _br = _bl + 1
-    _tl = _bl + (_n + 1)
-    _tr = _tl + 1
-    triangles = np.empty((_n * _n * 2, 3), dtype="uint32")
-    triangles[0::2] = np.stack([_bl, _br, _tl], axis=-1)
-    triangles[1::2] = np.stack([_br, _tr, _tl], axis=-1)
-
+    # MESH POSITIONS. Vertex height sampled from the H3 field through the same lookup the
+    # texture uses, so colour and relief cannot drift apart. Holes go to zero rather than
+    # NaN: a NaN vertex takes its whole triangle fan with it.
     _lon = bbox[0] + tex_coords[:, 0] * (bbox[2] - bbox[0])
     _lat = bbox[1] + tex_coords[:, 1] * (bbox[3] - bbox[1])
 
@@ -733,15 +856,10 @@ def _(
         _z[_ok] = _elev[_rows[_ok]]
     _z *= elevation_scale.value
 
-    # float32 is what the trait casts to anyway. At lat 44 that is ~1 m of positional
-    # quantisation on the vertices, invisible against a 9 km AOI.
+    # float32 is what the trait casts to anyway: ~1 m of positional quantisation at lat 44,
+    # invisible against a 9 km AOI.
     positions = np.stack([_lon, _lat, _z], axis=-1).astype("float32")
-
-    print(
-        f"mesh: {len(positions):,} vertices · {len(triangles):,} triangles · "
-        f"{_ok.sum() / _ok.size * 100:.1f}% of vertices landed on a cell"
-    )
-    return positions, tex_coords, triangles
+    return (positions,)
 
 
 @app.cell
@@ -752,14 +870,13 @@ def _(mo):
         label="Renderer",
         inline=True,
     )
-    wireframe = mo.ui.checkbox(value=False, label="Wireframe (surface only)")
-    mo.hstack([renderer, wireframe], justify="start", gap=2)
-    return renderer, wireframe
+    renderer
+    return (renderer,)
 
 
 @app.cell
 def _(h3_table, mesh_density, mo, triangles):
-    # The comparison, in numbers, before you look at either picture.
+    # The comparison in numbers, before you look at either picture.
     #
     # high_precision=True puts H3HexagonLayer on the PolygonLayer path: each cell is a real
     # extruded prism, a hexagonal top plus six side quads, so roughly 30 vertices of
@@ -792,45 +909,38 @@ def _(
     SurfaceLayer,
     Table,
     bbox,
-    cell_colors,
-    elevation_scale,
     h3_table,
-    positions,
+    np,
     renderer,
-    tex_coords,
-    texture,
-    triangles,
-    wireframe,
 ):
-    # Both renderers, same data, same colours. Rebuilt on every control change, which loses
-    # view state: fine for a demo whose job is comparison, wrong for the real notebook
-    # (which builds the layer once and swaps traits live).
+    # The layer and the Map are built ONCE per renderer choice, from PLACEHOLDER geometry.
+    # This cell deliberately references no viz control, so marimo never re-runs it for a
+    # palette, contrast, smooth, scale or density change and the view state survives. The
+    # update cell below pushes the real arrays in.
+    #
+    # SurfaceLayer never populates _bbox (it has no geoarrow table to derive one from), so
+    # the view state has to be explicit or the Map opens on null island.
     if renderer.value == "Surface mesh":
-        _layer = SurfaceLayer(
-            positions=positions,
-            triangles=triangles,
-            tex_coords=tex_coords,
-            texture=texture,
-            wireframe=wireframe.value,
+        scene_layer = SurfaceLayer(
+            positions=np.zeros((4, 3), dtype="float32"),
+            triangles=np.array([[0, 1, 2], [1, 3, 2]], dtype="uint32"),
+            tex_coords=np.zeros((4, 2), dtype="float32"),
+            texture=np.zeros((1, 1, 4), dtype="uint8"),
         )
     else:
         _t = Table.from_arrow(h3_table)
-        _layer = H3HexagonLayer(
+        scene_layer = H3HexagonLayer(
             table=_t,
             get_hexagon=_t["hex"],
-            get_fill_color=cell_colors,
+            get_fill_color=[136, 136, 136],  # placeholder; the update cell paints it
             get_elevation=_t["elevation"],
             high_precision=True,
             extruded=True,
             stroked=False,
-            elevation_scale=elevation_scale.value,
-            opacity=1.0,
         )
 
-    # SurfaceLayer never populates _bbox (it has no geoarrow table to derive one from), so
-    # the view state has to be explicit or the Map opens on null island.
     scene = Map(
-        layers=[_layer],
+        layers=[scene_layer],
         view_state={
             "longitude": (bbox[0] + bbox[2]) / 2,
             "latitude": (bbox[1] + bbox[3]) / 2,
@@ -847,6 +957,40 @@ def _(
         parameters={"depthTest": True, "blend": True},
     )
     scene
+    return (scene_layer,)
+
+
+@app.cell
+def _(
+    SurfaceLayer,
+    cell_colors,
+    elevation_scale,
+    fill_opacity,
+    positions,
+    scene_layer,
+    tex_coords,
+    texture,
+    triangles,
+    wireframe,
+):
+    # The only thing the controls do: swap traits on the running layer. No Map rebuild, no
+    # re-stream, no re-fold, no re-bin.
+    #
+    # BATCHED, because positions, tex_coords and triangles have to agree about vertex
+    # indices. Moving the mesh density slider changes all three, and if they reach the widget
+    # one at a time the frontend briefly holds indices that point past the end of the buffer.
+    with scene_layer.hold_trait_notifications():
+        if isinstance(scene_layer, SurfaceLayer):
+            scene_layer.positions = positions
+            scene_layer.tex_coords = tex_coords
+            scene_layer.triangles = triangles
+            scene_layer.texture = texture
+            scene_layer.wireframe = wireframe.value
+            scene_layer.opacity = fill_opacity.value
+        else:
+            scene_layer.get_fill_color = cell_colors
+            scene_layer.elevation_scale = elevation_scale.value
+            scene_layer.opacity = fill_opacity.value
     return
 
 
