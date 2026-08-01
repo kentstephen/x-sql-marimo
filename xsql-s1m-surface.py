@@ -16,6 +16,9 @@
 #     "arro3-io",
 #     "numpy",
 #     "pyproj>=3.7",
+#     "geopy==2.5.0",
+#     "aiohttp>=3.10",
+#     "geoarrow-rust-core>=0.6",
 # ]
 # ///
 """S1M -> H3 -> ONE TEXTURED MESH. A look-at-it demo, not a replacement for the real one.
@@ -64,8 +67,17 @@ survives every adjustment. Only the renderer radio rebuilds.
 `SurfaceLayer` is experimental and unexported (it is not in `lonboard.experimental.__init__`,
 only `TextLayer` is). It works. One bug is patched below; see the PARQUET PATCH cell.
 
-AOI is fixed to Mount Washington, New Hampshire. No picker: this notebook is about what the
-render looks like, and a picker is just a way to get a different scene slowly.
+PICKER. Opens on the national S1M coverage carpet over the National Map 3D Viewer's own
+basemap set, Esri Topographic by default (which is what the viewer actually opens on, and why
+its terrain is shaded across Canada and Mexico: the USGS services stop at the border). Both
+hosts are ArcGIS MapServer, so both are `/tile/{z}/{y}/{x}`, ROW BEFORE COLUMN. Ctrl/Cmd +
+drag to draw an AOI. Mount Washington is the seed, not a fixed AOI, so it opens with
+something on screen.
+
+NO HEX CAP. `xsql-s1m-h3.py` stops at 5M cells because deck has to draw an extruded prism for
+each one. Here the cell count never reaches the GPU, so that cap is gone rather than raised.
+The guard that remains is on the KERNEL, the stream and fold and the sevenfold ring join, and
+it fires an order of magnitude higher.
 
 Run:  uv run marimo edit xsql-s1m-surface.py --sandbox
 """
@@ -86,10 +98,12 @@ def _():
 
     import h3ronpy
     import numpy as np
+    import palettable
     import pyarrow as pa
     import xarray as xr
     import marimo as mo
 
+    import geoarrow.rust.core as grc
     from pyproj import Transformer
 
     from arro3.core import Table
@@ -99,25 +113,37 @@ def _():
     from xarray_sql import XarrayContext
     from h3ronpy.vector import coordinates_to_cells
 
-    from lonboard import Map, H3HexagonLayer
+    from geopy.adapters import AioHTTPAdapter
+    from geopy.geocoders import Photon
+    from lonboard import BitmapTileLayer, Map, H3HexagonLayer, SolidPolygonLayer
     from lonboard.basemap import CartoBasemap, MaplibreBasemap
     from lonboard.colormap import apply_continuous_cmap
-    from lonboard.controls import FullscreenControl, NavigationControl, ScaleControl
+    from lonboard.controls import (
+        FullscreenControl,
+        GeocoderControl,
+        NavigationControl,
+        ScaleControl,
+    )
 
     # SurfaceLayer is real but unexported: import it off the private module.
     from lonboard.experimental._surface import SurfaceLayer
 
     return (
+        AioHTTPAdapter,
+        BitmapTileLayer,
         BytesIO,
         CartoBasemap,
         FullscreenControl,
         GeoTIFF,
+        GeocoderControl,
         H3HexagonLayer,
         Map,
         MaplibreBasemap,
         NavigationControl,
+        Photon,
         S3Store,
         ScaleControl,
+        SolidPolygonLayer,
         SurfaceLayer,
         Table,
         Transformer,
@@ -126,10 +152,12 @@ def _():
         apply_continuous_cmap,
         asyncio,
         coordinates_to_cells,
+        grc,
         h3ronpy,
         mo,
         np,
         pa,
+        palettable,
         pathlib,
         sqlite3,
         struct,
@@ -325,16 +353,31 @@ def _(np, pathlib, sqlite3, struct):
     _path = fetch_index()
     with sqlite3.connect(f"file:{_path}?mode=ro", uri=True) as _con:
         _rows = _con.execute(
-            "SELECT geom, tile, production_date, dataset_link FROM current"
+            "SELECT geom, tile, production_date, z_max, dataset_link FROM current"
         ).fetchall()
 
+    # Reproject every footprint's CORNERS once, vectorised over the whole product. Albers
+    # corners, not the lon/lat envelope: a 10 km Albers square is a slightly rotated quad in
+    # degrees, and drawing it as an axis-aligned box would smear the national grid into a
+    # staircase. Corner order SW, SE, NE, NW.
     _alb = np.array([_envelope(r[0]) for r in _rows], dtype="float64")
+    _inv = Transformer.from_crs("EPSG:6350", "EPSG:4326", always_xy=True)
+    _cx = np.column_stack([_alb[:, 0], _alb[:, 2], _alb[:, 2], _alb[:, 0]])
+    _cy = np.column_stack([_alb[:, 1], _alb[:, 1], _alb[:, 3], _alb[:, 3]])
+    _lon, _lat = _inv.transform(_cx.ravel(), _cy.ravel())
+    _lon = _lon.reshape(-1, 4)
+    _lat = _lat.reshape(-1, 4)
+
     tiles_all = [
         {
             "tile": r[1],
-            "key": r[3].split("amazonaws.com/", 1)[-1],
+            "key": r[4].split("amazonaws.com/", 1)[-1],
             "produced": r[2] or "",
+            # z_min carries a nodata sentinel (-999999) wherever a tile has holes, so the
+            # coverage shading reads z_max only.
+            "z_max": float(r[3]) if r[3] is not None else float("nan"),
             "albers": tuple(_alb[i]),
+            "quad": list(zip(_lon[i], _lat[i])),  # SW, SE, NE, NW in lon/lat
         }
         for i, r in enumerate(_rows)
     ]
@@ -345,14 +388,208 @@ def _(np, pathlib, sqlite3, struct):
 
 
 @app.cell
-def _():
-    # FIXED AOI. Mount Washington, New Hampshire: the summit cone, Tuckerman and Huntington
-    # ravines on the east face, and enough of the Cog railway ridge to give the surface
-    # something to do. ~7 x 9 km, which is a real scene rather than a toy one.
+def _(
+    SolidPolygonLayer,
+    Table,
+    apply_continuous_cmap,
+    grc,
+    np,
+    pa,
+    palettable,
+    tiles_all,
+):
+    # THE COVERAGE LAYER: the entire product as geometry, drawn before anything is picked.
+    # It answers the only question that matters before you draw a box: where does S1M exist
+    # at all.
     #
-    # No picker on purpose. This notebook answers "what does the mesh look like", and the
-    # picker is only a slower way to get a different scene.
-    bbox = [-71.34, 44.23, -71.25, 44.31]
+    # Shaded by z_max on viridis at low opacity and with NO outlines, so neighbouring tiles
+    # blend into one continuous field and the carpet reads as a single dissolved coverage
+    # shape with elevation context, rather than as 11,717 separately coloured boxes.
+    # Outlining each tile is what made it read as a grid. The coverage answer is the PRESENCE
+    # of the shape, never its hue.
+    _wkts = pa.array(
+        [
+            "POLYGON ((" + ", ".join(f"{x} {y}" for x, y in [*t["quad"], t["quad"][0]]) + "))"
+            for t in tiles_all
+        ]
+    )
+    _geom = grc.from_wkt(_wkts, to_type=grc.from_wkt(_wkts).type.with_crs("EPSG:4326"))
+
+    _zmax = np.array([t["z_max"] for t in tiles_all], dtype="float64")
+    _zmax = np.where(np.isfinite(_zmax), _zmax, 0.0)
+    # Clip to a robust range so a handful of high peaks do not flatten the whole ramp.
+    _lo, _hi = float(np.percentile(_zmax, 1)), float(np.percentile(_zmax, 99))
+    _norm = np.clip((_zmax - _lo) / max(_hi - _lo, 1.0), 0.0, 1.0)
+    _fill = apply_continuous_cmap(_norm, palettable.matplotlib.Viridis_20, alpha=150)
+
+    coverage_table = Table.from_arrow(
+        pa.table(
+            {
+                "tile": pa.array([t["tile"] for t in tiles_all]),
+                "produced": pa.array([t["produced"] for t in tiles_all]),
+                "max elevation (m)": pa.array(_zmax),
+            }
+        )
+    ).append_column("geometry", _geom)
+
+    coverage_layer = SolidPolygonLayer(
+        table=coverage_table,
+        get_fill_color=_fill,
+        opacity=0.35,
+        extruded=False,
+        pickable=False,
+    )
+    print(
+        f"coverage layer: {len(tiles_all):,} S1M footprints · "
+        f"viridis over tile z_max {_lo:.0f} m (dark) to {_hi:.0f} m (bright)"
+    )
+    return (coverage_layer,)
+
+
+@app.cell
+def _(mo):
+    # Mount Washington, New Hampshire as the SEED, not as a fixed AOI: the summit cone,
+    # Tuckerman and Huntington ravines on the east face, enough of the Cog ridge to give the
+    # surface something to do. ~7 x 9 km.
+    #
+    # Seeded rather than None (which is what xsql-s1m-h3.py does) because this notebook is
+    # about looking at the render, so it should open with something on screen. Draw a box on
+    # the picker below to go anywhere else.
+    get_bbox, set_bbox = mo.state([-71.34, 44.23, -71.25, 44.31])
+    return get_bbox, set_bbox
+
+
+@app.cell
+def _(
+    AioHTTPAdapter,
+    BitmapTileLayer,
+    CartoBasemap,
+    FullscreenControl,
+    GeocoderControl,
+    Map,
+    MaplibreBasemap,
+    NavigationControl,
+    Photon,
+    ScaleControl,
+    coverage_layer,
+    set_bbox,
+):
+    # The National Map 3D Viewer's basemaps, as a deck.gl BitmapTileLayer: one more layer in
+    # the same deck stack as the coverage carpet rather than a MapLibre style, so it sits
+    # under the footprints and over Positron and can be swapped live.
+    #
+    # Two different hosts, one path shape. The viewer's DEFAULT is not a USGS service at all,
+    # it is Esri's Topographic web map (portalItem 668f436d...), which is why terrain is
+    # shaded across Canada and Mexico in it: the basemap.nationalmap.gov services stop at the
+    # US border. Its raster form is World_Topo_Map on services.arcgisonline.com.
+    #
+    # Both hosts are ArcGIS MapServer, so both are /tile/{z}/{y}/{x}: ROW before column. In
+    # XYZ order they return tiles from the wrong place rather than 404ing, which reads as a
+    # projection bug rather than a typo.
+    #
+    # Terms: the arcgisonline raster tiles are unauthenticated but Esri scopes them to use
+    # with Esri APIs or an API key. The National Map viewer is an Esri JS app so it qualifies
+    # and this notebook does not. Kept as the default because it is the basemap the viewer
+    # shows, but every USGS entry below is unencumbered and stays sharper over an AOI.
+    _USGS = "https://basemap.nationalmap.gov/arcgis/rest/services/{}/MapServer/tile/{{z}}/{{y}}/{{x}}"
+    _ESRI = "https://services.arcgisonline.com/ArcGIS/rest/services/{}/MapServer/tile/{{z}}/{{y}}/{{x}}"
+
+    # label -> (tile template, max zoom the service actually publishes). Declaring max_zoom
+    # makes deck overzoom the deepest real tile instead of requesting ones the server does
+    # not have; the USGS services stop at 16, Esri's go deeper.
+    BASEMAPS = {
+        "Esri Topographic (viewer default)": (_ESRI.format("World_Topo_Map"), 19),
+        "Esri Terrain": (_ESRI.format("World_Terrain_Base"), 13),
+        "USGS Imagery + Topo": (_USGS.format("USGSImageryTopo"), 16),
+        "USGS Imagery only": (_USGS.format("USGSImageryOnly"), 16),
+        "USGS Topo": (_USGS.format("USGSTopo"), 16),
+        "USGS Shaded relief": (_USGS.format("USGSShadedReliefOnly"), 16),
+    }
+    _default = "Esri Topographic (viewer default)"
+    basemap_layer = BitmapTileLayer(
+        data=BASEMAPS[_default][0],
+        max_zoom=BASEMAPS[_default][1],
+        tile_size=256,
+        opacity=1.0,
+        max_requests=-1,  # HTTP/2, so let the browser pipeline rather than throttling to 6
+    )
+
+    # The picker, opened on CONUS with the coverage carpet already on it. Draw a box
+    # (Ctrl/Cmd + drag) -> selected_bounds -> set_bbox.
+    #
+    # Built once and it references no reactive UI element, so pan/zoom/AOI survive every
+    # downstream run. Nothing ever reassigns .layers.
+    _geocoder = GeocoderControl.from_geopy(
+        Photon(adapter_factory=AioHTTPAdapter, user_agent="x-sql-marimo"),
+    )
+    picker = Map(
+        # Basemap tiles first so the coverage carpet draws on top of them. Positron stays
+        # underneath: the National Map services stop at the US border, and without it the
+        # rest of the world would be blank.
+        layers=[basemap_layer, coverage_layer],
+        view_state={"longitude": -96.0, "latitude": 38.5, "zoom": 3.6, "pitch": 0},
+        basemap=MaplibreBasemap(style=CartoBasemap.Positron),
+        controls=[
+            _geocoder,
+            FullscreenControl(position="top-right"),
+            # visualize_pitch makes the compass button call resetNorthPitch(): one click
+            # snaps back to north-up AND flat, not just north-up.
+            NavigationControl(visualize_pitch=True),
+            ScaleControl(),
+        ],
+    )
+    picker.observe(
+        lambda c: set_bbox(list(c["new"])) if c["new"] is not None else None,
+        names="selected_bounds",
+    )
+    picker
+    return BASEMAPS, basemap_layer
+
+
+@app.cell
+def _(BASEMAPS, mo):
+    # Basemap picker for the map above. Its own cell, downstream of the picker, so choosing a
+    # basemap never rebuilds the Map and never disturbs a box you have already drawn.
+    basemap_choice = mo.ui.dropdown(
+        options=list(BASEMAPS),
+        value="Esri Topographic (viewer default)",
+        label="Basemap",
+    )
+    basemap_opacity = mo.ui.number(
+        start=0.0, stop=1.0, step=0.1, value=1.0, debounce=True, label="Basemap opacity"
+    )
+    mo.vstack(
+        [
+            mo.hstack([basemap_choice, basemap_opacity], justify="start", gap=2),
+            mo.md(
+                "<small>Basemaps: [USGS The National Map]"
+                "(https://basemap.nationalmap.gov/) and Esri. Footprints on top are the "
+                "1 m coverage index; Ctrl/Cmd + drag to draw an AOI.</small>"
+            ),
+        ],
+        gap=0.5,
+    )
+    return basemap_choice, basemap_opacity
+
+
+@app.cell
+def _(BASEMAPS, basemap_choice, basemap_layer, basemap_opacity):
+    # Live trait swap, same idiom as the scene layer: nudge the running BitmapTileLayer
+    # instead of reassigning picker.layers, which would rebuild the deck stack.
+    #
+    # max_zoom moves with the URL, not after it. Leaving a deep Esri max_zoom on a USGS
+    # service asks for z17+ tiles that do not exist and the basemap goes blank exactly when
+    # you zoom in to place a box.
+    _url, _maxz = BASEMAPS[basemap_choice.value]
+    basemap_layer.max_zoom = _maxz
+    basemap_layer.data = _url
+    basemap_layer.opacity = basemap_opacity.value
+    return
+
+
+@app.cell
+def _(get_bbox):
+    bbox = list(get_bbox())
     return (bbox,)
 
 
@@ -373,7 +610,7 @@ def _(mo):
 
 
 @app.cell
-def _(Transformer, bbox, h3_res, np, tiles_albers, tiles_all):
+def _(Transformer, bbox, h3_res, mo, np, tiles_albers, tiles_all):
     # Verbatim rule from xsql-s1m-h3.py: pick the overview geometrically so EVERY H3 cell is
     # guaranteed at least one pixel centre. p <= sqrt(2) * 0.5373 * sqrt(A), SAFETY 0.6.
     _fwd = Transformer.from_crs("EPSG:4326", "EPSG:6350", always_xy=True)
@@ -399,10 +636,34 @@ def _(Transformer, bbox, h3_res, np, tiles_albers, tiles_all):
 
     candidates = [{**tiles_all[int(i)]} for i in np.flatnonzero(_hit)]
 
+    # THE GUARD, and note what it is NOT guarding. xsql-s1m-h3.py stops at 5M hexes because
+    # deck has to draw an extruded prism for each one. Here the cell count never reaches the
+    # GPU at all: geometry is the mesh-density slider and styling is one texture, both fixed
+    # regardless of how many cells the fold produced. So that cap is gone rather than raised.
+    #
+    # What still binds is the KERNEL, not the renderer: the pixels streamed, the fold over
+    # them, and the h3_grid_disk ring join, which explodes each cell into seven rows before
+    # aggregating back down. That ceiling is far higher and it is about time and memory, so
+    # the estimate is printed ALWAYS and the stop only fires somewhere you would not want to
+    # go by accident.
+    CELL_GUARD = 40_000_000
+    _est_cells = (_e - _w) * (_n - _s) / H3_CELL_M2[h3_res.value]
+    _est_px = (_e - _w) * (_n - _s) / read_res_m**2
     print(
-        f"AOI {tuple(bbox)} -> {len(candidates)} S1M tile(s) · "
+        f"AOI {tuple(round(v, 4) for v in bbox)} -> {len(candidates)} S1M tile(s) · "
         f"reading the {read_res_m:g} m overview for H3 res {h3_res.value} "
-        f"(~{H3_CELL_M2[h3_res.value] / read_res_m**2:.0f} px per hex)"
+        f"(~{H3_CELL_M2[h3_res.value] / read_res_m**2:.0f} px per hex) · "
+        f"~{_est_px / 1e6:.1f}M px in, ~{_est_cells / 1e6:.2f}M cells out"
+    )
+    mo.stop(
+        _est_cells > CELL_GUARD,
+        mo.md(
+            f"### That AOI will not fit in the kernel\n"
+            f"~**{_est_cells / 1e6:.0f}M** cells from ~**{_est_px / 1e6:.0f}M** pixels "
+            f"(guard **{CELL_GUARD / 1e6:.0f}M**). This is a memory and time limit on the "
+            f"stream and fold, **not** a rendering limit: the mesh would draw it fine. "
+            f"Lower the H3 resolution or draw a smaller box."
+        ),
     )
     return aoi_albers, candidates, read_res_m
 
