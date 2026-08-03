@@ -63,6 +63,40 @@ THE TWO TEXTURE SOURCES:
     nothing, and at res 11 under a 10 m texel it was not even visibly different. H3 still
     bins the DEM.
 
+LEAF-ON IMAGERY DRAPES THE CANOPY, NOT THE GROUND, which is the one way a photograph is
+worse than a ramp. Over forest a summer frame is a green sheet stretched across terrain
+you cannot see: the mesh has relief the texture does nothing to corroborate, and the road
+cuts, drainage and rock the DEM is actually describing are all under leaves. So `NAIP
+season` asks for leaf-off frames: Any (best mosaic, unchanged), Prefer leaf-off (take bare
+ground where it exists, best mosaic where it does not), or Leaf-off only (refuse to
+substitute and let the palette have the scene).
+
+It is a REQUEST, not a guarantee, because NAIP is specified as growing-season imagery.
+Leaf-off frames exist where a state's flight window opened before leaf-out or closed after
+leaf-drop, which is a minority of the archive and unevenly spread: the Ozarks have a full
+November 2021 mosaic, the Presidentials have late-October 2021 over 62% of the box, and
+Vermont finished its 2018 campaign in January 2019. The window is a latitude ramp in
+`naip.leaf_on_window`, ~Apr 15 to ~Nov 1 at latitude 35 pulling in nine days a degree
+north. The chosen campaign's season and dates are printed and any leaf-on substitution is
+stated on screen, because "this is canopy, not ground" is not something the picture will
+tell you.
+
+WINTER NAIP IS REAL, AND MOSTLY FLORIDA. Querying Planetary Computer for December-February
+flights across CONUS returns Florida, Texas, Georgia and Louisiana by volume, where winter
+is just a clear-sky month, plus a thin northern tail: Vermont and New Hampshire, January
+2019, finishing a campaign that started the previous September. That northern tail is
+exactly what a mountain box wants and exactly what is likely to be under SNOW, with the
+sun 20 degrees up throwing shadows across every north slope. Snow-off-leaf still shows
+ground shape better than canopy does, so it is not refused, but a deep-winter pick above
+latitude 38 says so.
+
+CAMPAIGNS, NOT CALENDAR YEARS, which is worth knowing if you ever read the STAC yourself:
+a NAIP campaign is a state contract that can run past New Year, and `naip:year` is the
+campaign while `datetime` is the flight day. Grouping the Vermont 2018 campaign by
+`datetime.year` splits one 100% mosaic into a 56% "2019" and a 46% "2018". `naip.py`
+groups on `naip:year`, and takes the leaf-off SUBSET of a campaign when only part of it
+flew out of season.
+
 THE TEXTURE CEILING, AND THE TILE GRID THAT LIFTS IT. One texture over a wide box was the
 binding constraint on this drape: 2048 texels over 24 km is ~12 m per texel against NAIP's
 0.6 m, so the swath view threw away most of the imagery. It is not a download problem and
@@ -99,6 +133,14 @@ cannot light the mesh and an unlit colour ramp does not read as terrain. A NAIP 
 needs none of that: it is a photograph taken in real sunlight and the shadows are already
 in the pixels. A second sun on top double-shades it into a glossy shell. So the hillshade
 applies to the `Palette` source only, and the drape looks like the raster it is.
+
+THE IMAGERY QUESTION IS ASKED BEFORE THE DEM IS STREAMED. The STAC search now sits
+directly under the AOI, above the COG reads, and it gates them: on the NAIP source, an AOI
+whose imagery covers less than half the box stops the pipeline with a message instead of
+streaming a DEM, folding a few hundred thousand H3 cells and building a mesh to discover
+at the last step that there is nothing to paint on it. The cheap question goes first. The
+cost of stopping is that the scene keeps the last box that got through, so the message
+says plainly that nothing was fetched.
 
 CARRIED OVER UNCHANGED from the surface notebook, and see its docstring for why:
 `relief_smooth` on the height field (the
@@ -756,14 +798,94 @@ def _(get_bbox):
 
 
 @app.cell
+def _(bbox, drape, get_started, mo, naip, naip_season):
+    # THE IMAGERY QUESTION IS ASKED FIRST, BEFORE ANY PIXEL IS STREAMED, and that ordering
+    # is the point of this cell's position rather than an accident of it. It used to sit
+    # below the fold, so a box over an AOI with no NAIP still streamed a few hundred
+    # megabytes of DEM, folded it into H3 and built a mesh, all to discover at the last
+    # step that there was nothing to drape on it. The STAC call is seconds and no pixels;
+    # the DEM is minutes and many. Ask the cheap question first.
+    #
+    # STAC ONLY: which quads exist, which year, which season. Skipped entirely on the
+    # Palette source, because there is no reason to hit a STAC API to draw a colour ramp,
+    # and latched, because otherwise merely opening the notebook would hit one.
+    #
+    # THE COVERAGE FLOOR. Under 50% the drape is mostly palette wearing a photograph as a
+    # patch, and the seam between the two is more distracting than either alone. It is a
+    # floor, not a requirement of totality: partial coverage above it still falls back to
+    # the ramp per tile, which is the honest way to draw the edge of a NAIP year.
+    MIN_COVER = 0.50
+
+    if not get_started() or drape.value == "Palette":
+        naip_quads, naip_info = [], None
+    else:
+        naip_quads, naip_info = naip.naip_quads(bbox, naip_season.value)
+
+    _bad = naip_info is not None and naip_info[0] in ("error", "none")
+    naip_cover = 0.0 if (naip_info is None or _bad) else float(naip_info[2])
+    if drape.value == "Palette" or not get_started():
+        naip_cover = 1.0  # nothing to gate: the palette covers whatever the DEM covers
+
+    if _bad and naip_info[0] == "error":
+        print(f"NAIP STAC unavailable ({naip_info[1]}) — re-run this cell to retry")
+    elif _bad:
+        print(f"NAIP: {naip_info[1]}")
+    elif naip_info:
+        print(
+            f"NAIP {naip_info[0]}: {naip_info[1]} quad(s), {naip_info[2]:.0%} of the AOI"
+            f" · {naip_info[3]}"
+        )
+        if naip_info[4]:
+            print(f"  NOTE: {naip_info[4]}")
+    elif get_started() and drape.value != "Palette":
+        print("no NAIP found for this AOI")
+
+    # A leaf-ON answer under a leaf-off REQUEST is the quiet case worth naming: the scene
+    # is fine, it is just canopy rather than ground, and nothing else on screen says so.
+    naip_season_note = (
+        mo.md(
+            f"**Leaf-off unavailable here** — using {naip_info[3]}. NAIP is a "
+            f"growing-season program, so bare-ground frames only exist where a state's "
+            f"flight window opened before leaf-out or closed after leaf-drop."
+            + (f"<br><small>{naip_info[4]}</small>" if naip_info[4] else "")
+        )
+        if naip_quads
+        and naip_season.value == "prefer"
+        and naip_info
+        and not str(naip_info[3]).startswith("leaf-off")
+        else None
+    )
+    # Between the floor and totality the drape is real imagery with ramp at its edges, and
+    # that is a legitimate scene rather than a degraded one. Name it so the palette showing
+    # through reads as the edge of a NAIP year and not as a hole in the render.
+    naip_partial_note = (
+        mo.md(
+            f"**NAIP covers {naip_cover:.0%} of this box** — the rest of the scene falls "
+            f"back to the palette, tile by tile. Shrink the box to sit inside the "
+            f"imagery, or leave it and read the ramp as the edge of the flight."
+        )
+        if naip_quads and naip_cover < 0.995
+        else None
+    )
+    mo.vstack(
+        [n for n in (naip_season_note, naip_partial_note) if n is not None], gap=0.5
+    )
+    return (MIN_COVER, naip_cover, naip_info, naip_quads)
+
+
+@app.cell
 def _(
     DEM_DEG,
+    MIN_COVER,
     bbox,
     dem_source,
     dem_tiles,
+    drape,
     get_started,
     h3_res,
     mo,
+    naip_cover,
+    naip_info,
     np,
     s1m_albers,
     s1m_tiles,
@@ -776,6 +898,37 @@ def _(
             "Pick a **DEM** and an **H3 resolution** above, then **Ctrl/Cmd + drag** on "
             "the map to draw an AOI. That starts the pipeline; nothing is fetched before "
             "it. After the first box, the controls drive the scene directly."
+        ),
+    )
+
+    # THE COVERAGE GATE, and unlike the S1M note further down this one deliberately DOES
+    # halt the chain. The S1M case prints instead of stopping because a missing 1 m DEM
+    # still leaves a scene worth drawing (flat ground, real imagery). Here the missing
+    # thing is the imagery itself, and the whole notebook is a drape: streaming and folding
+    # a DEM to paint a colour ramp on it is work you did not ask for.
+    #
+    # The cost of stopping is that the scene above keeps the LAST box's mesh, so the
+    # message has to say plainly that nothing was fetched, or a stale render reads as a
+    # broken one.
+    _reason = (
+        f"the STAC search failed ({naip_info[1]})"
+        if naip_info and naip_info[0] == "error"
+        else naip_info[1]
+        if naip_info and naip_info[0] == "none"
+        else f"NAIP covers {naip_cover:.0%} of this box"
+        if naip_info
+        else "this AOI has no NAIP at all"
+    )
+    mo.stop(
+        drape.value != "Palette" and naip_cover < MIN_COVER,
+        mo.md(
+            f"### Not enough NAIP here to drape\n"
+            f"{_reason}, against a {MIN_COVER:.0%} floor. **Nothing has been streamed**: "
+            f"the DEM read, the H3 fold and the mesh all sit downstream of this check, so "
+            f"an AOI with no imagery costs one STAC call and stops.\n\n"
+            f"Move or shrink the box, set **NAIP season** back to *Any*, or switch "
+            f"**Texture source** to *Palette* to draw the terrain on its own. The scene "
+            f"above is still the last box that got this far."
         ),
     )
 
@@ -1161,41 +1314,6 @@ def _(bbox, cell_rows, coordinates_to_cells, h3_res, np, pa, tex_size):
     texel_ok = _ok.reshape(_T, _T)
     print(f"texel index: {_T}x{_T} · {texel_ok.mean() * 100:.1f}% landed on a cell")
     return texel_ok, texel_rows
-
-
-@app.cell
-def _(bbox, drape, get_started, mo, naip):
-    # STAC ONLY: which NAIP quads exist and which year to use. No pixels move here, so it
-    # re-runs on a new AOI and costs a couple of seconds. Skipped entirely on the Palette
-    # source, because there is no reason to hit a STAC API to draw a colour ramp.
-    # Latched too, and not only for symmetry: this cell depends on `bbox` alone, so
-    # without the gate merely opening the notebook would hit a STAC API before you had
-    # chosen anything.
-    if not get_started() or drape.value == "Palette":
-        naip_quads, naip_info = [], None
-    else:
-        naip_quads, naip_info = naip.naip_quads(bbox)
-
-    if naip_info and naip_info[0] == "error":
-        print(f"NAIP STAC unavailable ({naip_info[1]}) — re-run this cell to retry")
-    elif naip_info:
-        print(
-            f"NAIP {naip_info[0]}: {naip_info[1]} quad(s), {naip_info[2]:.0%} of the AOI"
-        )
-    elif get_started() and drape.value != "Palette":
-        print("no NAIP found for this AOI")
-
-    # A drape that silently falls back to a ramp looks like a bug in the drape. Say it.
-    naip_note = (
-        mo.md(
-            f"**No NAIP for this AOI** ({'STAC error' if naip_info and naip_info[0] == 'error' else 'no coverage'})"
-            f" — the scene falls back to the palette. The terrain is unaffected."
-        )
-        if get_started() and drape.value != "Palette" and not naip_quads
-        else None
-    )
-    naip_note
-    return (naip_quads,)
 
 
 @app.cell
@@ -1646,6 +1764,27 @@ def _(PALETTES, mo):
         value="NAIP",
         label="Texture source",
     )
+    # SEASON, and it is about what the photograph SHOWS, not when it was taken. A leaf-on
+    # frame over forest drapes the canopy: the ground the DEM is describing is hidden
+    # under it, so the mesh has relief the texture cannot corroborate. A leaf-off frame
+    # shows the bare ground, the road cuts, the drainage lines and the rock, which is the
+    # thing a terrain drape is for.
+    #
+    # NAIP is a growing-season program, so leaf-off frames only exist where a state's
+    # flight window opened before leaf-out or closed after leaf-drop, and plenty of AOIs
+    # have none at all. Hence three settings rather than a switch: "prefer" quietly takes
+    # leaf-off where it exists and the best mosaic where it does not, while "only" refuses
+    # to substitute and lets the palette take the scene. The choice is re-made per AOI and
+    # costs a STAC call, not a re-read of pixels.
+    naip_season = mo.ui.dropdown(
+        options={
+            "Any (best mosaic)": "any",
+            "Prefer leaf-off": "prefer",
+            "Leaf-off only": "off",
+        },
+        value="Any (best mosaic)",
+        label="NAIP season",
+    )
     hillshade = mo.ui.slider(
         start=0.0, stop=1.0, step=0.05, value=0.6, label="Hillshade", show_value=True
     )
@@ -1693,7 +1832,8 @@ def _(PALETTES, mo):
     mo.vstack(
         [
             mo.hstack(
-                [drape, brightness, hillshade, colour_smooth], justify="start", gap=2
+                [drape, naip_season, brightness, hillshade, colour_smooth],
+                justify="start", gap=2,
             ),
             mo.hstack([palette, reverse_ramp], justify="start", gap=2),
             mo.hstack(
@@ -1712,6 +1852,7 @@ def _(PALETTES, mo):
         fill_opacity,
         hillshade,
         mesh_density,
+        naip_season,
         palette,
         relief_smooth,
         reverse_ramp,
