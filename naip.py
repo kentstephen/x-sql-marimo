@@ -113,10 +113,25 @@ def _window_for(reader, bounds_proj, Window):
     return Window(col_off=col0, row_off=row0, width=col1 - col0, height=row1 - row0)
 
 
-async def _read_quad(item, bbox, target_res_m, GeoTIFF, HTTPStore, Window):
+async def open_quads(quads, GeoTIFF, HTTPStore):
+    """Open every quad's COG once, as {href: GeoTIFF}, for reuse across many reads.
+
+    A tiled drape calls `naip_rgb` once PER TILE, so without this the same COG header is
+    re-fetched and re-parsed grid_n^2 times. Opening is the part that is pure overhead
+    when repeated; the windowed reads are not, because each tile genuinely wants its own
+    window and, at a finer texel size, its own overview level.
+    """
+    hrefs = list({q.assets["image"].href: None for q in quads})
+    opened = await asyncio.gather(
+        *[GeoTIFF.open("", store=HTTPStore.from_url(h)) for h in hrefs]
+    )
+    return dict(zip(hrefs, opened))
+
+
+async def _read_quad(item, bbox, target_res_m, GeoTIFF, HTTPStore, Window, opened=None):
     """Stream one NAIP quad's AOI window at an overview matched to `target_res_m`."""
     href = item.assets["image"].href  # already signed by sign_inplace
-    g = await GeoTIFF.open("", store=HTTPStore.from_url(href))
+    g = (opened or {}).get(href) or await GeoTIFF.open("", store=HTTPStore.from_url(href))
 
     # Coarsest level still at least as fine as one texel. NAIP is 0.6 m native with
     # overviews to /64, and reading a level finer than the texture can show is pure
@@ -148,7 +163,9 @@ async def _read_quad(item, bbox, target_res_m, GeoTIFF, HTTPStore, Window):
     return data.astype("uint8"), mask, tuple(r.bounds), str(g.crs), float(reader.res[0])
 
 
-async def naip_rgb(quads, lon, lat, bbox, target_res_m, GeoTIFF, HTTPStore, Window):
+async def naip_rgb(
+    quads, lon, lat, bbox, target_res_m, GeoTIFF, HTTPStore, Window, opened=None
+):
     """Stream `quads` and inverse-warp them onto the caller's lon/lat lattice.
 
     Returns (rgb uint8 (H, W, 3), covered bool (H, W), info dict). `lon` and `lat` are
@@ -167,7 +184,10 @@ async def naip_rgb(quads, lon, lat, bbox, target_res_m, GeoTIFF, HTTPStore, Wind
     times costs more than reading the imagery does.
     """
     reads = await asyncio.gather(
-        *[_read_quad(q, bbox, target_res_m, GeoTIFF, HTTPStore, Window) for q in quads]
+        *[
+            _read_quad(q, bbox, target_res_m, GeoTIFF, HTTPStore, Window, opened)
+            for q in quads
+        ]
     )
     tiles = [t for t in reads if t is not None]
     info = {

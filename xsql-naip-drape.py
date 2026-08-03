@@ -63,13 +63,35 @@ THE TWO TEXTURE SOURCES:
     nothing, and at res 11 under a 10 m texel it was not even visibly different. H3 still
     bins the DEM.
 
-THE TEXTURE CEILING IS REAL AND IT IS PRINTED. A single texture over a wide box is the
-binding constraint on this drape: 2048 texels over 20 km is ~10 m per texel, and NAIP is
-0.6 m native, so the swath view throws away most of the imagery. The stream picks the COG
-overview that matches the texel size rather than downloading detail it will discard, and
-the streaming cell prints metres-per-texel against NAIP's native resolution on every AOI,
-so the cost is visible instead of implied. Beating it means tiled `SurfaceLayer`s, one
-mesh and one texture per sub-box, which is not built here.
+THE TEXTURE CEILING, AND THE TILE GRID THAT LIFTS IT. One texture over a wide box was the
+binding constraint on this drape: 2048 texels over 24 km is ~12 m per texel against NAIP's
+0.6 m, so the swath view threw away most of the imagery. It is not a download problem and
+no amount of streaming fixes it. A GPU caps a single texture at 8192-16384 texels a side,
+and 24 km at 0.6 m would need 40,000, so the image physically cannot be uploaded whole.
+
+So the drape is now N x N `SurfaceLayer`s, `Drape tiles` in the controls. Each tile is its
+own mesh and its own texture over 1/N^2 of the ground, which multiplies ground resolution
+by N without any single texture growing: 4x4 at 2048 is 8192 texels across the AOI, ~3 m,
+four times finer than the largest texture deck will accept. Each tile also reads NAIP at
+the overview matching ITS texel size, so the extra resolution is genuinely streamed rather
+than interpolated. The tile cell prints metres-per-texel and total VRAM before the reads
+start, because every step of the grid is 2x the memory and 4x the download.
+
+WHAT TILING DOES NOT BUY, and it is the reason 4x4 is the last option rather than a
+slider. Every tile is resident at once: nothing here knows what is on screen, so the grid
+is bounded by total VRAM (4x4 at 4096 is 1.1 GB and will not fit) rather than by the
+per-texture cap. Full NAIP resolution over a swath needs the tiles to be VIEW-DRIVEN, i.e.
+built and evicted as the camera moves, which is what deck's own `TileLayer` does for
+`lonboard.RasterLayer` and what `SurfaceLayer` has no protocol for. See `RasterLayer` in
+lonboard 0.16 for the shape that would take: an async `fetch_tile(x, y, z)` plus a
+`render_tile` callback, with the COG's overview pyramid used as the zoom pyramid.
+
+TERRAIN IS NOT TILED, ONLY PIXELS ARE. The H3 index, the height field and the hillshade
+stay on one global lattice, because they come from a 10 m DEM that a 2048 grid already
+out-resolves. So raising the tile count costs no H3 work, and every tile samples the SAME
+height field, which is what welds the seams: a boundary vertex has one lon/lat, indexes
+one height, and both neighbours place it identically. There is no crack to reconcile
+because there is no second opinion about the ground.
 
 THE HILLSHADE DOES NOT TOUCH THE IMAGERY. The surface notebook bakes a synthetic 315/45
 sun into its texture because lonboard's SurfaceLayer ships no NORMAL attribute, so deck
@@ -82,7 +104,7 @@ CARRIED OVER UNCHANGED from the surface notebook, and see its docstring for why:
 `relief_smooth` on the height field (the
 fold is piecewise constant, so the hexagonal staircase is in the DATA and no mesh density
 fixes it), the NaN-aware blurs, the parquet patch, and the build-once-swap-traits layer.
-
+`wha
 Run:  uv run marimo edit xsql-naip-drape.py --sandbox
 
 `naip.py` must sit next to this file: it holds the STAC search and the drape warp.
@@ -1107,32 +1129,38 @@ def _(h3_table, np):
 
 @app.cell
 def _(bbox, cell_rows, coordinates_to_cells, h3_res, np, pa, tex_size):
-    # THE TEXEL LATTICE, and it is the hinge of the whole notebook: one regular lon/lat grid
-    # that BOTH the H3 index and the NAIP warp are resolved onto. Because the imagery is
-    # sampled at exactly these coordinates, imagery and cells are aligned by construction
-    # rather than by two derivations that agree until one of them is edited.
+    # THE TERRAIN LATTICE: one regular lon/lat grid over the whole AOI, carrying the H3
+    # index and therefore the height field, the hillshade and the palette.
     #
-    # It is also the expensive half of everything below (a coordinates_to_cells call plus a
-    # searchsorted over every texel: 4.2M of each at 2048) and it depends only on geometry,
-    # so changing a colour is a colormap over an existing index, not a re-binning.
+    # IT IS NO LONGER THE IMAGERY LATTICE, and that split is what the tiled drape is. The
+    # two were one grid while there was one texture, but they want different resolutions:
+    # heights come from a 10 m DEM, so at a 24 km AOI a 2048 grid is already finer than the
+    # source and going further buys nothing, while imagery is 0.6 m and wants every texel it
+    # can get. The tile cell below builds its own, much finer lattice per tile for NAIP, and
+    # samples this one for height. Terrain stays global and cheap; only pixels get tiled.
+    #
+    # This is also the expensive half of everything below (a coordinates_to_cells call plus
+    # a searchsorted over every texel: 4.2M of each at 2048) and it depends only on geometry,
+    # so changing a colour is a colormap over an existing index, not a re-binning. Keeping
+    # it off the tile grid means raising the tile count costs no H3 work at all.
     #
     # Row 0 of the image is the SOUTH edge, because the mesh's tex_coord v runs 0..1 south
     # to north and WebGL samples v=0 at the first row. If the scene comes out mirrored
     # vertically, this assumption is the thing to flip.
     _T = tex_size.value
-    tex_lon, tex_lat = np.meshgrid(
+    _tex_lon, _tex_lat = np.meshgrid(
         np.linspace(bbox[0], bbox[2], _T), np.linspace(bbox[1], bbox[3], _T)
     )
     _cells = np.asarray(
         pa.array(
-            coordinates_to_cells(tex_lat.ravel(), tex_lon.ravel(), h3_res.value)
+            coordinates_to_cells(_tex_lat.ravel(), _tex_lon.ravel(), h3_res.value)
         ).to_numpy(zero_copy_only=False)
     ).astype("uint64")
     _rows, _ok = cell_rows(_cells)
     texel_rows = _rows.reshape(_T, _T)
     texel_ok = _ok.reshape(_T, _T)
     print(f"texel index: {_T}x{_T} · {texel_ok.mean() * 100:.1f}% landed on a cell")
-    return tex_lat, tex_lon, texel_ok, texel_rows
+    return texel_ok, texel_rows
 
 
 @app.cell
@@ -1171,43 +1199,93 @@ def _(bbox, drape, get_started, mo, naip):
 
 
 @app.cell
-async def _(
-    GeoTIFF,
-    HTTPStore,
-    Window,
-    aoi_w_m,
-    bbox,
-    naip,
-    naip_quads,
-    np,
-    tex_lat,
-    tex_lon,
-):
-    # THE DRAPE STREAM. Read the NAIP quads at the overview that matches one texel and
-    # inverse-warp them onto the texel lattice. Its own cell because it is the only network
-    # I/O the imagery needs: palette changes, hillshade, smoothing and elevation scale all
-    # run downstream of it without re-fetching a photograph.
+def _(aoi_w_m, bbox, np, tex_size, tile_grid):
+    # THE TILE GRID, in geometry only. No pixels, no heights: just which sub-box each tile
+    # covers and the lon/lat lattice its texture will be sampled on. Its own cell because
+    # every later stage (imagery, texture, mesh) iterates this same list, and they must all
+    # agree about tile extents down to the float.
     #
-    # THE CEILING, PRINTED. One texture over a wide box is the binding limit on this
-    # notebook. NAIP is 0.6 m native, and 2048 texels across 24 km is ~12 m per texel, so
-    # the swath view is showing roughly one twentieth of the imagery's real detail. That is
-    # a fair trade for one draw call over a whole mountain range, but it should be a number
-    # on screen rather than a surprise, and it is the thing tiled SurfaceLayers would fix.
-    _texel_m = aoi_w_m / tex_lon.shape[1]
+    # TILES SHARE THEIR EDGE SAMPLES. Tile i spans lon [w + i*step, w + (i+1)*step] with
+    # S+1 samples INCLUSIVE of both ends, so tile i's last column and tile i+1's first
+    # column are the same coordinate carrying the same texel and the same vertex height.
+    # That is what keeps the seams invisible: not a tolerance, an identity. Slice the tiles
+    # exclusively instead and every boundary becomes a visible crack in the mesh and a
+    # one-texel discontinuity in the photograph.
+    _N, _S = tile_grid.value, tex_size.value
+    _w, _s, _e, _n = bbox
+    tiles = []
+    for _j in range(_N):
+        for _i in range(_N):
+            _lo0 = _w + (_e - _w) * _i / _N
+            _lo1 = _w + (_e - _w) * (_i + 1) / _N
+            _la0 = _s + (_n - _s) * _j / _N
+            _la1 = _s + (_n - _s) * (_j + 1) / _N
+            tiles.append(
+                {
+                    "bbox": (_lo0, _la0, _lo1, _la1),
+                    "lon": np.linspace(_lo0, _lo1, _S + 1),
+                    "lat": np.linspace(_la0, _la1, _S + 1),
+                }
+            )
+
+    # THE BUDGET, printed before anything is spent. Total texels is (grid * tex)^2 and every
+    # one of them is 4 bytes resident on the GPU, so 4x4 at 4096 is 1.1 GB and will not fit
+    # in a browser tab. Saying so here is cheaper than finding out by crashing the renderer.
+    texel_m = aoi_w_m / (_N * _S)
+    _vram = len(tiles) * (_S + 1) ** 2 * 4
+    print(
+        f"drape grid: {_N}x{_N} tiles of {_S}^2 = {_N * _S} texels across the AOI · "
+        f"{texel_m:.2f} m per texel · {_vram / 1e6:.0f} MB of texture"
+        + ("  <-- over a typical GPU budget" if _vram > 8e8 else "")
+    )
+    return texel_m, tiles
+
+
+@app.cell
+async def _(GeoTIFF, HTTPStore, Window, naip, naip_quads, np, texel_m, tiles):
+    # THE DRAPE STREAM, now once per tile. Each tile reads only the quads that overlap it,
+    # through its own window, at the overview matching ITS texel size. That last part is the
+    # whole win: with one texture the target resolution was aoi_width/2048 and the reader
+    # picked a coarse overview to match, so the detail was discarded inside async-geotiff
+    # before it was ever downloaded. Sixteen tiles ask for a level four times finer, and the
+    # same code path delivers it.
+    #
+    # Still the only network I/O the imagery needs: palette, hillshade, smoothing, elevation
+    # scale and the tile textures below all run downstream without re-fetching a photograph.
+    #
+    # SEQUENTIAL over tiles, concurrent within one. `naip_rgb` already gathers across quads,
+    # and a 4x4 grid firing every quad of every tile at once is dozens of concurrent range
+    # reads against one host, which Planetary Computer throttles. Tiles are the natural
+    # place to let it breathe.
     if naip_quads:
-        naip_rgb, naip_cover, _info = await naip.naip_rgb(
-            naip_quads, tex_lon, tex_lat, bbox, _texel_m, GeoTIFF, HTTPStore, Window
-        )
+        _opened = await naip.open_quads(naip_quads, GeoTIFF, HTTPStore)
+        naip_drape = []
+        _read, _cov = 0, []
+        for _t in tiles:
+            _lon, _lat = np.meshgrid(_t["lon"], _t["lat"])
+            _rgb, _c, _info = await naip.naip_rgb(
+                naip_quads, _lon, _lat, _t["bbox"], texel_m,
+                GeoTIFF, HTTPStore, Window, _opened,
+            )
+            naip_drape.append((_rgb, _c))
+            _read += _info["quads_read"]
+            _cov.append(_info["covered"])
+        _src = min((r.res[0] for r in _opened.values()), default=float("nan"))
         print(
-            f"NAIP drape: {_info['quads_read']}/{_info['quads_found']} quad(s) read at the "
-            f"{_info['source_res_m']:.1f} m overview · {_texel_m:.1f} m per texel "
-            f"({_texel_m / 0.6:.0f}x coarser than NAIP native) · "
-            f"{_info['covered'] * 100:.1f}% of the lattice painted"
+            f"NAIP drape: {len(tiles)} tile(s), {_read} quad read(s) total · "
+            f"{texel_m:.2f} m per texel vs {_src:.1f} m native "
+            f"({texel_m / _src:.0f}x coarser) · "
+            f"{float(np.mean(_cov)) * 100:.1f}% of the lattice painted"
         )
     else:
-        naip_rgb = np.zeros((*tex_lon.shape, 3), dtype="uint8")
-        naip_cover = np.zeros(tex_lon.shape, dtype=bool)
-    return naip_cover, naip_rgb
+        naip_drape = [
+            (
+                np.zeros((len(_t["lat"]), len(_t["lon"]), 3), dtype="uint8"),
+                np.zeros((len(_t["lat"]), len(_t["lon"])), dtype=bool),
+            )
+            for _t in tiles
+        ]
+    return (naip_drape,)
 
 
 @app.cell
@@ -1299,18 +1377,32 @@ def _(cell_shade, mo, np):
 
 
 @app.cell
+def _(bbox, np):
+    # NEAREST-SAMPLE a global terrain-lattice array onto one tile's much finer lattice.
+    # Separable, so the row and column indices are built once as 1-D and combined with
+    # np.ix_ rather than materialising a pair of (S+1)^2 index grids per tile per array.
+    def tile_sample(arr, tile):
+        _g = arr.shape[0]
+        _c = np.clip(
+            ((tile["lon"] - bbox[0]) / (bbox[2] - bbox[0]) * (_g - 1)).round(), 0, _g - 1
+        ).astype("int64")
+        _r = np.clip(
+            ((tile["lat"] - bbox[1]) / (bbox[3] - bbox[1]) * (_g - 1)).round(), 0, _g - 1
+        ).astype("int64")
+        return arr[np.ix_(_r, _c)]
+
+    return (tile_sample,)
+
+
+@app.cell
 def _(
     PALETTES,
     apply_continuous_cmap,
     box_mean,
-    brightness,
     cell_shade,
     colour_smooth,
     contrast,
     contrast_value,
-    drape,
-    naip_cover,
-    naip_rgb,
     np,
     palette,
     reverse_ramp,
@@ -1318,92 +1410,121 @@ def _(
     texel_ok,
     texel_rows,
 ):
-    # THE TEXTURE. Three sources, one output: an RGBA image on the texel lattice, with the
-    # baked hillshade multiplied in at the end for all of them.
+    # THE PALETTE, computed ONCE on the terrain lattice rather than once per tile. It is a
+    # function of elevation alone, so nothing about it varies across the grid, and every
+    # tile just samples the result. The blur especially wants to be global: run per tile it
+    # would see each tile's edge as the edge of the data and bend the ramp there.
+    #
+    # Blur the shading VALUE, not the finished RGB: the ramp still spans the same contrast
+    # window, so it behaves like a coarser fold rather than a soft-focus filter, and it
+    # happens before the hillshade so softening never flattens relief.
+    _ = contrast
+    _shade = np.where(texel_ok, cell_shade[texel_rows] if cell_shade.size else 0.0, 0.0)
+    _mask = texel_ok.astype("float64")
+    _v, _m = box_mean(_shade, _mask, int(colour_smooth.value))
+    _shade = np.divide(_v, _m, out=np.zeros_like(_v), where=_m > 0)
+
+    _lo, _hi = float(contrast_value[0]), float(contrast_value[1])
+    _norm = np.clip((_shade - _lo) / max(_hi - _lo, 1e-6), 0.0, 1.0)
+    if reverse_ramp.value:
+        _norm = 1.0 - _norm
+
+    _c = np.asarray(
+        apply_continuous_cmap(_norm.ravel(), PALETTES[palette.value], alpha=1.0)
+    )
+    # The hillshade is baked here, i.e. on the palette and nowhere else. See below.
+    palette_rgb = (
+        _c[:, :3].astype("float64").reshape(*texel_ok.shape, 3) * shade_factor[..., None]
+    )
+    return (palette_rgb,)
+
+
+@app.cell
+def _(brightness, drape, naip_drape, np, palette_rgb, texel_ok, tile_sample, tiles):
+    # THE TEXTURES, one RGBA image per tile. The loop is the only structural change tiling
+    # forces on this cell: the per-source logic below is what it always was, applied N^2
+    # times to arrays that each cover 1/N^2 of the ground at N times the resolution.
     #
     # `visible` is what the mesh may show, and it differs by source. The palette covers
     # every cell in the scene; NAIP covers only where a quad was actually read, so an AOI
     # that runs off the edge of the imagery goes transparent there rather than painting
-    # black over real terrain.
-    _ = contrast
-    if drape.value == "NAIP" and naip_cover.any():
-        rgb = naip_rgb.astype("float64")
-        visible = texel_ok & naip_cover
+    # black over real terrain. A tile with NO imagery at all falls back to the palette on
+    # its own, which is why the test is per tile and not per scene: a grid straddling the
+    # edge of a NAIP year gets photograph where there is photograph and ramp elsewhere,
+    # rather than all-or-nothing.
+    textures = []
+    for _k, _t in enumerate(tiles):
+        _rgb_src, _cover = naip_drape[_k]
+        _ok = tile_sample(texel_ok, _t)
+        if drape.value == "NAIP" and _cover.any():
+            rgb = _rgb_src.astype("float64")
+            visible = _ok & _cover
+        else:
+            rgb = tile_sample(palette_rgb, _t)
+            visible = _ok
 
-    else:
-        # PALETTE. Blur the shading VALUE, not the finished RGB: the ramp still spans the
-        # same contrast window, so it behaves like a coarser fold rather than a soft-focus
-        # filter, and it happens before the hillshade so softening never flattens relief.
-        _shade = np.where(texel_ok, cell_shade[texel_rows] if cell_shade.size else 0.0, 0.0)
-        _mask = texel_ok.astype("float64")
-        _v, _m = box_mean(_shade, _mask, int(colour_smooth.value))
-        _shade = np.divide(_v, _m, out=np.zeros_like(_v), where=_m > 0)
+        # BRIGHTNESS, on the imagery only, and it is a GAMMA rather than a gain.
+        #
+        # NAIP over forest is genuinely dark (a Presidentials frame averages RGB
+        # 104/120/114) and a plain multiply would push the open ground and the summit rock
+        # to pure white before the tree canopy became readable, because the thing you want
+        # to see is in the shadows and the thing that clips is not. A gamma lifts the low
+        # end and leaves 255 pinned, so detail arrives out of the dark without blowing
+        # anything out. 1.0 is the untouched photograph.
+        #
+        # Deliberately NOT wired to the palette: that ramp is already calibrated by the
+        # contrast window and gamma-shifting it would misreport elevation. The test is on
+        # `_cover`, not on the dropdown, so a tile that fell back to the ramp is not
+        # gamma-shifted while its NAIP neighbours are.
+        if _cover.any() and drape.value != "Palette" and brightness.value != 1.0:
+            rgb = 255.0 * np.power(np.clip(rgb, 0, 255) / 255.0, 1.0 / brightness.value)
 
-        _lo, _hi = float(contrast_value[0]), float(contrast_value[1])
-        _norm = np.clip((_shade - _lo) / max(_hi - _lo, 1e-6), 0.0, 1.0)
-        if reverse_ramp.value:
-            _norm = 1.0 - _norm
+        # THE HILLSHADE IS FOR THE PALETTE ONLY, and it is already baked into palette_rgb
+        # upstream rather than applied here.
+        #
+        # A palette encodes height in hue and nothing else, so it needs a synthetic sun to
+        # read as terrain. A NAIP frame is a PHOTOGRAPH: it was taken in real sunlight and
+        # it already carries the real shadows, the real aspect shading, and the real time of
+        # day. Multiplying a second 315/45 sun over that is double-shading. It lights slopes
+        # the actual sun did not light, fights the shadows that are already in the pixels,
+        # and the result reads as a glossy shell rather than as ground. Draped imagery
+        # should look like the raster it is.
+        #
+        # Relief still reads on the NAIP sources, from the two places it should: the mesh is
+        # genuinely 3D under a pitched camera, and the photograph brought its own light.
 
-        _c = np.asarray(
-            apply_continuous_cmap(_norm.ravel(), PALETTES[palette.value], alpha=1.0)
-        )
-        rgb = _c[:, :3].astype("float64").reshape(*texel_ok.shape, 3)
-        visible = texel_ok
+        _tex = np.empty((*visible.shape, 4), dtype="uint8")
+        _tex[..., :3] = np.clip(rgb, 0, 255).astype("uint8")
+        # Cut alpha with the ORIGINAL mask: the blur widens the valid region, and without
+        # this the scene grows a soft fringe past its own extent.
+        _tex[..., 3] = np.where(visible, 255, 0)
+        textures.append(_tex)
 
-    # BRIGHTNESS, on the imagery only, and it is a GAMMA rather than a gain.
-    #
-    # NAIP over forest is genuinely dark (a Presidentials frame averages RGB 104/120/114)
-    # and a plain multiply would push the open ground and the summit rock to pure white
-    # before the tree canopy became readable, because the thing you want to see is in the
-    # shadows and the thing that clips is not. A gamma lifts the low end and leaves 255
-    # pinned, so detail arrives out of the dark without blowing anything out. 1.0 is the
-    # untouched photograph.
-    #
-    # Deliberately NOT wired to the palette: that ramp is already calibrated by the
-    # contrast window and gamma-shifting it would misreport elevation.
-    if drape.value != "Palette" and brightness.value != 1.0:
-        rgb = 255.0 * np.power(np.clip(rgb, 0, 255) / 255.0, 1.0 / brightness.value)
-
-    # THE HILLSHADE IS FOR THE PALETTE ONLY, and this was wrong in the first version.
-    #
-    # A palette encodes height in hue and nothing else, so it needs a synthetic sun to read
-    # as terrain. A NAIP frame is a PHOTOGRAPH: it was taken in real sunlight and it
-    # already carries the real shadows, the real aspect shading, and the real time of day.
-    # Multiplying a second 315/45 sun over that is double-shading. It lights slopes the
-    # actual sun did not light, fights the shadows that are already in the pixels, and the
-    # result reads as a glossy shell rather than as ground. Draped imagery should look like
-    # the raster it is.
-    #
-    # Relief still reads on the NAIP sources, from the two places it should: the mesh is
-    # genuinely 3D under a pitched camera, and the photograph brought its own light.
-    #
-    # Luminance modulation only where it does apply: RGB scaled together, no hue shift, so
-    # the ramp stays deuteranope-safe.
-    if drape.value == "Palette":
-        rgb = rgb * shade_factor[..., None]
-
-    texture = np.empty((*texel_ok.shape, 4), dtype="uint8")
-    texture[..., :3] = np.clip(rgb, 0, 255).astype("uint8")
-    # Cut alpha with the ORIGINAL mask: the blur widens the valid region, and without this
-    # the scene grows a soft fringe past its own extent.
-    texture[..., 3] = np.where(visible, 255, 0)
+    _bytes = sum(t.nbytes for t in textures)
+    _opaque = float(np.mean([(t[..., 3] > 0).mean() for t in textures]))
     print(
-        f"texture [{drape.value}]: {texture.shape[1]}x{texture.shape[0]} "
-        f"({texture.nbytes / 1e6:.1f} MB) · {visible.mean() * 100:.1f}% opaque"
+        f"texture [{drape.value}]: {len(textures)} x {textures[0].shape[1]}"
+        f"x{textures[0].shape[0]} ({_bytes / 1e6:.1f} MB total) · "
+        f"{_opaque * 100:.1f}% opaque"
     )
-    return (texture,)
+    return (textures,)
 
 
 @app.cell
-def _(aoi_w_m, mesh_density, np):
-    # MESH TOPOLOGY. Vertex count is (n+1)^2 and triangle count is 2n^2, fixed by the slider
-    # and independent of the cell count: this is the whole reason a swath is affordable.
-    # Own cell so moving the elevation scale re-uploads positions without rebuilding
-    # indices.
+def _(aoi_w_m, mesh_density, np, tile_grid):
+    # MESH TOPOLOGY, built ONCE and shared by every tile. Vertex count is (n+1)^2 and
+    # triangle count is 2n^2, fixed by the slider and independent of the cell count: this is
+    # the whole reason a swath is affordable. Own cell so moving the elevation scale
+    # re-uploads positions without rebuilding indices.
+    #
+    # The slider is the density ACROSS THE AOI, so it is divided by the grid to hold the
+    # triangle budget constant as tiles are added: N^2 tiles of (density/N)^2 quads is the
+    # same 2*density^2 triangles however the grid is set. Tiling is for texels, not for
+    # geometry, and a 10 m DEM does not get finer because the imagery did.
     #
     # Vectorised: lonboard's own generate_mesh_grid() writes these indices with a Python
     # double loop, a quarter of a million iterations at density 512.
-    _n = mesh_density.value
+    _n = max(8, mesh_density.value // tile_grid.value)
     _u = np.linspace(0.0, 1.0, _n + 1, dtype="float32")
     _UU, _VV = np.meshgrid(_u, _u)
     tex_coords = np.stack([_UU.ravel(), _VV.ravel()], axis=-1).astype("float32")
@@ -1419,29 +1540,43 @@ def _(aoi_w_m, mesh_density, np):
     triangles[1::2] = np.stack([_br, _tr, _tl], axis=-1)
 
     print(
-        f"mesh: {len(tex_coords):,} vertices · {len(triangles):,} triangles · "
-        f"{aoi_w_m / _n:.1f} m per quad"
+        f"mesh: {tile_grid.value ** 2} x ({len(tex_coords):,} vertices, "
+        f"{len(triangles):,} triangles) · "
+        f"{aoi_w_m / (_n * tile_grid.value):.1f} m per quad"
     )
     return tex_coords, triangles
 
 
 @app.cell
-def _(bbox, elevation_scale, height_tex, np, tex_coords):
-    # MESH POSITIONS. Height comes from the SMOOTHED texture-space height field, not from a
-    # per-vertex cell lookup, which matters twice over: the relief blur has already removed
-    # the hexagonal staircase, and sampling the same array the hillshade was computed from
-    # means shading and shape cannot drift apart.
+def _(bbox, elevation_scale, height_tex, np, tex_coords, tiles):
+    # MESH POSITIONS, one array per tile. Height comes from the SMOOTHED texture-space
+    # height field, not from a per-vertex cell lookup, which matters twice over: the relief
+    # blur has already removed the hexagonal staircase, and sampling the same array the
+    # hillshade was computed from means shading and shape cannot drift apart.
+    #
+    # EVERY TILE SAMPLES THE SAME GLOBAL FIELD, and that is what welds the grid shut. A
+    # vertex on the boundary between two tiles is at one lon/lat, so it indexes one entry of
+    # height_tex and both tiles place it at exactly the same height. There is no seam to
+    # reconcile because there is no second opinion about the ground. Give each tile its own
+    # local height field and this is where the cracks would come from.
     _G = height_tex.shape[0]
-    _lon = bbox[0] + tex_coords[:, 0] * (bbox[2] - bbox[0])
-    _lat = bbox[1] + tex_coords[:, 1] * (bbox[3] - bbox[1])
+    positions = []
+    for _t in tiles:
+        _w, _s, _e, _n = _t["bbox"]
+        _lon = _w + tex_coords[:, 0] * (_e - _w)
+        _lat = _s + tex_coords[:, 1] * (_n - _s)
 
-    _c = np.clip((tex_coords[:, 0] * (_G - 1)).round().astype("int64"), 0, _G - 1)
-    _r = np.clip((tex_coords[:, 1] * (_G - 1)).round().astype("int64"), 0, _G - 1)
-    _z = height_tex[_r, _c] * elevation_scale.value
+        _c = np.clip(
+            ((_lon - bbox[0]) / (bbox[2] - bbox[0]) * (_G - 1)).round(), 0, _G - 1
+        ).astype("int64")
+        _r = np.clip(
+            ((_lat - bbox[1]) / (bbox[3] - bbox[1]) * (_G - 1)).round(), 0, _G - 1
+        ).astype("int64")
+        _z = height_tex[_r, _c] * elevation_scale.value
 
-    # float32 is what the trait casts to anyway: ~1 m of positional quantisation at lat 44,
-    # invisible against a 24 km AOI.
-    positions = np.stack([_lon, _lat, _z], axis=-1).astype("float32")
+        # float32 is what the trait casts to anyway: ~1 m of positional quantisation at lat
+        # 44, invisible against a 24 km AOI.
+        positions.append(np.stack([_lon, _lat, _z], axis=-1).astype("float32"))
     return (positions,)
 
 
@@ -1457,21 +1592,31 @@ def _(
     bbox,
     np,
 ):
-    # The layer and the Map are built ONCE, from placeholder geometry. This cell references
+    # The layers and the Map are built ONCE, from placeholder geometry. This cell references
     # no control at all, so marimo never re-runs it and the view you flew to survives every
     # adjustment. The update cell at the bottom pushes the real arrays in.
+    #
+    # A FIXED POOL, sized to the largest grid the dropdown offers, because the Map must not
+    # be rebuilt and `Map.layers` must not be reassigned: either one throws away the camera.
+    # So all 16 exist from the start and the update cell fills as many as the current grid
+    # needs, parking the rest on a degenerate triangle with a transparent texel. An unused
+    # layer costs one draw call of nothing.
     #
     # SurfaceLayer never populates _bbox (it has no geoarrow table to derive one from), so
     # the view state has to be explicit or the Map opens on null island. Zoom 10.5 rather
     # than the surface notebook's 12.5: a swath needs to be stood back from.
-    surface = SurfaceLayer(
-        positions=np.zeros((4, 3), dtype="float32"),
-        triangles=np.array([[0, 1, 2], [1, 3, 2]], dtype="uint32"),
-        tex_coords=np.zeros((4, 2), dtype="float32"),
-        texture=np.zeros((1, 1, 4), dtype="uint8"),
-    )
+    MAX_TILES = 16
+    surfaces = [
+        SurfaceLayer(
+            positions=np.zeros((4, 3), dtype="float32"),
+            triangles=np.array([[0, 1, 2], [1, 3, 2]], dtype="uint32"),
+            tex_coords=np.zeros((4, 2), dtype="float32"),
+            texture=np.zeros((1, 1, 4), dtype="uint8"),
+        )
+        for _ in range(MAX_TILES)
+    ]
     scene = Map(
-        layers=[surface],
+        layers=surfaces,
         view_state={
             "longitude": (bbox[0] + bbox[2]) / 2,
             "latitude": (bbox[1] + bbox[3]) / 2,
@@ -1488,7 +1633,7 @@ def _(
         parameters={"depthTest": True, "blend": True},
     )
     scene
-    return (surface,)
+    return (surfaces,)
 
 
 @app.cell
@@ -1528,7 +1673,17 @@ def _(PALETTES, mo):
         start=64, stop=2048, step=64, value=1024, label="Mesh density", show_value=True
     )
     tex_size = mo.ui.dropdown(
-        options={"1024": 1024, "2048": 2048, "4096": 4096}, value="2048", label="Texture"
+        options={"1024": 1024, "2048": 2048, "4096": 4096},
+        value="2048",
+        label="Texture / tile",
+    )
+    # THE TILE GRID, and it is the control that lifts the resolution ceiling. Ground
+    # resolution is aoi_width / (grid * texture), so 4x4 at 2048 is 8192 texels across the
+    # AOI: four times finer than any single texture can be, because it is sixteen textures.
+    # Kept as a small fixed set rather than a slider because every step is 2x the VRAM and
+    # 4x the download, and MAX_TILES below is sized to the largest option.
+    tile_grid = mo.ui.dropdown(
+        options={"1x1": 1, "2x2": 2, "3x3": 3, "4x4": 4}, value="2x2", label="Drape tiles"
     )
     fill_opacity = mo.ui.number(
         start=0.0, stop=1.0, step=0.1, value=1.0, debounce=True, label="Opacity"
@@ -1542,7 +1697,7 @@ def _(PALETTES, mo):
             ),
             mo.hstack([palette, reverse_ramp], justify="start", gap=2),
             mo.hstack(
-                [elevation_scale, relief_smooth, mesh_density, tex_size,
+                [elevation_scale, relief_smooth, mesh_density, tex_size, tile_grid,
                  fill_opacity, wireframe],
                 justify="start", gap=2,
             ),
@@ -1561,6 +1716,7 @@ def _(PALETTES, mo):
         relief_smooth,
         reverse_ramp,
         tex_size,
+        tile_grid,
         wireframe,
     )
 
@@ -1600,27 +1756,43 @@ def _(PALETTES, contrast, drape, mo, palette, reverse_ramp):
 @app.cell
 def _(
     fill_opacity,
+    np,
     positions,
-    surface,
+    surfaces,
     tex_coords,
-    texture,
+    textures,
     triangles,
     wireframe,
 ):
-    # The only thing the controls do: swap traits on the running layer. No Map rebuild, no
+    # The only thing the controls do: swap traits on the running layers. No Map rebuild, no
     # re-stream, no re-fold, no re-bin.
     #
-    # BATCHED, because positions, tex_coords and triangles have to agree about vertex
-    # indices. Moving the mesh density slider changes all three, and if they reach the
-    # widget one at a time the frontend briefly holds indices that point past the end of
+    # BATCHED PER LAYER, because positions, tex_coords and triangles have to agree about
+    # vertex indices. Moving the mesh density slider changes all three, and if they reach
+    # the widget one at a time the frontend briefly holds indices that point past the end of
     # the buffer.
-    with surface.hold_trait_notifications():
-        surface.positions = positions
-        surface.tex_coords = tex_coords
-        surface.triangles = triangles
-        surface.texture = texture
-        surface.wireframe = wireframe.value
-        surface.opacity = fill_opacity.value
+    _blank_pos = np.zeros((4, 3), dtype="float32")
+    _blank_tri = np.array([[0, 1, 2], [1, 3, 2]], dtype="uint32")
+    _blank_uv = np.zeros((4, 2), dtype="float32")
+    _blank_tex = np.zeros((1, 1, 4), dtype="uint8")
+
+    for _k, _layer in enumerate(surfaces):
+        with _layer.hold_trait_notifications():
+            if _k < len(positions):
+                _layer.positions = positions[_k]
+                _layer.tex_coords = tex_coords
+                _layer.triangles = triangles
+                _layer.texture = textures[_k]
+                _layer.wireframe = wireframe.value
+                _layer.opacity = fill_opacity.value
+            else:
+                # Shrinking the grid has to actively blank the surplus layers. Leaving last
+                # run's geometry on them draws a coarse copy of the scene underneath the new
+                # one, which reads as z-fighting rather than as a stale layer.
+                _layer.positions = _blank_pos
+                _layer.tex_coords = _blank_uv
+                _layer.triangles = _blank_tri
+                _layer.texture = _blank_tex
     return
 
 
