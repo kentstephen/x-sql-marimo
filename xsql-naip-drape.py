@@ -395,7 +395,7 @@ def _(dem_source, h3_res, mo):
                 "<small>Switching to **1 m** draws the S1M coverage footprints on the map "
                 "below: the 1 m product exists only inside them. The 10 m seamless needs "
                 "no such check, so the carpet hides itself. Neither control fetches "
-                "anything on its own before the first run.</small>"
+                "anything until you draw a box.</small>"
             ),
         ],
         gap=0.5,
@@ -580,7 +580,21 @@ def _(mo):
     #   Wind River, WY         [-109.75, 43.05, -109.30, 43.40]
     #   Beartooth, MT          [-109.65, 45.00, -109.20, 45.30]
     get_bbox, set_bbox = mo.state([-71.42, 44.16, -71.15, 44.36])
-    return get_bbox, set_bbox
+
+    # THE FIRST-RUN LATCH. Opening the notebook should stop at the picker: streaming COGs
+    # and folding a few hundred thousand cells is not a page-load activity, and certainly
+    # not something to redo while you are still choosing a DEM and a resolution.
+    #
+    # DRAWING THE BOX IS THE RUN. There is no button, because a button would be a second
+    # gesture meaning "yes, really" after the one gesture that already said it. The picker
+    # exists to be drawn on; doing so is an unambiguous statement of intent, and it is the
+    # only action that supplies the one input the pipeline cannot default.
+    #
+    # It is a LATCH, not a switch: it blocks until the first box and is transparent
+    # forever after, so once a scene exists, nudging the resolution just re-runs. Nothing
+    # ever closes it.
+    get_started, set_started = mo.state(False)
+    return get_bbox, get_started, set_bbox, set_started
 
 
 @app.cell
@@ -597,6 +611,7 @@ def _(
     ScaleControl,
     coverage_layer,
     set_bbox,
+    set_started,
 ):
     # THE PICKER, and note what is NOT on it: there is no coverage layer. The S1M notebooks
     # open on a carpet of 1 m footprints because the first question there is "does this
@@ -654,10 +669,14 @@ def _(
             ScaleControl(),
         ],
     )
-    picker.observe(
-        lambda c: set_bbox(list(c["new"])) if c["new"] is not None else None,
-        names="selected_bounds",
-    )
+    def _on_box(change):
+        """selected_bounds -> the AOI, and the first box also opens the latch."""
+        if change["new"] is None:
+            return
+        set_bbox(list(change["new"]))
+        set_started(True)
+
+    picker.observe(_on_box, names="selected_bounds")
     picker
     return BASEMAPS, basemap_layer
 
@@ -700,49 +719,6 @@ def _(BASEMAPS, basemap_choice, basemap_layer, basemap_opacity):
 
 
 @app.cell
-def _(mo):
-    # THE FIRST-RUN LATCH. Opening the notebook should stop at the picker: streaming COGs
-    # and folding a few hundred thousand cells is not something to do on page load, and it
-    # is certainly not something to redo while you are still deciding on a DEM and a
-    # resolution.
-    #
-    # But gating EVERY run behind a button would be worse than not gating at all: once a
-    # scene exists, nudging the H3 resolution and waiting for a click is friction with no
-    # payoff. So the gate is a LATCH, not a switch. It blocks until the first click and is
-    # transparent forever after, which makes the button mean "start", not "apply".
-    get_started, set_started = mo.state(False)
-    return get_started, set_started
-
-
-@app.cell
-def _(get_started, mo):
-    run_button = mo.ui.run_button(
-        label="Stream this AOI", disabled=get_started(), kind="success"
-    )
-    mo.hstack(
-        [
-            run_button,
-            mo.md(
-                "<small>Draw a box on the map (Ctrl/Cmd + drag) or keep the seeded one, "
-                "then start. After the first run this button retires and the controls "
-                "drive the scene directly.</small>"
-            ),
-        ],
-        justify="start",
-        gap=1,
-    )
-    return (run_button,)
-
-
-@app.cell
-def _(run_button, set_started):
-    # One-way. Nothing ever sets it back, so the gate opens once and stays open.
-    if run_button.value:
-        set_started(True)
-    return
-
-
-@app.cell
 def _(coverage_layer, dem_source):
     # Live trait swap, same idiom as the basemap: the picker is built once and never
     # reassigns .layers, so showing the carpet is a `visible` flip on the running layer and
@@ -774,9 +750,10 @@ def _(
     mo.stop(
         not get_started(),
         mo.md(
-            "### Nothing streamed yet\n"
-            "Pick a **DEM** and an **H3 resolution** above, draw a box on the map "
-            "(Ctrl/Cmd + drag) or keep the seeded one, then press **Stream this AOI**."
+            "### Draw a box to start\n"
+            "Pick a **DEM** and an **H3 resolution** above, then **Ctrl/Cmd + drag** on "
+            "the map to draw an AOI. That starts the pipeline; nothing is fetched before "
+            "it. After the first box, the controls drive the scene directly."
         ),
     )
 
