@@ -399,8 +399,14 @@ async def open_quads(quads, GeoTIFF, HTTPStore):
     return dict(zip(hrefs, opened))
 
 
-async def _read_quad(item, bbox, target_res_m, GeoTIFF, HTTPStore, Window, opened=None):
-    """Stream one NAIP quad's AOI window at an overview matched to `target_res_m`."""
+async def _read_quad(
+    item, bbox, target_res_m, GeoTIFF, HTTPStore, Window, opened=None, bands=3
+):
+    """Stream one NAIP quad's AOI window at an overview matched to `target_res_m`.
+
+    `bands=3` is R, G, B, the drape. `bands=4` adds NIR, which is the band NAIP carries
+    and a drape throws away: it is what makes NDVI possible without a second sensor.
+    """
     href = item.assets["image"].href  # already signed by sign_inplace
     g = (opened or {}).get(href) or await GeoTIFF.open(
         "", store=_store_for(HTTPStore, href)
@@ -425,9 +431,9 @@ async def _read_quad(item, bbox, target_res_m, GeoTIFF, HTTPStore, Window, opene
 
     r = await reader.read(window=win)
     ma = r.as_masked()
-    data = np.ma.getdata(ma)[:3]  # NAIP is R, G, B, NIR; the drape wants the first three
+    data = np.ma.getdata(ma)[:bands]  # NAIP band order is R, G, B, NIR
     mask = np.ma.getmaskarray(ma)
-    mask = mask[:3].any(axis=0) if mask.ndim == 3 else np.zeros(data.shape[1:], bool)
+    mask = mask[:bands].any(axis=0) if mask.ndim == 3 else np.zeros(data.shape[1:], bool)
     # A quad's collar is padded with pure black rather than with a nodata value, so
     # without this every quad edge drapes as a hard black band across the terrain.
     mask |= (data[0] == 0) & (data[1] == 0) & (data[2] == 0)
@@ -442,11 +448,13 @@ async def _read_quad(item, bbox, target_res_m, GeoTIFF, HTTPStore, Window, opene
 
 
 async def naip_rgb(
-    quads, lon, lat, bbox, target_res_m, GeoTIFF, HTTPStore, Window, opened=None
+    quads, lon, lat, bbox, target_res_m, GeoTIFF, HTTPStore, Window, opened=None, bands=3
 ):
     """Stream `quads` and inverse-warp them onto the caller's lon/lat lattice.
 
-    Returns (rgb uint8 (H, W, 3), covered bool (H, W), info dict). `lon` and `lat` are
+    Returns (pixels uint8 (H, W, `bands`), covered bool (H, W), info dict), where `bands`
+    is 3 for the R, G, B drape and 4 to keep NAIP's NIR band as well, which is what an
+    index like NDVI needs and what a photograph alone cannot give you. `lon` and `lat` are
     2-D arrays of the same shape: whatever grid the caller wants painted, in whatever row
     order it uses. Nothing here assumes north-up, so the notebook's south-first texture
     convention needs no flip on either side.
@@ -485,7 +493,7 @@ async def naip_rgb(
     async def read_one(q):
         async with sem:
             return await _read_quad(
-                q, bbox, target_res_m, GeoTIFF, HTTPStore, Window, opened
+                q, bbox, target_res_m, GeoTIFF, HTTPStore, Window, opened, bands
             )
 
     reads = await asyncio.gather(*[read_one(q) for q in quads])
@@ -495,7 +503,7 @@ async def naip_rgb(
         "quads_found": len(quads),
         "source_res_m": min((t[4] for t in tiles), default=float("nan")),
     }
-    rgb = np.zeros((*lon.shape, 3), dtype="uint8")
+    rgb = np.zeros((*lon.shape, bands), dtype="uint8")
     covered = np.zeros(lon.shape, dtype=bool)
     if not tiles:
         return rgb, covered, info
@@ -527,7 +535,7 @@ async def naip_rgb(
             good = inside & ~mask[ric, cic] & (d > depth)
             if not good.any():
                 continue
-            for band in range(3):
+            for band in range(bands):
                 rgb[..., band][good] = data[band][ric, cic][good]
             depth[good] = d[good]
             covered |= good

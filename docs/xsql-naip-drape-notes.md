@@ -131,7 +131,7 @@ view-dependent, and it is good at 10-25 km and structurally incapable above ~40 
 swaths need view-driven tiles, which is the `RasterLayer`/`TileLayer` note in the notebook
 docstring.
 
-## NEXT: DEM to heights, H3 to analysis
+## DONE, as `xsql-naip-ndvi.py`: DEM to heights, H3 to analysis
 
 Decided at the end of this session, and it follows from the `xsql-s1m-surface-notes.md`
 observation that a raster folded to hexes and sampled back to a lattice is a round trip.
@@ -143,8 +143,41 @@ the job the index actually exists for. In this notebook that means the SQL aggre
 what gets painted on the mesh; the join to vector data (Overture buildings, see the surface
 notes) is still the strongest case for it and is still unbuilt.
 
-First thing to paint that way: **NDVI**, from the NIR band `naip.py` currently discards.
+First thing to paint that way: **NDVI**, from the NIR band `naip.py` used to discard.
 `(NIR - R) / (NIR + R)`, folded per cell in SQL, on a colourblind-safe ramp (NOT the
 conventional red-to-green, which is exactly the pair to avoid). That gives H3 something to
 do that a photograph cannot, and gives the drape a reason to be a data product rather than
 a picture.
+
+Built, and the shape it took:
+
+- **Heights are bilinear off the streamed COGs**, straight onto the texel lattice. No fold
+  in the geometry path, so no plateaus, so `smooth` defaults to **0** rather than to the
+  drape's 3. Nearest would have aliased instead, because a shaded surface is read through
+  its derivative and nearest quantises the derivative into flats and cliffs.
+- **The read resolution now serves two masters**, and takes the finer: roughly one DEM
+  sample per texel for the height field, and enough pixel centres per hexagon for `avg()`
+  to mean something. In the drape only the second existed, because the lattice was fed by
+  the fold rather than by the raster.
+- **The query is the notebook.** Two rasters, two agencies, two resolutions, two CRSs,
+  aggregated to the same key and `LEFT JOIN`ed on it in one DataFusion statement. The DEM
+  side goes in through xarray-sql as its native grid, one relation per COG; the NAIP side
+  goes in as the lattice it was sampled onto. Nothing is reprojected to a common grid,
+  which is the step this normally costs.
+- **`relief`** (max − min elevation inside a cell) comes free from the same GROUP BY, needs
+  no ring join, and says something the height field structurally cannot: it is a statistic
+  about the pixels rather than a property of the surface they were folded into.
+- **NAIP is read once, in the shape the surface needs.** NDVI reads 4 bands onto the global
+  lattice, because it is about to be averaged into hexagons and does not want tile
+  resolution. The photograph reads 3 bands per tile at tile resolution, because it does.
+- **`naip.py` grew a `bands` argument**, defaulting to 3. Band order is R, G, B, NIR;
+  verified against ground truth, with Big Cottonwood forest at NDVI 0.39 median and 0.63
+  p90 and Utah Lake negative.
+- **The hexagons are visible, and that is now the point.** The shape is smooth and the
+  cells are the data, so seeing them is seeing the resolution of the analysis.
+- **The notebook checks the lonboard patch itself** and prints a loud warning if the bundle
+  has been reverted, because that failure is silent and looks like six other bugs.
+
+Still unbuilt, and still the strongest case for the index: the **vector** join. Overture
+buildings on S3 as GeoParquet, polyfilled with `h3ronpy.vector.geometry_to_cells`, is the
+same `LEFT JOIN` with a different right-hand side.
