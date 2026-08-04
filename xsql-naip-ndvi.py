@@ -375,10 +375,18 @@ def _(mo):
     # and a city edge, which is about the clearest NDVI contrast in the country inside one
     # small box. ~14 x 13 km, small enough that the texture is not the binding constraint.
     #
-    # Others worth pasting in:
-    #   Sangre de Cristo, NM   [-105.70, 36.50, -105.30, 36.85]
-    #   Presidentials, NH      [-71.42, 44.16, -71.15, 44.36]
-    #   Columbia Gorge, OR     [-121.95, 45.55, -121.75, 45.72]
+    # Others worth pasting in, all sized so the photograph still resolves:
+    #   Flagstaff + Mt Elden, AZ  [-111.72, 35.15, -111.55, 35.27]
+    #   Sangre de Cristo, NM      [-105.70, 36.50, -105.30, 36.85]
+    #   Presidentials, NH         [-71.42, 44.16, -71.15, 44.36]
+    #   Columbia Gorge, OR        [-121.95, 45.55, -121.75, 45.72]
+    #
+    # BOX WIDTH IS THE SETTING THAT MATTERS MOST, and it is not a control, so it is easy
+    # to miss. Mesh quads are AOI / mesh_density and texels are AOI / (tiles * texture),
+    # so both coarsen linearly with the box and nothing else in the notebook does. At 15 km
+    # the defaults give 15 m quads and 3.7 m texels and the drape reads as a photograph. At
+    # 100 km the same defaults give 99 m quads and 25 m texels, the mesh visibly facets,
+    # and it looks like a bug in the terrain when it is a bug in the box.
     get_bbox, set_bbox = mo.state([-111.79, 40.55, -111.63, 40.66])
 
     # The first-run latch: opening the notebook should stop at the picker. Drawing a box is

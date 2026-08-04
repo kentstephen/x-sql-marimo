@@ -181,3 +181,39 @@ Built, and the shape it took:
 Still unbuilt, and still the strongest case for the index: the **vector** join. Overture
 buildings on S3 as GeoParquet, polyfilled with `h3ronpy.vector.geometry_to_cells`, is the
 same `LEFT JOIN` with a different right-hand side.
+
+## Verdict on `xsql-naip-ndvi.py`, after a false alarm
+
+It works. Flagstaff and Mount Elden at ~15 km came back as a photograph on smooth terrain:
+no hexagonal terracing at any H3 resolution, no facets, imagery sharp.
+
+**The interim "this did not work" was box width, not method.** The mesh cell prints metres
+per quad, and it read **98.7 m/quad**, which is 1024 quads across a **101 km** box: the
+swath left over from the drape session. Those were mesh triangles, exactly as large as they
+looked. The texture was 24.7 m per texel at the same width, which was the pixelation. Both
+scale linearly with the box and nothing else in the notebook does, so the DEM-heights
+change was never implicated.
+
+The lesson is procedural rather than technical. Four theories went out before that number
+was asked for, and the number was already printed in the notebook's own output the whole
+time. **Read the diagnostics the notebook prints before forming a theory about the render.**
+Same lesson as dumping the texture to a PNG, one layer up.
+
+### Settings for a ~100 km swath, if the box has to stay wide
+
+| Control | Set to | Result at 101 km |
+|---|---|---|
+| Mesh density | 2048 (max) | 49 m quads |
+| Drape tiles | 4x4 | 8192 texels across the AOI |
+| Texture / tile | 2048 | 12.3 m per texel, 269 MB of texture |
+| Elevation scale | 1.0-1.2 | exaggeration amplifies facets |
+| Height smooth | 1-2 | softens crests so 49 m quads read less sharply |
+| H3 resolution | 10 | 150 m cells, well matched to a 12 m texel |
+
+`Texture / tile` 4096 with 4x4 is 1.07 GB and will not fit. 3x3 at 4096 is 8.2 m per texel
+at 604 MB and is the better trade if the GPU is generous.
+
+At swath width **the data surfaces hold up and the photograph does not**: a res-10 cell is
+150 m and a 12 m texel resolves it twelve times over, while NAIP at 0.6 m is starved by a
+factor of twenty. If a 100 km box exists to show a pattern across a whole range, NDVI and
+Relief are the surfaces that will show it. The photograph wants 15-25 km.
