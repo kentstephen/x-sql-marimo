@@ -1161,6 +1161,7 @@ def _(PALETTES, apply_continuous_cmap, cell_field, np, ndvi_range, palette, surf
 
 @app.cell
 def _(
+    brightness,
     data_ok,
     data_rgb,
     np,
@@ -1183,6 +1184,12 @@ def _(
         if surface.value == "NAIP RGB" and _cover.any():
             rgb = _rgb_src.astype("float64")
             visible = _ok & _cover
+            # Gamma, not a gain, and only on the photograph: the ramps are calibrated by
+            # their own windows and gamma-shifting one would misreport the number it draws.
+            if brightness.value != 1.0:
+                rgb = 255.0 * np.power(
+                    np.clip(rgb, 0, 255) / 255.0, 1.0 / brightness.value
+                )
         else:
             rgb = tile_sample(data_rgb, _t)
             # The hillshade is for the DATA surfaces only. A photograph brought its own sun.
@@ -1330,6 +1337,14 @@ def _(PALETTES, mo):
         label="Colour by",
     )
     palette = mo.ui.dropdown(options=list(PALETTES), value="BluYl", label="Ramp")
+    # BRIGHTNESS, on the photograph only, and it is a GAMMA rather than a gain. NAIP over
+    # forest is genuinely dark (a Presidentials frame averages RGB 104/120/114) and a plain
+    # multiply pushes open ground and summit rock to white before the canopy becomes
+    # readable, because what you want to see is in the shadows and what clips is not. A
+    # gamma lifts the low end and leaves 255 pinned. 1.0 is the untouched photograph.
+    brightness = mo.ui.slider(
+        start=0.4, stop=3.0, step=0.1, value=1.0, label="Brightness", show_value=True
+    )
     ndvi_range = mo.ui.range_slider(
         start=-1.0, stop=1.0, step=0.05, value=[-0.2, 0.8],
         label="NDVI window", show_value=True, debounce=True,
@@ -1363,7 +1378,7 @@ def _(PALETTES, mo):
 
     mo.vstack(
         [
-            mo.hstack([surface, palette, ndvi_range], justify="start", gap=2),
+            mo.hstack([surface, palette, brightness, ndvi_range], justify="start", gap=2),
             mo.hstack(
                 [elevation_scale, hillshade, smooth, mesh_density, tex_size, tile_grid,
                  fill_opacity, wireframe],
@@ -1373,6 +1388,7 @@ def _(PALETTES, mo):
         gap=0.75,
     )
     return (
+        brightness,
         elevation_scale,
         fill_opacity,
         hillshade,
