@@ -181,6 +181,52 @@ Two process notes, both earned:
   The answer here was that the thing should not have been running at all, which no amount
   of tuning the constant would have reached.
 
+## OPEN, NOT DECIDED: what H3 is still doing here
+
+Raised at the end of the session and left unresolved. Nothing below has been changed.
+
+**H3 was scoped, not dropped.** The gate is `surface.value not in ("NDVI", "Relief")` at
+`xsql-naip-tiles.py:1511`; on `NAIP RGB` and `Elevation` the fold is skipped and says so.
+The default surface is `NAIP RGB`, so on the view the notebook opens into, H3 does nothing.
+
+**There is one real leak onto the RGB path, and it is a bug.** In the DEM-selection cell:
+
+```python
+_for_fold = SAFETY * np.sqrt(H3_CELL_M2[h3_res.value])
+_target_m = min(_for_fold, m_texel)
+```
+
+This runs unconditionally. So on `NAIP RGB` the `H3 resolution` dropdown still narrows which
+overview gets streamed, for a fold that never runs: at res 13 it pulls the DEM read down to
+4 m on a scene that never reads a cell value. Leftover from when the fold fed the geometry.
+The fix is to let `_for_fold` into the minimum only when the fold will actually run. NOT YET
+APPLIED.
+
+**Stephen's verdict on NDVI: not worth doing.** Second time he has said this (the previous
+session's notes record the same). The known cause is that the NDVI surface paints
+`cell_field("ndvi", _k)` at `:1941`, i.e. res-10 hexagon averages, while the sharp per-texel
+NDVI array computed one cell upstream is right there. It is a one-line change and has never
+been made, so "NDVI looks awful" has never actually been tested against the sharp version.
+
+**Relief is the only surface where the fold buys something no resampling can produce**:
+`max - min` inside a cell is a statistic over a neighbourhood of pixels.
+
+Three directions, none chosen:
+
+1. Fix the leak and make NDVI sharp. H3 then stands behind Relief alone.
+2. Cut H3 out of this notebook. Relief becomes a local min/max window over the height field,
+   which drops DataFusion, h3ronpy and xarray-sql from the render path entirely. The
+   notebook stops advertising a spatial index it barely uses.
+3. Give H3 the job the notes have argued for across three sessions and never built: the
+   VECTOR JOIN. Overture buildings on S3 as GeoParquet, polyfilled with
+   `h3ronpy.vector.geometry_to_cells`, `LEFT JOIN`ed to the terrain aggregate on cell id.
+   That is a thing a raster pipeline genuinely cannot do, unlike everything H3 is currently
+   being asked to do here.
+
+Worth noting that 2 and 3 are not opposites: cutting H3 out of the RENDER path and using it
+for a join are the same argument, which is that a spatial index should be doing joins rather
+than resampling rasters.
+
 ## Still unbuilt, and now the obvious next thing
 
 **View-dependent residency.** The tile scheme is already global and camera-independent, so
