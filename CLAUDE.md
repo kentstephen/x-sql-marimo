@@ -87,6 +87,16 @@ Core deps (see `pyproject.toml`): `marimo`, `datafusion`, `h3ronpy`, `pyarrow`,
 `--sandbox` stays self-contained. Pin the deck.gl-raster / lonboard versions; they
 move fast.
 
+### Always hand Stephen the run command
+
+Whenever a notebook is created or renamed, **end the response with the command to open
+it**, sandbox form first. Not buried in a docstring, not implied. Every time:
+
+```bash
+uv run marimo edit <notebook>.py --sandbox   # PEP 723 header, fresh env
+uv run marimo edit <notebook>.py             # project venv (has the lonboard patch)
+```
+
 ### Required for every SurfaceLayer notebook
 
 ```bash
