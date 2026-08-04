@@ -1338,7 +1338,7 @@ def _(PALETTES, mo):
         start=0.0, stop=1.0, step=0.05, value=0.6, label="Hillshade", show_value=True
     )
     elevation_scale = mo.ui.number(
-        start=0.0, stop=50.0, step=0.1, value=1.5, debounce=True, label="Elevation scale"
+        start=0.0, stop=50.0, step=0.1, value=2.0, debounce=True, label="Elevation scale"
     )
     # Defaults to ZERO, unlike the drape's `relief_smooth`. There is no hexagonal staircase
     # in this height field to sand down, because the height field never went through H3.
@@ -1354,7 +1354,7 @@ def _(PALETTES, mo):
         label="Texture / tile",
     )
     tile_grid = mo.ui.dropdown(
-        options={"1x1": 1, "2x2": 2, "3x3": 3, "4x4": 4}, value="1x1", label="Drape tiles"
+        options={"1x1": 1, "2x2": 2, "3x3": 3, "4x4": 4}, value="2x2", label="Drape tiles"
     )
     fill_opacity = mo.ui.number(
         start=0.0, stop=1.0, step=0.1, value=1.0, debounce=True, label="Opacity"
