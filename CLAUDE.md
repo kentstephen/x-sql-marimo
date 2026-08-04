@@ -83,7 +83,10 @@ uv run marimo export html <notebook>.py -o /tmp/out.html
 
 Core deps (see `pyproject.toml`): `marimo`, `datafusion`, `h3ronpy`, `pyarrow`,
 `xarray-sql`, plus the streaming/render stack to add: `obstore`, `async-geotiff`,
-`lonboard`. Keep each notebook's PEP 723 header in sync with `pyproject.toml` so
+`lonboard`. `duckdb` (with `INSTALL spatial`) is there for exactly one job: reading the
+S1M footprint GeoPackage, where `ST_Read` parses the geometry blobs and `ST_Transform`
+takes Albers to degrees. It is not a second query engine for the fold; that stays
+DataFusion. Keep each notebook's PEP 723 header in sync with `pyproject.toml` so
 `--sandbox` stays self-contained. Pin the deck.gl-raster / lonboard versions; they
 move fast.
 

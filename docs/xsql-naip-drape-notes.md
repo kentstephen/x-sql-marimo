@@ -217,3 +217,130 @@ At swath width **the data surfaces hold up and the photograph does not**: a res-
 150 m and a 12 m texel resolves it twelve times over, while NAIP at 0.6 m is starved by a
 factor of twenty. If a 100 km box exists to show a pattern across a whole range, NDVI and
 Relief are the surfaces that will show it. The photograph wants 15-25 km.
+
+## Session: S1M restored, the fold scoped, and a seam that was mine
+
+### The DEM source was never Stephen's call to lose
+
+The drape hard-wired 10 m and argued the case in its own docstring as though it were
+settled. It was not: nobody asked for S1M to be dropped, and swapping a notebook's data
+source is not a routine judgment call. `xsql-naip-ndvi.py` now carries a **DEM source**
+dropdown, `10 m seamless (nationwide)` default and `1 m S1M lidar (partial coverage)`
+alongside it. Three things follow from S1M and each is marked `S1M ONLY` in the code:
+
+* **No VRT.** The only national catalog is `S1M_Products.gpkg`, ~15 MB, read with duckdb
+  spatial. The `current` layer is one row per tile (11,749 rows, 11,749 distinct tiles),
+  so the `ROW_NUMBER() OVER (PARTITION BY cell_name ...)` version dedupe in
+  `3dep-seamless-duckdb-h3/s1m_viewer.py` is not needed against this vintage.
+* **The coverage carpet** rides in the picker's layer stack from the start with
+  `visible=False`, flipped by the DEM source in the same live-trait-swap cell as the
+  basemap. The Map is still built once, so a drawn box survives the toggle.
+* **Albers.** Tile selection happens in EPSG:6350 where footprints really are boxes; the
+  lattice is projected into metres for the height sample; and the fold reaches degrees
+  through the per-tile order-3 polynomial, because pyproj from a DataFusion worker thread
+  aborts the process. Measured fit error on real tiles: 0.0000 to 0.0003 mm against a 1 mm
+  tolerance.
+
+Guards: no tiles, coverage under 25%, and more than 64 tiles. The last is a statement
+about box size, since S1M is a 10 km grid.
+
+### duckdb over stdlib sqlite3, and why
+
+A GeoPackage is SQLite, so `sqlite3` reads it with zero new dependencies, which is what
+`xsql-s1m-h3.py` and `xsql-s1m-surface.py` do (hand-unpacking the GPB envelope with
+`struct`, reprojecting with pyproj outside SQL). Stephen asked for duckdb, correctly: the
+reference repo is duckdb throughout, `ST_Read` removes the hand-rolled blob parsing, and
+`ST_Transform` removes the out-of-band reprojection. Cost is `INSTALL spatial` fetching a
+binary extension on first run. pyproj stays regardless, because the polynomial fit lives
+inside the UDF where `ST_Transform` cannot reach.
+
+### What H3 is actually for here, established by being asked four times
+
+Stephen pushed until the answer was honest, and the honest answer is narrow:
+
+| Surface | Needs the fold? |
+|---|---|
+| `NAIP RGB` | No. Never touched it. |
+| `Elevation` | No. The bilinear height field is strictly better than hexagon means. |
+| `NDVI` | Yes, to average the NIR band per cell and make the join demonstrable. |
+| `Relief` | **Yes, genuinely.** `max - min` inside a cell is a statistic over a
+neighbourhood of pixels, so no resampling at any resolution produces it. |
+
+So the fold is now gated to NDVI and Relief and prints `fold skipped: [<surface>] reads no
+cell values` otherwise. Three ties to the RGB path were cut:
+
+1. The texture alpha started from `texel_ok` ("this texel landed on a cell the fold saw"),
+   which made the PHOTOGRAPH depend on the fold. It now starts from `surface_ok`, i.e.
+   whether the mesh has a height there, which is what the geometry is built from.
+2. The elevation ramp (and the fallback under the photograph) read `cell_field("elevation")`.
+   It now reads `height_raw`. Visibly better: the Cottonwood range widened from
+   `1.49e3 .. 3.47e3` to `1.48e3 .. 3.5e3`, because averaging into hexagons was clipping
+   the summit and the valley floor.
+3. `coordinates_to_cells` over every texel is skipped along with the fold.
+
+**The speed claim was overstated and is worth recording as such.** Skipping the fold saves
+about a second out of twenty-three on a Cottonwood-sized box (medians over three runs each:
+24.1s with, 23.1s without). It was never the bottleneck. The value of the change is
+structural and the elevation ramp getting better, not throughput. Measure before agreeing
+that something is slow.
+
+### The seam was in the sampler, not in a product called Seamless
+
+Reported as "tile gaps": a dashed dark cross over an Asheville S1M drape, with
+`98.7% covered` on the height field and `98.7% opaque` on the texture.
+
+`_bilinear` computed `fx` in pixel-centre space, so it runs -0.5 at the left edge of column
+0 to `w-0.5` at the right edge of column `w-1`, then tested `0 <= i0 < w-1`. That discards
+the outer HALF PIXEL on all four sides, because there is no second pixel to interpolate
+against out there. Harmless mid-mosaic, fatal at a seam: two adjacent COGs each discard
+their own half pixel at the shared boundary, so the union carries a ONE PIXEL NaN crack
+along every tile edge. No height means transparent texture, hence the dashes.
+
+The fix clamps the index pair to the last valid pair but leaves `tx`/`ty` UNCLIPPED, so
+they run to -0.5 and 1.5 and the same expression becomes a linear extrapolation off the
+edge pixels. Verified on synthetic edge-matched tiles whose truth is a plane:
+
+| sampler | NaN | max error vs truth |
+|---|---|---|
+| old | 10.0% | 3e-14 (where it answers at all) |
+| clipped `tx` to [0,1] | 0% | **5.0 m** (half-pixel flat step at every seam) |
+| unclipped (shipped) | 0% | 3e-14 |
+
+Interior samples are bit-identical to the old code, because out there the clamps never bind.
+
+On Stephen's exact AOI (63 S1M tiles, Asheville) the height field went **98.7% -> 99.0%**,
+and the texture with it. The recovered 0.3% is the ~11 internal tile seams at roughly one
+texel each.
+
+**Why the dashes were dashed, which is the diagnostic worth keeping:** the crack is one
+read pixel (16 m) wide against 31.8 m texel spacing, so each seam line only catches a texel
+some of the time. A sub-texel crack sampled by a coarser lattice renders as a dashed line,
+never a solid one. If a seam artifact is dashed, suspect a sub-texel gap.
+
+The remaining **1.0% is real**: `S1M coverage of this box: 99%`. The height field now agrees
+with the coverage carpet to the decimal. No sampler change fills ground USGS never flew.
+
+### Two false starts on that diagnosis
+
+* First theory was NAIP mosaic holes. Wrong: `100.0% painted` ruled it out immediately, and
+  the number was already in the output.
+* Second attempt to reproduce used the 10 m product with 4 COGs and came back 100% opaque
+  with BOTH samplers, because at that read resolution the crack was narrower than a texel
+  and missed the lattice entirely. **Reproduce on the user's actual source and box, not on
+  a convenient one.** The AOI print line carries the bbox and the source; ask for it first.
+
+### S1M at swath width is not S1M
+
+63 COG reads, 18.8M pixels, and the notebook reads the **16 m overview** of a 1 m product,
+which is the 10 m product with coverage gaps and a much larger bill. Read resolution is set
+by the lattice (AOI / texture), so native 1 m needs a box of roughly `texture * 2 m`:
+~4 km at 2048, ~8 km at 4096. The tile-selection cell now prints this as a NOTE with the
+box size and the threshold whenever it reads coarser than 2 m, rather than leaving it to be
+discovered.
+
+### Still unbuilt, and now the obvious next thing
+
+The 10 m seamless product is nationwide and covers exactly the ground S1M is missing.
+Filling S1M gaps from the 10 m DEM is a small change to the stream cell, since both already
+flow through one reader, and it would make S1M usable on boxes that clip a coverage edge
+instead of gating them at 25%.

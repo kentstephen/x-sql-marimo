@@ -8,6 +8,7 @@ dependencies = [
     "aiohttp>=3.10",
     "async-geotiff>=0.4",
     "datafusion>=54.0.0",
+    "duckdb>=1.5.5",
     "geoarrow-rust-core>=0.6",
     "geopy>=2.5.0",
     "h3ronpy>=0.22.0",

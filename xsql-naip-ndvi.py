@@ -3,6 +3,7 @@
 # dependencies = [
 #     "marimo",
 #     "datafusion>=54.0.0",
+#     "duckdb>=1.5.5",
 #     "xarray-sql>=0.3.2",
 #     "xarray",
 #     "h3ronpy>=0.22.0",
@@ -38,12 +39,32 @@ do. The default view is still the photograph.
 
 So the two paths are split, and each gets the tool that suits it:
 
-  * THE SHAPE COMES FROM THE DEM. Heights are bilinear off the streamed 10 m COGs straight
-    onto the texel lattice. Smooth by construction, no plateaus, no `relief_smooth` needed
-    to undo a quantisation this notebook never performs. The mesh can be coarser than the
+  * THE SHAPE COMES FROM THE DEM. Heights are bilinear off the streamed COGs straight onto
+    the texel lattice. Smooth by construction, no plateaus, no `relief_smooth` needed to
+    undo a quantisation this notebook never performs. The mesh can be coarser than the
     drape's, because the field it samples is smooth rather than stepped.
   * THE DATA COMES FROM H3, IN SQL, WHERE IT BELONGS. The fold is no longer in service of
     geometry, so it is free to do what a spatial index is for: aggregate, and JOIN.
+
+EITHER DEM, AND IT IS A DROPDOWN. The drape hard-wired 10 m and argued the case in its own
+docstring as though it were settled; it is not, and this notebook does not decide for you.
+
+  * `10 m seamless` is the 1/3 arc-second product, nationwide, catalogued by one .vrt, and
+    the right default for a wide swath. EPSG:4269, so its grid already IS degrees.
+  * `1 m S1M` is lidar, and it is the right answer for a small box over ground that has it.
+    Three things follow, and each is marked S1M ONLY where it appears in the code:
+      - NO VRT. The only national catalog is a ~15 MB GeoPackage of tile footprints, read
+        with duckdb spatial (`ST_Read` parses the geometry blobs, `ST_Transform` takes
+        Albers to degrees). That index also draws the COVERAGE CARPET in the picker, since
+        unlike 10 m this product does not exist everywhere, and the tile-selection cell
+        prints and gates on what fraction of your box it actually covers.
+      - ALBERS. Tiles are EPSG:6350, so the lattice is projected into metres for the height
+        sample (plain pyproj, exact), and the FOLD reaches degrees through a per-tile
+        order-3 polynomial fitted on the main thread, because pyproj called from a
+        DataFusion worker thread does not raise, it aborts the process. The fit is checked
+        against the real transformer and refuses to return above 1 mm of error.
+      - IT IS A 10 KM TILE GRID, so a wide box is many COG opens rather than a few. Guarded
+        at 64 tiles, which is a statement about box size, not about the renderer.
 
 THE QUERY IS THE POINT OF THE NOTEBOOK:
 
@@ -118,12 +139,17 @@ def _():
     import xml.etree.ElementTree as ET
     from io import BytesIO
 
+    import duckdb
     import numpy as np
     import palettable
     import pyarrow as pa
     import xarray as xr
     import marimo as mo
 
+    import geoarrow.rust.core as grc
+    from pyproj import Transformer
+
+    from arro3.core import Table
     from obstore.store import S3Store, HTTPStore
     from async_geotiff import GeoTIFF, Window
     from datafusion import udf
@@ -132,7 +158,7 @@ def _():
 
     from geopy.adapters import AioHTTPAdapter
     from geopy.geocoders import Photon
-    from lonboard import BitmapTileLayer, Map
+    from lonboard import BitmapTileLayer, Map, SolidPolygonLayer
     from lonboard.basemap import CartoBasemap, MaplibreBasemap
     from lonboard.colormap import apply_continuous_cmap
     from lonboard.controls import (
@@ -163,12 +189,17 @@ def _():
         Photon,
         S3Store,
         ScaleControl,
+        SolidPolygonLayer,
         SurfaceLayer,
+        Table,
+        Transformer,
         Window,
         XarrayContext,
         apply_continuous_cmap,
         asyncio,
         coordinates_to_cells,
+        duckdb,
+        grc,
         mo,
         naip,
         np,
@@ -237,10 +268,14 @@ def _(mo):
     mo.md("""
     # DEM shape, H3 data
 
-    The 10 m seamless DEM makes the **shape**, bilinear and smooth, with no fold in the
-    geometry path: no hexagonal terracing at any resolution. H3 makes the **data**, which
-    is what a spatial index is actually for: a DataFusion `GROUP BY` over the DEM pixels
-    `LEFT JOIN`ed to a `GROUP BY` over NAIP's near-infrared band, on a shared cell id.
+    The DEM makes the **shape**, bilinear and smooth, with no fold in the geometry path:
+    no hexagonal terracing at any resolution. H3 makes the **data**, which is what a
+    spatial index is actually for: a DataFusion `GROUP BY` over the DEM pixels `LEFT JOIN`ed
+    to a `GROUP BY` over NAIP's near-infrared band, on a shared cell id.
+
+    **Either DEM.** `10 m seamless` is nationwide and the right default for a swath;
+    `1 m S1M` is lidar for a small box and draws its coverage carpet in the picker, because
+    it does not exist everywhere. Same fold, same query, same everything downstream.
 
     Draw a box (Ctrl/Cmd + drag). It opens on the **photograph**; NDVI, elevation and
     relief are one dropdown away under the scene.
@@ -249,11 +284,78 @@ def _(mo):
 
 
 @app.cell
-def _(XarrayContext, coordinates_to_cells, np, pa, udf):
-    # ONE UDF, and this notebook needs no more than that. The seamless 10 m COGs are
-    # EPSG:4269, so their grid coordinates already ARE degrees and go straight into
-    # `h3_latlng_to_cell(y, x, res)`. The Albers polynomial machinery in the S1M notebooks
-    # exists only because 1 m tiles are projected; there is none of it here.
+def _(Transformer, XarrayContext, coordinates_to_cells, np, pa, udf):
+    # TWO CRSs, AND THE FOLD HAS TO SPEAK BOTH. The seamless 10 m COGs are EPSG:4269, so
+    # their grid coordinates already ARE degrees and go straight into
+    # `h3_latlng_to_cell(y, x, res)`; that path needs nothing below the first function.
+    #
+    # S1M tiles are EPSG:6350 Albers, and the fold has to reach degrees from metres INSIDE
+    # a DataFusion UDF, where pyproj cannot go: called from a worker thread it does not
+    # raise, it ABORTS THE PROCESS. So lon/lat is fitted per tile as an order-3 polynomial
+    # on the main thread, where pyproj is safe, and the UDF closes over the coefficients
+    # and is pure numpy. The fit is checked against the real transformer on a 64x64 grid
+    # and refuses to return if it is off by more than a millimetre, which on a 10 km tile
+    # order 3 clears by a wide margin.
+    PROJ_ORDER = 3
+
+    def _design(u, v, order=PROJ_ORDER):
+        cols = [np.ones_like(u)]
+        for total in range(1, order + 1):
+            for i in range(total + 1):
+                cols.append(u ** (total - i) * v**i)
+        return np.column_stack(cols)
+
+    def fit_lonlat(crs, bounds, samples=12, check=64, tol_mm=1.0):
+        """Fit lon/lat over a tile's extent. Main thread only: this is the pyproj call."""
+        left, bottom, right, top = bounds
+        inv = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+        cx, cy = (left + right) / 2.0, (bottom + top) / 2.0
+        sx = max((right - left) / 2.0, 1e-9)
+        sy = max((top - bottom) / 2.0, 1e-9)
+
+        fx, fy = np.meshgrid(
+            np.linspace(left, right, samples), np.linspace(bottom, top, samples)
+        )
+        flon, flat = inv.transform(fx.ravel(), fy.ravel())
+        A = _design((fx.ravel() - cx) / sx, (fy.ravel() - cy) / sy)
+        clon = np.linalg.lstsq(A, flon, rcond=None)[0]
+        clat = np.linalg.lstsq(A, flat, rcond=None)[0]
+
+        tx, ty = np.meshgrid(
+            np.linspace(left, right, check), np.linspace(bottom, top, check)
+        )
+        tlon, tlat = inv.transform(tx.ravel(), ty.ravel())
+        B = _design((tx.ravel() - cx) / sx, (ty.ravel() - cy) / sy)
+        err_m = np.hypot(
+            (B @ clat - tlat) * 111_320.0,
+            (B @ clon - tlon) * 111_320.0 * np.cos(np.radians(tlat)),
+        )
+        err_mm = float(err_m.max() * 1000.0)
+        if not np.isfinite(err_mm) or err_mm > tol_mm:
+            raise RuntimeError(
+                f"lon/lat fit for {crs} over {bounds} is off by {err_mm:.3f} mm "
+                f"(tolerance {tol_mm} mm). Raise PROJ_ORDER or shrink the window."
+            )
+        return (cx, cy, sx, sy, clon, clat), err_mm
+
+    def make_lonlat_udf(name, fit):
+        """One UDF per tile, its fitted coefficients closed over. Pure numpy inside."""
+        cx, cy, sx, sy, clon, clat = fit
+
+        def _to_lonlat(x, y):
+            A = _design((x.to_numpy() - cx) / sx, (y.to_numpy() - cy) / sy)
+            return pa.StructArray.from_arrays(
+                [pa.array(A @ clon), pa.array(A @ clat)], names=["lon", "lat"]
+            )
+
+        return udf(
+            _to_lonlat,
+            [pa.float64(), pa.float64()],
+            pa.struct([("lon", pa.float64()), ("lat", pa.float64())]),
+            "stable",
+            name=name,
+        )
+
     def _latlng_to_cell(lat, lng, res):
         return pa.array(
             coordinates_to_cells(lat.to_numpy(), lng.to_numpy(), res[0].as_py())
@@ -280,8 +382,8 @@ def _(XarrayContext, coordinates_to_cells, np, pa, udf):
             )
         ).astype("uint64")
 
-    print("DataFusion context factory ready (h3_latlng_to_cell)")
-    return cells_of, make_ctx
+    print("DataFusion context factory ready (h3_latlng_to_cell, per-tile lon/lat fits)")
+    return cells_of, fit_lonlat, make_ctx, make_lonlat_udf
 
 
 @app.cell
@@ -297,6 +399,7 @@ def _(mo):
         10: "res 10 ·  ~150 m hex",
         11: "res 11 ·  ~57 m hex",
         12: "res 12 ·  ~22 m hex",
+        13: "res 13",
     }
     h3_res = mo.ui.dropdown(
         options={v: k for k, v in _OPTS.items()},
@@ -312,23 +415,39 @@ def _(mo):
         value="Any (best mosaic)",
         label="NAIP season",
     )
+    # THE DEM SOURCE IS A CHOICE, NOT A CONSTANT. The drape hard-wired 10 m and wrote the
+    # reasoning into its docstring as though it were settled. It is not: 10 m is the right
+    # default for a wide swath, and 1 m is the right answer for a small box over ground that
+    # has lidar, and the notebook is in no position to know which one you drew. Both are on
+    # prd-tnm, both stream through the same reader, and the differences they force are
+    # handled downstream and marked S1M ONLY where they appear.
+    dem_source = mo.ui.dropdown(
+        options={
+            "10 m seamless (nationwide)": "13",
+            "1 m S1M lidar (partial coverage)": "s1m",
+        },
+        value="10 m seamless (nationwide)",
+        label="DEM source",
+    )
     # NDVI wants LEAF-ON, which is the exact opposite of what the drape wants, and it is
     # worth being explicit that the same control now means something different. A bare
     # November canopy has no vigour to measure; a July one does.
     mo.vstack(
         [
-            mo.hstack([h3_res, naip_season], justify="start", gap=2),
+            mo.hstack([h3_res, dem_source, naip_season], justify="start", gap=2),
             mo.md(
                 "<small>H3 resolution is an **analysis** choice here, not a terrain one: "
-                "the shape comes from the DEM and does not move when you change it. Note "
-                "that **NDVI wants leaf-on**, the opposite of what the drape wants, "
-                "because a bare canopy has no vigour to measure. Neither control fetches "
+                "the shape comes from the DEM and does not move when you change it. "
+                "**1 m S1M** turns on the coverage carpet in the picker, because unlike "
+                "the 10 m product it does not exist everywhere; draw inside the carpet. "
+                "Note that **NDVI wants leaf-on**, the opposite of what the drape wants, "
+                "because a bare canopy has no vigour to measure. None of these fetch "
                 "anything until you draw a box.</small>"
             ),
         ],
         gap=0.5,
     )
-    return h3_res, naip_season
+    return dem_source, h3_res, naip_season
 
 
 @app.cell
@@ -366,7 +485,140 @@ def _(ET, pathlib, urllib):
         f"10 m seamless index: {len(dem_tiles):,} COGs · "
         f"native {DEM_DEG * 3600:.3f}\" ({DEM_DEG * 111_320:.1f} m)"
     )
-    return DEM_DEG, S3_BASE, dem_tiles
+    return CACHE, DEM_DEG, S3_BASE, dem_tiles
+
+
+@app.cell
+def _(CACHE, S3_BASE, duckdb, np, urllib):
+    # THE S1M CATALOG, AND IT IS NOT A VRT. This is the one structural difference between
+    # the two DEM sources, and everything else about S1M follows from it. The 10 m product
+    # publishes a nationwide .vrt, so "which COGs" is a bbox intersection against parsed
+    # XML. The 1 m product publishes no such thing: the only national catalog is one ~15 MB
+    # GeoPackage of tile footprints, so it has to be downloaded once and queried.
+    #
+    # duckdb spatial reads it directly. ST_Read parses the GeoPackage geometry blobs and
+    # ST_Transform takes Albers to degrees, which is the whole reason to reach for it here:
+    # the alternative is unpacking the GPB binary header by hand and reprojecting outside
+    # SQL. The `current` layer is already one row per tile (11,749 rows, 11,749 distinct
+    # tiles), so the version dedupe the reference notebook carries is not needed against
+    # this vintage of the file.
+    _gpkg = CACHE / "S1M_Products.gpkg"
+    if not _gpkg.exists():
+        CACHE.mkdir(parents=True, exist_ok=True)
+        print("downloading the S1M footprint index (~15 MB, once)...")
+        _tmp = _gpkg.with_suffix(".part")
+        urllib.request.urlretrieve(
+            S3_BASE
+            + "StagedProducts/Elevation/S1M/FullExtentSpatialMetadata/S1M_Products.gpkg",
+            _tmp,
+        )
+        _tmp.replace(_gpkg)
+
+    _con = duckdb.connect()
+    _con.sql("INSTALL spatial; LOAD spatial;")
+
+    # CORNERS, NOT A LON/LAT ENVELOPE. A 10 km Albers square is a slightly ROTATED quad in
+    # degrees, so drawing it as an axis-aligned box would smear the national grid into a
+    # staircase. The Albers envelope is kept as-is for tile selection (which happens in
+    # Albers, where the boxes really are boxes) and the four corners are transformed for
+    # drawing. Corner order SW, SE, NE, NW.
+    _rows = _con.sql(
+        f"""
+        WITH e AS (
+            SELECT tile, dataset_link, production_date, z_max,
+                   ST_XMin(geom) AS aw, ST_YMin(geom) AS asouth,
+                   ST_XMax(geom) AS ae, ST_YMax(geom) AS an
+            FROM ST_Read('{_gpkg}', layer='current')
+        ), c AS (
+            SELECT *,
+                ST_Transform(ST_Point(aw, asouth), 'EPSG:6350', 'EPSG:4326', always_xy := true) AS p_sw,
+                ST_Transform(ST_Point(ae, asouth), 'EPSG:6350', 'EPSG:4326', always_xy := true) AS p_se,
+                ST_Transform(ST_Point(ae, an), 'EPSG:6350', 'EPSG:4326', always_xy := true) AS p_ne,
+                ST_Transform(ST_Point(aw, an), 'EPSG:6350', 'EPSG:4326', always_xy := true) AS p_nw
+            FROM e
+        )
+        SELECT tile, dataset_link, production_date, z_max, aw, asouth, ae, an,
+               ST_X(p_sw), ST_Y(p_sw), ST_X(p_se), ST_Y(p_se),
+               ST_X(p_ne), ST_Y(p_ne), ST_X(p_nw), ST_Y(p_nw)
+        FROM c
+        """
+    ).fetchall()
+
+    s1m_albers = np.array([r[4:8] for r in _rows], dtype="float64")
+    s1m_tiles = [
+        {
+            "tile": r[0],
+            "key": r[1].split("amazonaws.com/", 1)[-1],
+            "produced": r[2] or "",
+            # z_min carries a nodata sentinel (-999999) wherever a tile has holes, so the
+            # coverage shading reads z_max only.
+            "z_max": float(r[3]) if r[3] is not None else float("nan"),
+            "albers": tuple(r[4:8]),
+            "quad": [(r[8], r[9]), (r[10], r[11]), (r[12], r[13]), (r[14], r[15])],
+        }
+        for r in _rows
+    ]
+    print(f"S1M index: {len(s1m_tiles):,} current 1 m tiles from {_gpkg}")
+    return s1m_albers, s1m_tiles
+
+
+@app.cell
+def _(
+    SolidPolygonLayer,
+    Table,
+    apply_continuous_cmap,
+    grc,
+    np,
+    pa,
+    palettable,
+    s1m_tiles,
+):
+    # THE COVERAGE CARPET: the entire 1 m product as geometry, drawn before anything is
+    # picked. It answers the only question that matters before you draw a box on S1M, which
+    # is whether S1M exists there at all. The 10 m source needs no such layer, which is why
+    # it is hidden unless the DEM source is S1M.
+    #
+    # Shaded by z_max on viridis at low opacity and with NO outlines, so neighbouring tiles
+    # blend into one continuous field rather than 11,749 separately coloured boxes.
+    # Outlining each tile is what made it read as a grid. The answer is the PRESENCE of the
+    # shape, never its hue, and the hue is luminance-monotonic anyway.
+    _wkts = pa.array(
+        [
+            "POLYGON ((" + ", ".join(f"{x} {y}" for x, y in [*t["quad"], t["quad"][0]]) + "))"
+            for t in s1m_tiles
+        ]
+    )
+    _geom = grc.from_wkt(_wkts, to_type=grc.from_wkt(_wkts).type.with_crs("EPSG:4326"))
+
+    _zmax = np.array([t["z_max"] for t in s1m_tiles], dtype="float64")
+    _zmax = np.where(np.isfinite(_zmax), _zmax, 0.0)
+    # Clip to a robust range so a handful of high peaks do not flatten the whole ramp.
+    _lo, _hi = float(np.percentile(_zmax, 1)), float(np.percentile(_zmax, 99))
+    _norm = np.clip((_zmax - _lo) / max(_hi - _lo, 1.0), 0.0, 1.0)
+
+    coverage_layer = SolidPolygonLayer(
+        table=Table.from_arrow(
+            pa.table(
+                {
+                    "tile": pa.array([t["tile"] for t in s1m_tiles]),
+                    "produced": pa.array([t["produced"] for t in s1m_tiles]),
+                    "max elevation (m)": pa.array(_zmax),
+                }
+            )
+        ).append_column("geometry", _geom),
+        get_fill_color=apply_continuous_cmap(
+            _norm, palettable.matplotlib.Viridis_20, alpha=150
+        ),
+        opacity=0.35,
+        extruded=False,
+        pickable=False,
+        visible=False,  # flipped on by the DEM source, downstream, without a rebuild
+    )
+    print(
+        f"S1M coverage carpet: {len(s1m_tiles):,} footprints · "
+        f"viridis over tile z_max {_lo:.0f} m (dark) to {_hi:.0f} m (bright)"
+    )
+    return (coverage_layer,)
 
 
 @app.cell
@@ -408,6 +660,7 @@ def _(
     NavigationControl,
     Photon,
     ScaleControl,
+    coverage_layer,
     set_bbox,
     set_started,
 ):
@@ -435,9 +688,14 @@ def _(
     )
 
     # Built once and referencing no reactive UI element, so pan/zoom/AOI survive every
-    # downstream run. Nothing ever reassigns .layers.
+    # downstream run. Nothing ever reassigns .layers. The coverage carpet is in the stack
+    # from the start and starts hidden, because toggling `visible` on a layer that is
+    # already there is free, while adding one later would mean rebuilding the deck stack
+    # and throwing away the box you just drew.
     picker = Map(
-        layers=[basemap_layer],
+        # Basemap tiles FIRST so the coverage carpet draws on top of them rather than
+        # under, which would hide it completely.
+        layers=[basemap_layer, coverage_layer],
         view_state={"longitude": -111.71, "latitude": 40.60, "zoom": 10.5, "pitch": 0},
         basemap=MaplibreBasemap(style=CartoBasemap.Positron),
         controls=[
@@ -476,8 +734,9 @@ def _(BASEMAPS, mo):
         [
             mo.hstack([basemap_choice, basemap_opacity], justify="start", gap=2),
             mo.md(
-                "<small>Ctrl/Cmd + drag to draw an AOI. The 10 m DEM is nationwide, so "
-                "anywhere in CONUS works; NAIP is checked before anything is "
+                "<small>Ctrl/Cmd + drag to draw an AOI. The **10 m** DEM is nationwide, so "
+                "anywhere in CONUS works; **1 m S1M** draws its coverage carpet here and "
+                "only exists inside it. NAIP is checked before anything is "
                 "streamed.</small>"
             ),
         ],
@@ -487,7 +746,14 @@ def _(BASEMAPS, mo):
 
 
 @app.cell
-def _(BASEMAPS, basemap_choice, basemap_layer, basemap_opacity):
+def _(
+    BASEMAPS,
+    basemap_choice,
+    basemap_layer,
+    basemap_opacity,
+    coverage_layer,
+    dem_source,
+):
     # Live trait swap: nudge the running layer rather than reassigning picker.layers, which
     # would rebuild the deck stack. max_zoom moves with the URL, not after it: leaving a
     # deep Esri max_zoom on a USGS service asks for tiles that do not exist and the basemap
@@ -496,6 +762,11 @@ def _(BASEMAPS, basemap_choice, basemap_layer, basemap_opacity):
     basemap_layer.max_zoom = _maxz
     basemap_layer.data = _url
     basemap_layer.opacity = basemap_opacity.value
+
+    # Same idiom for the carpet: the 10 m product is nationwide, so there is nothing to
+    # check and the layer would be noise. On S1M it is the difference between drawing a
+    # box that works and one that comes back empty.
+    coverage_layer.visible = dem_source.value == "s1m"
     return
 
 
@@ -553,7 +824,9 @@ def _(bbox, get_started, mo, naip, naip_season, surface):
 def _(
     DEM_DEG,
     MIN_COVER,
+    Transformer,
     bbox,
+    dem_source,
     dem_tiles,
     get_started,
     h3_res,
@@ -561,6 +834,8 @@ def _(
     naip_cover,
     naip_info,
     np,
+    s1m_albers,
+    s1m_tiles,
     surface,
     tex_size,
 ):
@@ -605,39 +880,151 @@ def _(
     _for_mesh = max(aoi_w_m, aoi_h_m) / tex_size.value
     _target_m = min(_for_fold, _for_mesh)
 
-    candidates = [
-        dict(t)
-        for t in dem_tiles
-        if t["bbox"][0] < _e and t["bbox"][2] > _w
-        and t["bbox"][1] < _n and t["bbox"][3] > _s
-    ]
+    if dem_source.value == "13":
+        # The seamless COGs are EPSG:4269, so their grid IS degrees: the AOI needs no
+        # projecting and tile selection is a bbox intersection in the AOI's own units.
+        dem_crs = "EPSG:4269"
+        aoi_read = (_w, _s, _e, _n)
+        candidates = [
+            dict(t)
+            for t in dem_tiles
+            if t["bbox"][0] < _e and t["bbox"][2] > _w
+            and t["bbox"][1] < _n and t["bbox"][3] > _s
+        ]
+        # Resolution is in DEGREES and a pixel is not square on the ground: at latitude 40
+        # one is ~10.3 m north-south but ~7.9 m east-west. North-south is the larger and
+        # therefore the binding one, so degrees convert with 111_320 and NO cosine. The
+        # cosine would overstate how fine the data is.
+        _native_m = DEM_DEG * 111_320.0
+        _levels = [_native_m * 2**k for k in range(6)]
+        _fit = [r for r in _levels if r <= _target_m]
+        read_res_m = _fit[-1] if _fit else _levels[0]
+        read_res = read_res_m / 111_320.0  # source units are degrees
+        dem_cover = 1.0  # nationwide: there is nothing to check
+        _label = "10 m seamless"
+    else:
+        # S1M ONLY. Tile selection happens in ALBERS, where the footprints really are
+        # axis-aligned boxes. Doing it in degrees would mean intersecting against rotated
+        # quads, which is both harder and wrong at the edges.
+        _fwd = Transformer.from_crs("EPSG:4326", "EPSG:6350", always_xy=True)
+        _ax, _ay = _fwd.transform(
+            [_w, _e, _e, _w], [_s, _s, _n, _n]
+        )
+        dem_crs = "EPSG:6350"
+        aoi_read = (min(_ax), min(_ay), max(_ax), max(_ay))
+        _pw, _ps, _pe, _pn = aoi_read
 
-    # The seamless COGs are EPSG:4269, so resolution is in DEGREES and a pixel is not
-    # square on the ground: at latitude 40 one is ~10.3 m north-south but ~7.9 m east-west.
-    # North-south is the larger and therefore the binding one, so degrees convert with
-    # 111_320 and NO cosine. The cosine would overstate how fine the data is.
-    _native_m = DEM_DEG * 111_320.0
-    _levels = [_native_m * 2**k for k in range(6)]
-    _fit = [r for r in _levels if r <= _target_m]
-    read_res_m = _fit[-1] if _fit else _levels[0]
-    read_res = read_res_m / 111_320.0  # source units are degrees
+        _hit = (
+            (s1m_albers[:, 0] < _pe)
+            & (s1m_albers[:, 2] > _pw)
+            & (s1m_albers[:, 1] < _pn)
+            & (s1m_albers[:, 3] > _ps)
+        )
+        candidates = [dict(s1m_tiles[int(i)]) for i in np.flatnonzero(_hit)]
 
+        # HOW MUCH OF THE BOX ACTUALLY HAS LIDAR. The national grid does not overlap, so
+        # the intersecting footprint areas simply sum. This is the number the carpet shows
+        # you by eye, made exact, and it is the thing that makes S1M different from a
+        # nationwide product: a box can be half data and half hole.
+        _iw = np.clip(np.minimum(s1m_albers[_hit, 2], _pe) - np.maximum(s1m_albers[_hit, 0], _pw), 0, None)
+        _ih = np.clip(np.minimum(s1m_albers[_hit, 3], _pn) - np.maximum(s1m_albers[_hit, 1], _ps), 0, None)
+        _aoi_area = max((_pe - _pw) * (_pn - _ps), 1e-9)
+        dem_cover = float(min(np.sum(_iw * _ih) / _aoi_area, 1.0))
+
+        # S1M overviews are a fixed power-of-two ladder in METRES, and the grid is already
+        # projected, so read_res needs no conversion at all.
+        _levels = [1.0 * 2**k for k in range(6)]
+        _fit = [r for r in _levels if r <= _target_m]
+        read_res_m = _fit[-1] if _fit else _levels[0]
+        read_res = read_res_m  # source units are metres
+        _label = "1 m S1M"
+
+    _est_px = (aoi_w_m * aoi_h_m) / read_res_m**2
     print(
         f"AOI {tuple(round(v, 4) for v in bbox)} · {aoi_w_m / 1000:.1f} x "
-        f"{aoi_h_m / 1000:.1f} km -> {len(candidates)} DEM COG(s) · reading the "
-        f"{read_res_m:.1f} m level "
+        f"{aoi_h_m / 1000:.1f} km -> {len(candidates)} {_label} COG(s) · reading the "
+        f"{read_res_m:g} m level "
         f"(mesh wants {_for_mesh:.1f} m, fold wants {_for_fold:.1f} m) · "
-        f"~{H3_CELL_M2[h3_res.value] / read_res_m**2:.0f} px per hex"
+        f"~{H3_CELL_M2[h3_res.value] / read_res_m**2:.0f} px per hex · "
+        f"~{_est_px / 1e6:.1f}M px in"
     )
-    return aoi_h_m, aoi_w_m, candidates, read_res
+    if dem_source.value == "s1m":
+        print(f"  S1M coverage of this box: {dem_cover:.0%}")
+        # WHAT S1M ACTUALLY BUYS YOU IS A FUNCTION OF BOX SIZE, and it is easy to pick 1 m
+        # from the dropdown and then read the 8 m overview of it, which is the 10 m product
+        # with coverage gaps. The read resolution is set by the lattice (AOI / texture), so
+        # reaching native 1 m means a box of roughly texture * 2 m or smaller: ~4 km at a
+        # 2048 texture, ~8 km at 4096. Said out loud rather than left to be discovered.
+        if read_res_m > 2.0:
+            print(
+                f"  NOTE: reading the {read_res_m:g} m overview, not native 1 m. The box "
+                f"is {max(aoi_w_m, aoi_h_m) / 1000:.1f} km against a {tex_size.value} "
+                f"texture. Draw under ~{tex_size.value * 2 / 1000:.0f} km, or raise the "
+                f"texture, to see what 1 m lidar is actually for."
+            )
+
+    # THE S1M GUARDS, and both exist because 1 m is addressed by a tile grid rather than by
+    # a nationwide mosaic. Neither is a rendering limit: the pixels and the COG opens are
+    # paid in the kernel long before anything reaches the GPU.
+    mo.stop(
+        dem_source.value == "s1m" and not candidates,
+        mo.md(
+            "### No 1 m lidar here\n"
+            "S1M has no tiles under this box, and **nothing has been streamed**. Turn on "
+            "**1 m S1M** in the DEM source dropdown to see the coverage carpet in the "
+            "picker and draw inside it, or switch the source back to **10 m seamless**, "
+            "which is nationwide."
+        ),
+    )
+    mo.stop(
+        dem_source.value == "s1m" and dem_cover < 0.25,
+        mo.md(
+            f"### Mostly a hole\n"
+            f"S1M covers only **{dem_cover:.0%}** of this box, so most of the surface "
+            f"would come back as nodata. Move the box inside the carpet, or switch to "
+            f"**10 m seamless**."
+        ),
+    )
+    mo.stop(
+        dem_source.value == "s1m" and len(candidates) > 64,
+        mo.md(
+            f"### That box is too many 1 m tiles\n"
+            f"**{len(candidates)}** S1M tiles (guard **64**), each a separate COG open and "
+            f"range read. S1M is a 10 km grid, so this is really a statement about box "
+            f"size: 1 m is for a small box. Draw smaller, or switch to **10 m seamless**, "
+            f"which covers a swath in a handful of COGs."
+        ),
+    )
+    return aoi_h_m, aoi_read, aoi_w_m, candidates, dem_crs, read_res
 
 
 @app.cell
-async def _(GeoTIFF, S3Store, S3_BASE, Window, asyncio, bbox, candidates, np, read_res):
-    # THE DEM STREAM. Unchanged from the drape except for what comes out: the arrays and
-    # their bounds are kept as-is, because BOTH consumers want the raster rather than a
-    # fold of it. The height field interpolates them; the SQL folds them.
+async def _(
+    GeoTIFF,
+    S3Store,
+    S3_BASE,
+    Window,
+    aoi_read,
+    asyncio,
+    candidates,
+    dem_source,
+    fit_lonlat,
+    np,
+    read_res,
+):
+    # THE DEM STREAM, AND IT IS THE SAME READER FOR BOTH SOURCES. Both products live on
+    # prd-tnm, both are COGs with a power-of-two overview ladder, so obstore + async-geotiff
+    # does not care which one it is pointed at. What comes out is kept as the raster and its
+    # bounds, because BOTH consumers want the raster rather than a fold of it: the height
+    # field interpolates it, the SQL folds it.
+    #
+    # The one difference is CRS, and it is carried rather than resolved here. Bounds come
+    # back in the source's own units (degrees for 10 m, Albers metres for S1M) and each
+    # S1M tile also carries the lon/lat fit its pixels will need in the fold. Fitting here
+    # rather than in the fold is deliberate: this coroutine runs on the main thread, and
+    # pyproj from a DataFusion worker aborts the process.
     _store = S3Store(bucket="prd-tnm", region="us-west-2", skip_signature=True)
+    _is_s1m = dem_source.value == "s1m"
 
     def _window(reader, aoi):
         pw, ps, pe, pn = aoi
@@ -663,8 +1050,17 @@ async def _(GeoTIFF, S3Store, S3_BASE, Window, asyncio, bbox, candidates, np, re
         reader = fits[-1] if fits else cands[0]
         # One pixel of margin on every side, so the bilinear sample at the very edge of the
         # AOI still has four neighbours instead of falling off the array and going NaN.
+        # reader.res is in the source's units, and so is aoi_read, so this is unit-agnostic.
         pad = reader.res[0] * 2
-        win = _window(reader, (bbox[0] - pad, bbox[1] - pad, bbox[2] + pad, bbox[3] + pad))
+        win = _window(
+            reader,
+            (
+                aoi_read[0] - pad,
+                aoi_read[1] - pad,
+                aoi_read[2] + pad,
+                aoi_read[3] + pad,
+            ),
+        )
         if win is None:
             return None
         r = await reader.read(window=win)
@@ -674,14 +1070,17 @@ async def _(GeoTIFF, S3Store, S3_BASE, Window, asyncio, bbox, candidates, np, re
         elev[elev < -1e5] = np.nan
         if not np.isfinite(elev).any():
             return None
-        return elev, tuple(r.bounds)
+        # S1M ONLY: the pixels are Albers metres, so fit this tile's window to lon/lat now,
+        # on the main thread. 10 m reads are already geographic and carry no fit.
+        fit = fit_lonlat(g.crs, tuple(r.bounds))[0] if _is_s1m else None
+        return elev, tuple(r.bounds), fit
 
     print(f"streaming {len(candidates)} DEM COG(s):")
     for _t in candidates:
         print(f"  {S3_BASE}{_t['key']}")
 
     dem_reads = [d for d in await asyncio.gather(*[_read_tile(t) for t in candidates]) if d]
-    _px = sum(int(e.size) for e, _ in dem_reads)
+    _px = sum(int(e.size) for e, _, _ in dem_reads)
     print(f"streamed {_px:,} DEM pixels from {len(dem_reads)}/{len(candidates)} COG(s)")
     return (dem_reads,)
 
@@ -700,7 +1099,29 @@ def _(bbox, np, tex_size):
 
 
 @app.cell
-def _(dem_reads, np, tex_lat, tex_lon):
+def _(Transformer, dem_crs, np, tex_lat, tex_lon):
+    # THE LATTICE, IN THE DEM'S OWN COORDINATES. The height field is a bilinear sample of
+    # the streamed raster, and bilinear only makes sense on the raster's REGULAR grid, so
+    # the lattice has to be carried into the source CRS rather than the raster dragged into
+    # degrees. For the 10 m product those are the same coordinates and this is a no-op.
+    #
+    # This is the forward direction, so it is plain pyproj on the main thread: no
+    # polynomial, no fit, no tolerance check. The polynomial exists only where the same
+    # conversion has to happen INSIDE a DataFusion worker, which is the fold and nowhere
+    # else. Bilinear here is exact.
+    if dem_crs == "EPSG:4269":
+        tex_x, tex_y = tex_lon, tex_lat
+    else:
+        _fwd = Transformer.from_crs("EPSG:4326", dem_crs, always_xy=True)
+        _x, _y = _fwd.transform(tex_lon.ravel(), tex_lat.ravel())
+        tex_x = np.asarray(_x).reshape(tex_lon.shape)
+        tex_y = np.asarray(_y).reshape(tex_lat.shape)
+        print(f"lattice projected into {dem_crs} for the height sample")
+    return tex_x, tex_y
+
+
+@app.cell
+def _(dem_reads, np, tex_x, tex_y):
     # HEIGHTS, BILINEAR OFF THE RASTER. This is the notebook's whole premise in twenty
     # lines: no fold, no hexagons, no `relief_smooth` to undo a quantisation that never
     # happens. The field is as smooth as the DEM is, which at 10 m is smoother than any
@@ -715,20 +1136,45 @@ def _(dem_reads, np, tex_lat, tex_lon):
     #
     # NaN discipline: a bilinear cell touching a nodata pixel is NaN, so nodata dilates by
     # one pixel. That is correct and it is why the read pads the window.
-    def _bilinear(elev, bounds, lon, lat):
+    # `x`/`y` are the lattice in the DEM's own CRS: degrees for the 10 m product, Albers
+    # metres for S1M. The arithmetic below is identical either way, because a COG's bounds
+    # and its grid spacing are in those same units.
+    def _bilinear(elev, bounds, x, y):
         left, bottom, right, top = bounds
         h, w = elev.shape
-        fx = (lon - left) / ((right - left) / w) - 0.5
-        fy = (top - lat) / ((top - bottom) / h) - 0.5
-        i0 = np.floor(fx).astype("int64")
-        j0 = np.floor(fy).astype("int64")
-        ok = (i0 >= 0) & (i0 < w - 1) & (j0 >= 0) & (j0 < h - 1)
+        if h < 2 or w < 2:
+            # A sliver read has no pair to interpolate between in one axis. Rare, but a
+            # window clipped to a COG's last column is exactly that, and indexing ic+1
+            # would walk off the array.
+            return None, np.zeros(x.shape, dtype=bool)
+        fx = (x - left) / ((right - left) / w) - 0.5
+        fy = (top - y) / ((top - bottom) / h) - 0.5
+        # VALID TO THE READ'S PHYSICAL EDGE, not to the last pixel CENTRE, and the
+        # difference is a visible bug. `fx` is in pixel-centre space, so it runs -0.5 at the
+        # left edge of column 0 to w-0.5 at the right edge of column w-1. Testing
+        # `0 <= i0 < w-1` threw away the outer HALF PIXEL on all four sides, because there
+        # is no second pixel to interpolate against out there.
+        #
+        # Harmless in the middle of a mosaic, fatal at a seam: two adjacent COGs each
+        # discard their own half pixel at the shared edge, so the union has a ONE PIXEL
+        # NaN crack along every 1-degree tile boundary. That crack has no height, so the
+        # texture goes transparent along it and the scene shows a dashed black line, in a
+        # cross wherever four tiles meet.
+        #
+        # So the outer half pixel EXTRAPOLATES instead of failing. The index pair is clamped
+        # to the last valid pair, but `tx`/`ty` are left unclipped, so they run to -0.5 and
+        # 1.5 out there and the same expression becomes a linear extrapolation off the edge
+        # pixels. Clipping them to [0, 1] would also close the crack, but by holding the
+        # edge value constant, which puts a half-pixel flat step along every seam: measured
+        # at 5 m of error against a known plane, versus 3e-14 for extrapolating. Interior
+        # samples are bit-identical either way, because out there the clamps never bind.
+        ok = (fx >= -0.5) & (fx <= w - 0.5) & (fy >= -0.5) & (fy <= h - 0.5)
         if not ok.any():
             return None, ok
-        tx = fx - i0
-        ty = fy - j0
-        ic = np.clip(i0, 0, w - 2)
-        jc = np.clip(j0, 0, h - 2)
+        ic = np.clip(np.floor(fx).astype("int64"), 0, w - 2)
+        jc = np.clip(np.floor(fy).astype("int64"), 0, h - 2)
+        tx = fx - ic
+        ty = fy - jc
         v = (
             elev[jc, ic] * (1 - tx) * (1 - ty)
             + elev[jc, ic + 1] * tx * (1 - ty)
@@ -737,9 +1183,9 @@ def _(dem_reads, np, tex_lat, tex_lon):
         )
         return v, ok
 
-    height_raw = np.full(tex_lon.shape, np.nan)
-    for _elev, _bounds in dem_reads:
-        _v, _ok = _bilinear(_elev, _bounds, tex_lon, tex_lat)
+    height_raw = np.full(tex_x.shape, np.nan)
+    for _elev, _bounds, _ in dem_reads:
+        _v, _ok = _bilinear(_elev, _bounds, tex_x, tex_y)
         if _v is None:
             continue
         _take = _ok & np.isfinite(_v) & ~np.isfinite(height_raw)
@@ -807,83 +1253,129 @@ def _(
     dem_reads,
     h3_res,
     make_ctx,
+    make_lonlat_udf,
     ndvi_tex,
     np,
     pa,
+    surface,
     tex_lat,
     tex_lon,
     xr,
 ):
-    # THE FOLD, AND THE JOIN. This is why the repository exists.
+    # THE FOLD, AND THE JOIN.
     #
     # Two rasters that share no CRS, no resolution, no provider and no tiling scheme are
     # aggregated to the SAME KEY and joined on it, in one DataFusion statement. The DEM
-    # goes in as its native grid through xarray-sql, one relation per COG, and its
-    # coordinates already are degrees. NAIP goes in as the lattice it was sampled onto.
-    # H3 makes them the same shape of thing. Nothing is reprojected and nothing is
-    # rasterised to a common grid, which is the step this normally costs.
+    # goes in as its native grid through xarray-sql, one relation per COG. NAIP goes in as
+    # the lattice it was sampled onto. H3 makes them the same shape of thing. Nothing is
+    # reprojected and nothing is rasterised to a common grid.
     #
-    # `relief` (max - min elevation inside a cell) is free here and worth having: it is
-    # roughness at the resolution of the aggregation, it needs no neighbours and therefore
-    # no ring join, and it says something the height field cannot, because the height field
-    # is a surface and this is a statistic about the pixels under it.
+    # IT RUNS FOR TWO SURFACES AND NO OTHERS, which is the honest scope of what an
+    # aggregation buys here:
+    #
+    #   `Relief` NEEDS it. max - min inside a cell is a statistic over a NEIGHBOURHOOD of
+    #     pixels, so no resampling at any resolution produces it.
+    #   `NDVI` uses it to average the NIR band per cell, which is what makes the DEM/NAIP
+    #     join demonstrable at all.
+    #
+    # `NAIP RGB` and `Elevation` do NOT. The photograph never reads a cell value, and
+    # elevation is already on the lattice as a bilinear height field that is strictly
+    # better than the hexagon means this produces. They used to pay for the fold anyway:
+    # a full DataFusion pass over every DEM pixel plus a `coordinates_to_cells` over every
+    # texel, on every render, for a result nothing drew.
     _res = h3_res.value
-    ctx = make_ctx()
 
-    for _i, (_elev, _bounds) in enumerate(dem_reads):
-        _left, _bottom, _right, _top = _bounds
-        _h, _w = _elev.shape
-        _yy = _top - (np.arange(_h) + 0.5) * (_top - _bottom) / _h
-        _xx = _left + (np.arange(_w) + 0.5) * (_right - _left) / _w
-        ctx.from_dataset(
-            f"dem_{_i}",
-            xr.Dataset({"elevation": (("y", "x"), _elev)}, coords={"y": _yy, "x": _xx}),
-            chunks={"y": 1024},
+    if surface.value not in ("NDVI", "Relief"):
+        cell_table = pa.table(
+            {
+                "hex": pa.array([], pa.uint64()),
+                "elevation": pa.array([], pa.float64()),
+                "relief": pa.array([], pa.float64()),
+                "n": pa.array([], pa.int64()),
+                "ndvi": pa.array([], pa.float64()),
+            }
+        )
+        tex_cells = np.zeros(0, dtype="uint64")
+        print(f"fold skipped: [{surface.value}] reads no cell values")
+    else:
+        ctx = make_ctx()
+        for _i, (_elev, _bounds, _fit) in enumerate(dem_reads):
+            _left, _bottom, _right, _top = _bounds
+            _h, _w = _elev.shape
+            _yy = _top - (np.arange(_h) + 0.5) * (_top - _bottom) / _h
+            _xx = _left + (np.arange(_w) + 0.5) * (_right - _left) / _w
+            ctx.from_dataset(
+                f"dem_{_i}",
+                xr.Dataset(
+                    {"elevation": (("y", "x"), _elev)}, coords={"y": _yy, "x": _xx}
+                ),
+                chunks={"y": 1024},
+            )
+            # S1M ONLY: one lon/lat UDF per relation, holding that tile's fitted
+            # coefficients. Per tile rather than one global fit because the polynomial is
+            # only accurate over the extent it was fitted on, and a 10 km window is where
+            # order 3 clears a millimetre.
+            if _fit is not None:
+                ctx.register_udf(make_lonlat_udf(f"to_lonlat_{_i}", _fit))
+
+        # The NAIP side arrives pre-indexed: the lattice cells are computed once here and
+        # reused to paint the result back, so the expensive `coordinates_to_cells` call
+        # happens a single time rather than once for the fold and once for the render.
+        tex_cells = cells_of(tex_lat, tex_lon, _res)
+        _flat = ndvi_tex.ravel()
+        _good = np.isfinite(_flat)
+        ctx.from_arrow(
+            pa.table({"hex": pa.array(tex_cells[_good]), "ndvi": pa.array(_flat[_good])}),
+            name="naip_lattice",
         )
 
-    # The NAIP side arrives pre-indexed: the lattice cells are computed once here and
-    # reused to paint the result back, so the expensive `coordinates_to_cells` call happens
-    # a single time rather than once for the fold and once for the render.
-    tex_cells = cells_of(tex_lat, tex_lon, _res)
-    _flat = ndvi_tex.ravel()
-    _good = np.isfinite(_flat)
-    ctx.from_arrow(
-        pa.table({"hex": pa.array(tex_cells[_good]), "ndvi": pa.array(_flat[_good])}),
-        name="naip_lattice",
-    )
-
-    _dem_union = " UNION ALL ".join(
-        f"SELECT h3_latlng_to_cell(y, x, CAST({_res} AS INT)) AS hex, elevation "
-        f"FROM dem_{_i} WHERE elevation = elevation"
-        for _i in range(len(dem_reads))
-    )
-    cell_table = ctx.sql(
-        f"""
-        WITH d AS (
-            SELECT hex,
-                   avg(elevation) AS elevation,
-                   max(elevation) - min(elevation) AS relief,
-                   count(*) AS n
-            FROM ({_dem_union})
-            GROUP BY 1
-        ),
-        v AS (
-            SELECT hex, avg(ndvi) AS ndvi, count(*) AS n_ndvi
-            FROM naip_lattice
-            GROUP BY 1
+        # THE ONE PLACE THE CRS SHOWS UP IN SQL. A 10 m relation's y/x already ARE lat/lon,
+        # so they go straight into the cell id. An S1M relation's are Albers metres, so they
+        # pass through that tile's fitted UDF first. Same fold, same key, same GROUP BY: the
+        # difference is one nested SELECT, and after this line nothing downstream can tell
+        # which source it is looking at.
+        _dem_union = " UNION ALL ".join(
+            (
+                f"SELECT h3_latlng_to_cell(y, x, CAST({_res} AS INT)) AS hex, elevation "
+                f"FROM dem_{_i} WHERE elevation = elevation"
+            )
+            if _fit is None
+            else (
+                f"SELECT h3_latlng_to_cell(p.lat, p.lon, CAST({_res} AS INT)) AS hex, "
+                f"elevation FROM ("
+                f"  SELECT to_lonlat_{_i}(x, y) AS p, elevation"
+                f"  FROM dem_{_i} WHERE elevation = elevation"
+                f")"
+            )
+            for _i, (_, _, _fit) in enumerate(dem_reads)
         )
-        SELECT d.hex, d.elevation, d.relief, d.n, v.ndvi
-        FROM d LEFT JOIN v USING (hex)
-        """
-    ).to_arrow_table()
+        cell_table = ctx.sql(
+            f"""
+            WITH d AS (
+                SELECT hex,
+                       avg(elevation) AS elevation,
+                       max(elevation) - min(elevation) AS relief,
+                       count(*) AS n
+                FROM ({_dem_union})
+                GROUP BY 1
+            ),
+            v AS (
+                SELECT hex, avg(ndvi) AS ndvi, count(*) AS n_ndvi
+                FROM naip_lattice
+                GROUP BY 1
+            )
+            SELECT d.hex, d.elevation, d.relief, d.n, v.ndvi
+            FROM d LEFT JOIN v USING (hex)
+            """
+        ).to_arrow_table()
 
-    _n = np.asarray(cell_table["n"])
-    _nd = np.asarray(cell_table["ndvi"])
-    print(
-        f"H3 res {_res}: {cell_table.num_rows:,} cells · "
-        f"{_n.mean():.1f} DEM px/cell (min {_n.min()}) · "
-        f"{np.isfinite(_nd).mean() * 100:.0f}% of cells carry NDVI"
-    )
+        _n = np.asarray(cell_table["n"])
+        _nd = np.asarray(cell_table["ndvi"])
+        print(
+            f"H3 res {_res}: {cell_table.num_rows:,} cells · "
+            f"{_n.mean():.1f} DEM px/cell (min {_n.min()}) · "
+            f"{np.isfinite(_nd).mean() * 100:.0f}% of cells carry NDVI"
+        )
     return cell_table, tex_cells
 
 
@@ -892,23 +1384,36 @@ def _(cell_table, np, tex_cells, tex_lon):
     # Cell id -> row, then every texel is a searchsorted. `ok` is False for cells the fold
     # never saw, which the texture turns transparent. Sorting once is what makes painting
     # 4M texels from a few hundred thousand cells cheap.
-    _hex = np.asarray(cell_table["hex"]).astype("uint64")
-    _order = np.argsort(_hex)
-    _sorted = _hex[_order]
+    #
+    # Skipped along with the fold: when the surface reads no cell values there is nothing
+    # to index, and building the index anyway would put the `coordinates_to_cells` cost
+    # back on a path that does not use the answer.
+    if tex_cells.size == 0:
+        texel_rows = np.zeros(tex_lon.shape, dtype="int64")
+        texel_ok = np.zeros(tex_lon.shape, dtype=bool)
+    else:
+        _hex = np.asarray(cell_table["hex"]).astype("uint64")
+        _order = np.argsort(_hex)
+        _sorted = _hex[_order]
 
-    _pos = np.clip(np.searchsorted(_sorted, tex_cells), 0, max(_sorted.size - 1, 0))
-    _found = _sorted[_pos] == tex_cells if _sorted.size else np.zeros(tex_cells.shape, bool)
-    texel_rows = _order[_pos].reshape(tex_lon.shape)
-    texel_ok = _found.reshape(tex_lon.shape)
+        _pos = np.clip(np.searchsorted(_sorted, tex_cells), 0, max(_sorted.size - 1, 0))
+        _found = (
+            _sorted[_pos] == tex_cells if _sorted.size else np.zeros(tex_cells.shape, bool)
+        )
+        texel_rows = _order[_pos].reshape(tex_lon.shape)
+        texel_ok = _found.reshape(tex_lon.shape)
 
     def cell_field(name):
         """A per-cell column, painted onto the lattice. NaN where the cell is missing."""
+        if texel_rows.size == 0 or cell_table.num_rows == 0:
+            return np.full(tex_lon.shape, np.nan)
         _v = np.asarray(cell_table[name]).astype("float64")
         out = np.where(texel_ok, _v[texel_rows], np.nan)
         return out
 
-    print(f"texel index: {texel_ok.shape[0]}^2 · {texel_ok.mean() * 100:.1f}% on a cell")
-    return cell_field, texel_ok
+    if tex_cells.size:
+        print(f"texel index: {texel_ok.shape[0]}^2 · {texel_ok.mean() * 100:.1f}% on a cell")
+    return cell_field
 
 
 @app.cell
@@ -948,7 +1453,14 @@ def _(aoi_h_m, aoi_w_m, box_mean, height_raw, np, smooth):
 
     px_m_x = aoi_w_m / height_tex.shape[1]
     px_m_y = aoi_h_m / height_tex.shape[0]
-    return height_tex, px_m_x, px_m_y
+
+    # WHERE THE SURFACE EXISTS AT ALL, and this is the mask every texture's alpha starts
+    # from. It used to be `texel_ok`, i.e. "this texel landed on an H3 cell the fold saw",
+    # which quietly made the PHOTOGRAPH depend on the fold: no cell, no pixel, even though
+    # the photograph never reads a cell value. The honest test is whether the mesh has a
+    # height here, which is what the geometry is built from and what the drape is drawn on.
+    surface_ok = _ms > 0
+    return height_tex, px_m_x, px_m_y, surface_ok
 
 
 @app.cell
@@ -1122,7 +1634,16 @@ async def _(
 
 
 @app.cell
-def _(PALETTES, apply_continuous_cmap, cell_field, np, ndvi_range, palette, surface):
+def _(
+    PALETTES,
+    apply_continuous_cmap,
+    cell_field,
+    height_raw,
+    ndvi_range,
+    np,
+    palette,
+    surface,
+):
     # THE DATA SURFACE, computed once on the global lattice, because it is a function of
     # the cell values alone and every tile just samples the result.
     #
@@ -1144,7 +1665,13 @@ def _(PALETTES, apply_continuous_cmap, cell_field, np, ndvi_range, palette, surf
             else (0.0, 1.0)
         )
     else:  # Elevation, and also the fallback under the photograph
-        _v = cell_field("elevation")
+        # STRAIGHT OFF THE HEIGHT FIELD, not off the fold. This used to read
+        # `cell_field("elevation")`, which meant the elevation ramp was hexagon means of
+        # the same pixels the height field already samples bilinearly, at whatever the H3
+        # resolution happened to be. Strictly worse, and it was the only reason the
+        # photograph needed the fold at all: this branch is what the RGB view falls back to
+        # where a tile has no imagery.
+        _v = height_raw
         _finite = _v[np.isfinite(_v)]
         _lo, _hi = (
             (float(np.nanmin(_finite)), float(np.nanmax(_finite)))
@@ -1176,7 +1703,7 @@ def _(
     photo,
     shade_factor,
     surface,
-    texel_ok,
+    surface_ok,
     tile_sample,
     tiles,
 ):
@@ -1188,7 +1715,7 @@ def _(
     textures = []
     for _k, _t in enumerate(tiles):
         _rgb_src, _cover = photo[_k]
-        _ok = tile_sample(texel_ok, _t)
+        _ok = tile_sample(surface_ok, _t)
         if surface.value == "NAIP RGB" and _cover.any():
             rgb = _rgb_src.astype("float64")
             visible = _ok & _cover
