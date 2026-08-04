@@ -139,6 +139,48 @@ that did not know about each other.
   out of the tile-grid cell, because that cell produces `tiles`: leaving it there would have
   made every change of `Colour by` rebuild the tile set and re-stream every DEM window.
 
+## The layer pool was a workaround for a constraint that does not exist
+
+Reported as "just the picker is really laggy, shouldn't be 1.1 GB in the browser before
+run". Two things were true at once and only one of them was mine.
+
+**The picker was never changed.** Diffed cell by cell against `xsql-naip-ndvi.py`: the
+picker `Map` and the coverage layer differ by COMMENT TEXT ONLY, zero code difference. I
+had asserted the pool was the cause before measuring anything, which was wrong of me to
+state as fact.
+
+**What actually sits in that browser tab is two maps.** The scene `Map` cell deliberately
+depends on no control, which is what stops a slider from resetting the camera, but it
+therefore does not depend on the first-run latch either, and `mo.stop` only halts
+DESCENDANTS of the cell it is in. So the scene map is constructed at notebook open, while
+the pipeline is still parked at the picker, and it was constructing a fixed pool of 1024
+SurfaceLayers to have them ready. I had raised that from 144 to 1024 to fit the 304-tile
+scene, which made a pre-existing cost 7x worse.
+
+**The pool existed because of an assumption that is false.** Every notebook in this repo
+carries the comment "`Map.layers` must not be reassigned: that throws away the camera", and
+that is why they pre-allocate. lonboard only recomputes the view from the layers inside
+`add_layer(focus=True)` and `reset_zoom=True`; `view_state` is an independent trait the
+frontend owns. Verified: fly the camera, grow the list 1 -> 88, shrink it 88 -> 9, and
+`view_state` is unchanged both times.
+
+So there is no pool. The Map is built with ONE blank layer and the update cell grows the
+list to the tile count and trims it back, removing surplus layers rather than blanking
+them. Idle cost is one draw call of nothing. `MAX_TILES` now bounds draw calls rather than
+a pool, and no longer has to equal anything in the Map cell.
+
+Worth carrying to the other notebooks: `xsql-naip-drape.py`, `xsql-naip-ndvi.py` and
+`xsql-s1m-surface.py` all pre-allocate on the same false premise, though at 16 layers
+rather than 1024, so it costs them much less.
+
+Two process notes, both earned:
+
+* **State a diagnosis as a hypothesis until it is measured.** "That's the 1.1 GB" was a
+  guess dressed as a finding, and Stephen was right to stop it.
+* **"Why would that even run?" is usually a better question than "how big should it be?"**
+  The answer here was that the thing should not have been running at all, which no amount
+  of tuning the constant would have reached.
+
 ## Still unbuilt, and now the obvious next thing
 
 **View-dependent residency.** The tile scheme is already global and camera-independent, so

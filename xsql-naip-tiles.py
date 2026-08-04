@@ -852,11 +852,11 @@ def _(bbox, detail, get_started, mo, np, tile_texels):
     # is fixed rather than derived from `smooth` so that moving a scene control never
     # re-streams a COG.
     # THE CAPS, AND THEY ARE DELIBERATELY GENEROUS, because the whole point of this
-    # notebook is that big boxes are the requirement. MAX_TILES exists only because the
-    # layer pool is fixed (deck will not let us reassign Map.layers without throwing away
-    # the camera), so it MUST equal POOL in the Map cell. Constructing 1024 SurfaceLayers
-    # measures 0.51 s, so the pool itself is not the cost; the draw calls are, which is
-    # what SOFT_TILES warns about rather than refuses.
+    # notebook is that big boxes are the requirement. MAX_TILES no longer has anything to do
+    # with a layer pool: the Map cell allocates one blank layer and the update cell grows the
+    # list to the tile count, so an unrun notebook holds one layer rather than a thousand.
+    # What MAX_TILES bounds now is DRAW CALLS, which is a real per-frame cost, and
+    # SOFT_TILES warns about it well before the refusal.
     #
     # Sized against a real target: a 24 x 25 km box at ~1.5 m/texel is about 840 MB of
     # texture no matter how it is tiled, because that is just area over texel area. A cap
@@ -2096,24 +2096,33 @@ def _(
     bbox,
     np,
 ):
-    # The layers and the Map are built ONCE, from placeholder geometry. This cell references
-    # no control, so marimo never re-runs it and the view you flew to survives every
-    # adjustment. The update cell at the bottom pushes the real arrays in.
+    # The Map is built ONCE. This cell references no control, so marimo never re-runs it and
+    # the view you flew to survives every adjustment. The update cell at the bottom puts the
+    # real layers in.
     #
-    # A FIXED POOL sized to the tile cap, because `Map.layers` must not be reassigned: that
-    # throws away the camera. Unused layers park on a degenerate triangle with a transparent
-    # texel and cost one draw call of nothing. THIS MUST EQUAL `MAX_TILES` in the tile-grid
-    # cell: that gate exists purely to keep the tile set inside this pool.
-    POOL = 1024
-    surfaces = [
-        SurfaceLayer(
+    # NO POOL. The notebooks this came from pre-allocated every layer they could ever need
+    # here, at Map construction, because they assumed `Map.layers` could not be reassigned
+    # without deck throwing away the camera. That assumption is why a pool existed at all,
+    # and it is wrong: in lonboard the view is only recomputed by `add_layer(focus=True)` or
+    # `reset_zoom=True`, and plain assignment to `.layers` touches nothing.
+    #
+    # It also had a cost nobody had priced. THIS CELL DEPENDS ON NO CONTROL, which is the
+    # whole point of it, but that also means it does not depend on the first-run latch: it
+    # runs the moment the notebook opens, while the pipeline is still parked at the picker.
+    # A pool of 1024 therefore built 1024 deck layers and their models before a box was ever
+    # drawn, on the same page and the same GPU as the picker you are trying to draw on.
+    #
+    # So the scene starts with ONE blank layer and the update cell grows the list to the tile
+    # count and trims it back. Idle cost is one draw call of nothing.
+    def new_surface():
+        return SurfaceLayer(
             positions=np.zeros((4, 3), dtype="float32"),
             triangles=np.array([[0, 1, 2], [1, 3, 2]], dtype="uint32"),
             tex_coords=np.zeros((4, 2), dtype="float32"),
             texture=np.zeros((1, 1, 4), dtype="uint8"),
         )
-        for _ in range(POOL)
-    ]
+
+    surfaces = [new_surface()]
     scene = Map(
         layers=surfaces,
         view_state={
@@ -2144,7 +2153,7 @@ def _(
         },
     )
     scene
-    return (surfaces,)
+    return new_surface, scene, surfaces
 
 
 @app.cell
@@ -2287,33 +2296,49 @@ def _(
 
 
 @app.cell
-def _(fill_opacity, np, positions, surfaces, tex_coords, textures, triangles, wireframe):
-    # The only thing the controls do: swap traits on the running layers. No Map rebuild.
+def _(
+    fill_opacity,
+    new_surface,
+    positions,
+    scene,
+    surfaces,
+    tex_coords,
+    textures,
+    triangles,
+    wireframe,
+):
+    # THE LAYER LIST IS GROWN TO THE TILE COUNT HERE, not pre-allocated at Map construction.
+    # A layer exists because a tile exists, which is the property that stops an unrun
+    # notebook from holding a thousand deck layers open while you are using the picker.
     #
+    # Reassigning `scene.layers` is safe: lonboard only recomputes the view state from the
+    # layers in `add_layer(focus=True)` and `reset_zoom=True`, neither of which is on this
+    # path, and `view_state` is an independent trait the frontend owns. It is still done as
+    # rarely as possible, i.e. only when the COUNT changes, because the count changing is
+    # the one case that cannot be expressed as a trait swap.
+    _need = len(positions)
+    while len(surfaces) < _need:
+        surfaces.append(new_surface())
+
     # BATCHED PER LAYER, because positions, tex_coords and triangles have to agree about
     # vertex indices. Moving Texels/quad changes all three, and if they reach the frontend
     # one at a time the widget briefly holds indices past the end of a buffer.
-    _blank_pos = np.zeros((4, 3), dtype="float32")
-    _blank_tri = np.array([[0, 1, 2], [1, 3, 2]], dtype="uint32")
-    _blank_uv = np.zeros((4, 2), dtype="float32")
-    _blank_tex = np.zeros((1, 1, 4), dtype="uint8")
-
-    for _k, _layer in enumerate(surfaces):
+    for _k in range(_need):
+        _layer = surfaces[_k]
         with _layer.hold_trait_notifications():
-            if _k < len(positions):
-                _layer.positions = positions[_k]
-                _layer.tex_coords = tex_coords
-                _layer.triangles = triangles
-                _layer.texture = textures[_k]
-                _layer.wireframe = wireframe.value
-                _layer.opacity = fill_opacity.value
-            else:
-                # Shrinking the tile set has to actively blank the surplus layers, or the
-                # last run's geometry draws a coarse copy underneath the new one.
-                _layer.positions = _blank_pos
-                _layer.tex_coords = _blank_uv
-                _layer.triangles = _blank_tri
-                _layer.texture = _blank_tex
+            _layer.positions = positions[_k]
+            _layer.tex_coords = tex_coords
+            _layer.triangles = triangles
+            _layer.texture = textures[_k]
+            _layer.wireframe = wireframe.value
+            _layer.opacity = fill_opacity.value
+
+    # Surplus layers are REMOVED rather than blanked. The pooled version had to actively
+    # blank them, because a layer left holding last run's geometry draws a coarse copy
+    # underneath the new one; dropping them from the list is both cheaper and harder to get
+    # wrong. `surfaces` keeps them so a later, larger tile set can reuse the objects.
+    if len(scene.layers) != _need:
+        scene.layers = tuple(surfaces[:_need])
     return
 
 
