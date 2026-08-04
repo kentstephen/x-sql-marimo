@@ -26,7 +26,9 @@ No rioxarray, no GDAL.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections import defaultdict, namedtuple
+from datetime import timedelta
 
 import numpy as np
 from pyproj import Transformer
@@ -46,6 +48,44 @@ REFETCH_YEARS = 3
 
 # Latitude above which a December-March flight should be assumed to have snow in it.
 SNOW_LAT = 38.0
+
+# THE TWO TIMEOUTS, and they are different problems with the same word.
+#
+# obstore's HTTP client gives an ENTIRE request 30 seconds by default, connect through
+# last byte of body. That is a sane default for the small range reads it was built for and
+# far too tight here: one tile of one NAIP quad at a fine overview is tens of megabytes,
+# and a wide box asks for dozens of those at once, so they share the link and each one
+# individually runs past 30 s. The read then fails as a timeout even though the transfer
+# was making progress the whole time, which is why this shows up on big AOIs and big tile
+# grids and never on a small box. So: 3 minutes overall, a short connect timeout so a dead
+# host still fails fast, and a read timeout that resets on each chunk received, which is
+# the one that should be catching a genuinely stalled transfer.
+#
+# `retry_timeout` bounds retries from the FIRST attempt, so it has to exceed `timeout` or a
+# retry can never happen. Kept under 5 minutes because the hrefs are SAS-signed and retries
+# do not re-sign.
+HTTP_CLIENT_OPTS = {
+    "timeout": "180s",
+    "connect_timeout": "15s",
+    "read_timeout": "60s",
+}
+HTTP_RETRY = {"max_retries": 6, "retry_timeout": timedelta(minutes=4)}
+
+# The STAC API is the other one, and it is not a bandwidth problem: the search is small
+# JSON, but pystac_client ships NO timeout by default, so a stalled connection hangs the
+# cell forever rather than failing. (connect, read) in seconds, plus a retry with backoff
+# around the whole search, because a transient 429 or 503 from a public API should cost a
+# pause rather than the pipeline: with the coverage gate downstream, a failed search now
+# stops the DEM read too.
+STAC_TIMEOUT = (10, 90)
+STAC_TRIES = 3
+
+# Items per page. PC defaults to a small page, so a 3,400-item archive query over a wide
+# box was 35 round trips; at 1,000 it is 4, and measurably faster end to end.
+STAC_PAGE = 1000
+
+# Simultaneous quad reads. See the note in `naip_rgb`.
+MAX_CONCURRENT_READS = 8
 
 _Year = namedtuple("_Year", "year quads one_date cov leaf_off dates")
 
@@ -116,15 +156,27 @@ def naip_quads(bbox, season="any", datetime_range="2010-01-01/2026-12-31", max_i
     from shapely import union_all
     from shapely.geometry import box as sbox, shape as sshape
 
-    cat = pystac_client.Client.open(NAIP_STAC, modifier=planetary_computer.sign_inplace)
+    cat = pystac_client.Client.open(
+        NAIP_STAC, modifier=planetary_computer.sign_inplace, timeout=STAC_TIMEOUT
+    )
 
     # No `sortby`: Planetary Computer sorts server-side and it is slow enough over a
     # 15-year window to trip the request timeout. The year grouping below sorts locally,
     # so the server only has to do the cheap bbox + datetime filter.
+    #
+    # Retried with backoff rather than failed on: this is a public API with rate limits,
+    # the query is idempotent, and the whole pipeline is now downstream of the answer.
     def _search(dt, cap):
-        return cat.search(
-            collections=["naip"], bbox=list(bbox), datetime=dt, max_items=cap,
-        ).item_collection()
+        for attempt in range(STAC_TRIES):
+            try:
+                return cat.search(
+                    collections=["naip"], bbox=list(bbox), datetime=dt,
+                    max_items=cap, limit=STAC_PAGE,
+                ).item_collection()
+            except Exception:
+                if attempt == STAC_TRIES - 1:
+                    raise
+                time.sleep(2**attempt)
 
     try:
         items = _search(datetime_range, max_items)
@@ -325,6 +377,13 @@ def _window_for(reader, bounds_proj, Window):
     return Window(col_off=col0, row_off=row0, width=col1 - col0, height=row1 - row0)
 
 
+def _store_for(HTTPStore, href):
+    """One store per href, with the timeouts and retries the defaults do not give."""
+    return HTTPStore.from_url(
+        href, client_options=HTTP_CLIENT_OPTS, retry_config=HTTP_RETRY
+    )
+
+
 async def open_quads(quads, GeoTIFF, HTTPStore):
     """Open every quad's COG once, as {href: GeoTIFF}, for reuse across many reads.
 
@@ -335,7 +394,7 @@ async def open_quads(quads, GeoTIFF, HTTPStore):
     """
     hrefs = list({q.assets["image"].href: None for q in quads})
     opened = await asyncio.gather(
-        *[GeoTIFF.open("", store=HTTPStore.from_url(h)) for h in hrefs]
+        *[GeoTIFF.open("", store=_store_for(HTTPStore, h)) for h in hrefs]
     )
     return dict(zip(hrefs, opened))
 
@@ -343,7 +402,9 @@ async def open_quads(quads, GeoTIFF, HTTPStore):
 async def _read_quad(item, bbox, target_res_m, GeoTIFF, HTTPStore, Window, opened=None):
     """Stream one NAIP quad's AOI window at an overview matched to `target_res_m`."""
     href = item.assets["image"].href  # already signed by sign_inplace
-    g = (opened or {}).get(href) or await GeoTIFF.open("", store=HTTPStore.from_url(href))
+    g = (opened or {}).get(href) or await GeoTIFF.open(
+        "", store=_store_for(HTTPStore, href)
+    )
 
     # Coarsest level still at least as fine as one texel. NAIP is 0.6 m native with
     # overviews to /64, and reading a level finer than the texture can show is pure
@@ -395,12 +456,20 @@ async def naip_rgb(
     to want this notebook can span 40 quads, and re-projecting a 2048-square lattice 40
     times costs more than reading the imagery does.
     """
-    reads = await asyncio.gather(
-        *[
-            _read_quad(q, bbox, target_res_m, GeoTIFF, HTTPStore, Window, opened)
-            for q in quads
-        ]
-    )
+    # CAPPED CONCURRENCY, which is a timeout fix and not a politeness one. Every read has
+    # its own wall clock, so firing forty at once does not make them forty times slower in
+    # parallel, it makes each one forty times slower against a timeout that does not know
+    # about the others. A cap keeps each transfer wide enough to finish inside its budget,
+    # and the total is no slower because the link was the constraint either way.
+    sem = asyncio.Semaphore(MAX_CONCURRENT_READS)
+
+    async def read_one(q):
+        async with sem:
+            return await _read_quad(
+                q, bbox, target_res_m, GeoTIFF, HTTPStore, Window, opened
+            )
+
+    reads = await asyncio.gather(*[read_one(q) for q in quads])
     tiles = [t for t in reads if t is not None]
     info = {
         "quads_read": len(tiles),

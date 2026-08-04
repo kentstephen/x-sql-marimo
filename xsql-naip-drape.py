@@ -448,18 +448,52 @@ def _(dem_source, mo):
 
 
 @app.cell
-def _(dem_source, h3_res, mo):
-    # BOTH SOURCE CONTROLS, ABOVE THE MAP, because they describe what you are about to
+def _(mo):
+    # SEASON, and it is about what the photograph SHOWS, not when it was taken. A leaf-on
+    # frame over forest drapes the canopy: the ground the DEM is describing is hidden
+    # under it, so the mesh has relief the texture does nothing to corroborate. A leaf-off
+    # frame shows the bare ground, the road cuts, the drainage lines and the rock, which is
+    # the thing a terrain drape is for.
+    #
+    # NAIP is a growing-season program, so leaf-off frames only exist where a state's
+    # flight window opened before leaf-out or closed after leaf-drop, and plenty of AOIs
+    # have none. Hence three settings rather than a switch: "prefer" quietly takes leaf-off
+    # where it covers the box comparably well and the best mosaic where it does not, while
+    # "only" refuses to substitute and lets the coverage gate stop the pipeline.
+    #
+    # IT LIVES UP HERE WITH THE DEM AND THE RESOLUTION, not down with the scene controls,
+    # because it decides WHAT GETS FETCHED. That is the split the notebook keeps: choosing
+    # a season re-runs a STAC search and re-streams imagery, so it belongs with the other
+    # two controls that spend network, above the picker, not among the sliders that only
+    # restyle a scene already in memory.
+    naip_season = mo.ui.dropdown(
+        options={
+            "Any (best mosaic)": "any",
+            "Prefer leaf-off": "prefer",
+            "Leaf-off only": "off",
+        },
+        value="Any (best mosaic)",
+        label="NAIP season",
+    )
+    return (naip_season,)
+
+
+@app.cell
+def _(dem_source, h3_res, mo, naip_season):
+    # ALL THREE SOURCE CONTROLS, ABOVE THE MAP, because they describe what you are about to
     # fetch rather than how the result looks. Everything that only restyles an existing
     # scene lives under the scene instead.
     mo.vstack(
         [
-            mo.hstack([dem_source, h3_res], justify="start", gap=2),
+            mo.hstack([dem_source, h3_res, naip_season], justify="start", gap=2),
             mo.md(
                 "<small>Switching to **1 m** draws the S1M coverage footprints on the map "
                 "below: the 1 m product exists only inside them. The 10 m seamless needs "
-                "no such check, so the carpet hides itself. Neither control fetches "
-                "anything until you draw a box.</small>"
+                "no such check, so the carpet hides itself. **NAIP season** asks for "
+                "leaf-off imagery, which shows bare ground instead of canopy: it is a "
+                "minority of the archive, so *Prefer* falls back to the best mosaic and "
+                "*Only* stops rather than substituting. None of these fetch anything "
+                "until you draw a box.</small>"
             ),
         ],
         gap=0.5,
@@ -1764,27 +1798,6 @@ def _(PALETTES, mo):
         value="NAIP",
         label="Texture source",
     )
-    # SEASON, and it is about what the photograph SHOWS, not when it was taken. A leaf-on
-    # frame over forest drapes the canopy: the ground the DEM is describing is hidden
-    # under it, so the mesh has relief the texture cannot corroborate. A leaf-off frame
-    # shows the bare ground, the road cuts, the drainage lines and the rock, which is the
-    # thing a terrain drape is for.
-    #
-    # NAIP is a growing-season program, so leaf-off frames only exist where a state's
-    # flight window opened before leaf-out or closed after leaf-drop, and plenty of AOIs
-    # have none at all. Hence three settings rather than a switch: "prefer" quietly takes
-    # leaf-off where it exists and the best mosaic where it does not, while "only" refuses
-    # to substitute and lets the palette take the scene. The choice is re-made per AOI and
-    # costs a STAC call, not a re-read of pixels.
-    naip_season = mo.ui.dropdown(
-        options={
-            "Any (best mosaic)": "any",
-            "Prefer leaf-off": "prefer",
-            "Leaf-off only": "off",
-        },
-        value="Any (best mosaic)",
-        label="NAIP season",
-    )
     hillshade = mo.ui.slider(
         start=0.0, stop=1.0, step=0.05, value=0.6, label="Hillshade", show_value=True
     )
@@ -1832,8 +1845,7 @@ def _(PALETTES, mo):
     mo.vstack(
         [
             mo.hstack(
-                [drape, naip_season, brightness, hillshade, colour_smooth],
-                justify="start", gap=2,
+                [drape, brightness, hillshade, colour_smooth], justify="start", gap=2
             ),
             mo.hstack([palette, reverse_ramp], justify="start", gap=2),
             mo.hstack(
@@ -1852,7 +1864,6 @@ def _(PALETTES, mo):
         fill_opacity,
         hillshade,
         mesh_density,
-        naip_season,
         palette,
         relief_smooth,
         reverse_ramp,
