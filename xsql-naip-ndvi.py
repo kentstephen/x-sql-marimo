@@ -411,12 +411,13 @@ def _(
 
     BASEMAPS = {
         "Esri Topographic (viewer default)": (_ESRI.format("World_Topo_Map"), 19),
+        "Esri Terrain": (_ESRI.format("World_Terrain_Base"), 13),
         "USGS Imagery + Topo": (_USGS.format("USGSImageryTopo"), 16),
         "USGS Imagery only": (_USGS.format("USGSImageryOnly"), 16),
         "USGS Topo": (_USGS.format("USGSTopo"), 16),
         "USGS Shaded relief": (_USGS.format("USGSShadedReliefOnly"), 16),
     }
-    _default = "USGS Imagery + Topo"
+    _default = "Esri Topographic (viewer default)"
     basemap_layer = BitmapTileLayer(
         data=BASEMAPS[_default][0],
         max_zoom=BASEMAPS[_default][1],
@@ -458,7 +459,7 @@ def _(BASEMAPS, mo):
     # Its own cell, downstream of the picker, so choosing a basemap never rebuilds the Map
     # and never disturbs a box you have already drawn.
     basemap_choice = mo.ui.dropdown(
-        options=list(BASEMAPS), value="USGS Imagery + Topo", label="Basemap"
+        options=list(BASEMAPS), value="Esri Topographic (viewer default)", label="Basemap"
     )
     basemap_opacity = mo.ui.number(
         start=0.0, stop=1.0, step=0.1, value=1.0, debounce=True, label="Basemap opacity"
