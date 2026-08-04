@@ -51,6 +51,25 @@ radio to switch back and it nearly took a machine down; that was a mistake and i
    light vector, sun 315°/45°, ambient floor 0.35, multiplied in as pure luminance so hue
    never shifts and the ramp stays deuteranope-safe. Uses the same `elevation_scale` as the
    geometry. Adding real normals would mean patching lonboard's JS.
+
+   > **CORRECTION (2026-08-03). The second sentence of this item is FALSE, and it cost a
+   > long debugging session on the NAIP drape.** A mesh without normals is not unlit. deck's
+   > `SimpleMeshLayer` reads `flatShading: !this.state.hasNormals`, so a missing `NORMAL`
+   > turns FLAT SHADING ON: the shader derives a face normal per triangle from screen-space
+   > derivatives and lights it with the default material (`material: true`). The surface has
+   > been lit all along, per triangle, by a light nobody chose.
+   >
+   > On a colour ramp this passes for texture. On a NAIP photograph it is ruinous: the
+   > drape breaks into pale and dark facets the size of a mesh quad, the two triangles of
+   > each quad disagree, and it reads as a herringbone of translucent quadrilaterals over
+   > the imagery. It looks exactly like a texture, mipmap or depth bug and is none of them,
+   > and no notebook parameter can reach it.
+   >
+   > Fix: `tools/patch_lonboard_surface.py` injects `material: false` into the props
+   > lonboard hands SimpleMeshLayer. **Re-run it after any install**, and hard-reload the
+   > browser, not just the kernel. Consequence for THIS notebook: the baked hillshade has
+   > been multiplying with deck's flat-facet sun the whole time, so the hillshade default
+   > is worth revisiting now that only one sun is left.
 2. **Mesh coarser than the data.** Density 256 over a 7 km AOI is 28 m quads against 9.4 m
    hexes: one vertex per nine cells, flat triangles spanning the gaps. Slider now reaches
    2048, defaults to 1024, and the cell prints metres per quad.

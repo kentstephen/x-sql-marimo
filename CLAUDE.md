@@ -87,6 +87,25 @@ Core deps (see `pyproject.toml`): `marimo`, `datafusion`, `h3ronpy`, `pyarrow`,
 `--sandbox` stays self-contained. Pin the deck.gl-raster / lonboard versions; they
 move fast.
 
+### Required for every SurfaceLayer notebook
+
+```bash
+uv run python tools/patch_lonboard_surface.py   # re-run after ANY install
+```
+
+Without it the textured mesh comes back covered in pale quadrilateral facets. lonboard's
+`SurfaceLayer` sends no `NORMAL`, and deck's `SimpleMeshLayer` responds to that with
+`flatShading: !hasNormals` rather than by skipping lighting: one derived normal per
+triangle, lit by the default material. On a colour ramp it passes for texture; on a NAIP
+photograph it is a herringbone of translucent facets over the imagery, and **no notebook
+parameter can reach it**. The script injects `material: false` into the shipped JS bundle,
+so `uv sync`, a lonboard upgrade and `--sandbox` all revert it. Hard-reload the browser
+after running it; the widget JS is cached client side and a kernel restart is not enough.
+Full account in `docs/xsql-naip-drape-notes.md`.
+
+Layer `parameters` must use luma v9 names: `depthCompare` and `depthWriteEnabled`, not the
+WebGL-1 `depthTest`, which deck reads as nothing and silently leaves depth disabled.
+
 ## Reference repos (reuse, do not rebuild)
 
 - `deck-terrain-naip-marimo/naip_terrain_viewer.py` — VRT-as-catalog parse, draw-box

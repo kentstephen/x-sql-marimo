@@ -433,7 +433,12 @@ async def _read_quad(item, bbox, target_res_m, GeoTIFF, HTTPStore, Window, opene
     mask |= (data[0] == 0) & (data[1] == 0) & (data[2] == 0)
     if mask.all():
         return None
-    return data.astype("uint8"), mask, tuple(r.bounds), str(g.crs), float(reader.res[0])
+    # item.bbox is the quad's FULL lon/lat extent, collar included, which is what the
+    # mosaic rule scores against. `r.bounds` is only the window that was read.
+    return (
+        data.astype("uint8"), mask, tuple(r.bounds), str(g.crs), float(reader.res[0]),
+        tuple(item.bbox),
+    )
 
 
 async def naip_rgb(
@@ -451,6 +456,20 @@ async def naip_rgb(
     coarser than the destination and needs a fill pass; inverse-sampling cannot, because
     every destination cell is written exactly once. Nearest neighbour: NAIP is already
     being read at roughly one source pixel per texel, so interpolation would only blur.
+
+    WHERE QUADS OVERLAP, THE DEEPEST ONE WINS, and this is what removes the pale rectangles
+    that used to sit all over a mountain drape. NAIP quarter-quads are not edge-matched
+    tiles: each one carries a COLLAR of 400-500 m that its neighbour also covers, and a
+    campaign is flown over weeks, so the two copies of that ground are different days with
+    different sun, haze and snow. Filling first-quad-wins therefore painted every collar as
+    a rectangle of one flight day surrounded by another, ~400 m across and rectangular
+    because a collar is. It read as a rendering artifact and it was a mosaicking one.
+
+    So each texel takes the quad it is FURTHEST INSIDE, scored on normalised distance to
+    that quad's own edges. Seams land on the midlines between quad centres instead of on
+    the collar boundaries, which is the standard Voronoi-ish mosaic rule: still a seam
+    where two days meet, but a single line through it rather than a 400 m patch, and it
+    runs where the two images are each at their most reliable rather than at their edges.
 
     The 4326 -> UTM transform is done ONCE PER CRS, not once per quad. An AOI wide enough
     to want this notebook can span 40 quads, and re-projecting a 2048-square lattice 40
@@ -481,24 +500,36 @@ async def naip_rgb(
     if not tiles:
         return rgb, covered, info
 
+    # How far inside its own quad each texel sits, 0 at the quad edge and 0.5 dead centre,
+    # normalised so quads of different sizes compare. Every texel keeps the best score it
+    # has seen, so a later quad only overwrites where it has the better claim.
+    depth = np.full(lon.shape, -np.inf)
+
     by_crs = defaultdict(list)
     for t in tiles:
         by_crs[t[3]].append(t)
 
     for crs, group in by_crs.items():
         X, Y = Transformer.from_crs("EPSG:4326", crs, always_xy=True).transform(lon, lat)
-        for data, mask, bounds, _, _ in group:
+        for data, mask, bounds, _, _, qbbox in group:
             h, w = mask.shape
             left, bottom, right, top = bounds
             ci = np.floor((X - left) / ((right - left) / w)).astype("int64")
             ri = np.floor((top - Y) / ((top - bottom) / h)).astype("int64")
-            inside = (ci >= 0) & (ci < w) & (ri >= 0) & (ri < h) & ~covered
+            inside = (ci >= 0) & (ci < w) & (ri >= 0) & (ri < h)
             cic, ric = np.clip(ci, 0, w - 1), np.clip(ri, 0, h - 1)
-            good = inside & ~mask[ric, cic]
+
+            qw, qs, qe, qn = qbbox
+            d = np.minimum(
+                np.minimum(lon - qw, qe - lon) / max(qe - qw, 1e-12),
+                np.minimum(lat - qs, qn - lat) / max(qn - qs, 1e-12),
+            )
+            good = inside & ~mask[ric, cic] & (d > depth)
             if not good.any():
                 continue
             for band in range(3):
                 rgb[..., band][good] = data[band][ric, cic][good]
+            depth[good] = d[good]
             covered |= good
 
     info["covered"] = float(covered.mean())

@@ -233,6 +233,7 @@ def _():
         naip,
         np,
         pa,
+        palettable,
         pathlib,
         sqlite3,
         struct,
@@ -904,7 +905,7 @@ def _(bbox, drape, get_started, mo, naip, naip_season):
     mo.vstack(
         [n for n in (naip_season_note, naip_partial_note) if n is not None], gap=0.5
     )
-    return (MIN_COVER, naip_cover, naip_info, naip_quads)
+    return MIN_COVER, naip_cover, naip_info, naip_quads
 
 
 @app.cell
@@ -1592,7 +1593,16 @@ def _(
 
 
 @app.cell
-def _(brightness, drape, naip_drape, np, palette_rgb, texel_ok, tile_sample, tiles):
+def _(
+    brightness,
+    drape,
+    naip_drape,
+    np,
+    palette_rgb,
+    texel_ok,
+    tile_sample,
+    tiles,
+):
     # THE TEXTURES, one RGBA image per tile. The loop is the only structural change tiling
     # forces on this cell: the per-source logic below is what it always was, applied N^2
     # times to arrays that each cover 1/N^2 of the ground at N times the resolution.
@@ -1782,7 +1792,33 @@ def _(
             NavigationControl(visualize_pitch=True),
             ScaleControl(),
         ],
-        parameters={"depthTest": True, "blend": True},
+        # DEPTH, IN LUMA v9 NAMES, and getting this wrong is invisible rather than loud.
+        #
+        # `depthTest` is the WebGL-1 spelling. deck 9 hands a layer's `parameters` to
+        # luma's RENDER PIPELINE, whose depth keys are `depthCompare` and
+        # `depthWriteEnabled`, so `depthTest` is not rejected, it is simply not a key
+        # anything reads. The pipeline then falls back to its defaults, and those defaults
+        # are `depthCompare: "always"` (which luma maps to gl.disable(DEPTH_TEST)) and
+        # `depthWriteEnabled: false`. The result is a terrain drawn with NO DEPTH BUFFER:
+        # every triangle passes, nothing occludes anything, and the scene is resolved by
+        # submission order alone.
+        #
+        # A heightfield in painter's order is right about half the time and wrong the other
+        # half, which is why this reads as an artifact rather than as a broken render.
+        # Triangles go out in mesh index order, south row to north row, so with the camera
+        # looking NORTH the far ridges are drawn last and paint over the near ones. What
+        # bleeds through is distant, hazier, paler ground, in patches shaped like mesh
+        # quads, alternating between a quad's two triangles into a herringbone. Turn the
+        # camera to look south and the same bug silently draws the correct picture.
+        #
+        # `depthTest` is kept because deck also runs the dict through a legacy WebGL path
+        # that does understand it; the two below are the ones that actually take effect.
+        parameters={
+            "depthTest": True,
+            "depthCompare": "less-equal",
+            "depthWriteEnabled": True,
+            "blend": True,
+        },
     )
     scene
     return (surfaces,)
