@@ -150,6 +150,7 @@ def _():
     import marimo as mo
 
     import geoarrow.rust.core as grc
+    import traitlets
     from pyproj import Transformer
 
     from arro3.core import Table
@@ -211,6 +212,7 @@ def _():
         pathlib,
         time,
         timedelta,
+        traitlets,
         udf,
         urllib,
         xr,
@@ -254,8 +256,18 @@ def _(pathlib):
     import lonboard as _lb
 
     _bundle = pathlib.Path(_lb.__file__).parent / "static" / "index.js"
-    if "material:!1" in _bundle.read_text():
-        print("lonboard patched: SurfaceLayer is unlit, textures render as themselves")
+    _js = _bundle.read_text()
+    if "material:!1" in _js and 'this.model.get("ramp_lut")' in _js:
+        print(
+            "lonboard patched: SurfaceLayer is unlit, and takes index + shade + ramp_lut"
+        )
+    elif "material:!1" in _js:
+        print(
+            "!! LONBOARD IS HALF PATCHED: unlit, but prepareTexture still expects RGBA.\n"
+            "!! The data surfaces send 2 bytes per texel and will render as nothing.\n"
+            "!!   uv run python tools/patch_lonboard_surface.py\n"
+            "!! then restart the kernel AND hard-reload the browser tab."
+        )
     else:
         print(
             "!! LONBOARD IS NOT PATCHED. The mesh will come back covered in pale\n"
@@ -2003,22 +2015,35 @@ def _(cell_table, ndvi_range, np, view, z_max, z_min):
 
 
 @app.cell
-def _(PALETTES, apply_continuous_cmap, np, palette):
-    # THE RAMP, RESOLVED ONCE INTO 256 ROWS. Every colour this notebook paints is a lookup
-    # into this table. The saving on the kernel side is small and measured (see the texture
-    # cell); the point is that the ramp now EXISTS as 1 KB of palette separate from the
-    # per-texel index, which is the shape the browser needs if the index is ever to be what
-    # crosses the bridge instead of finished RGBA.
+def _(PALETTES, apply_continuous_cmap, np, palette, reverse_ramp):
+    # THE RAMP AS A 256 x 4 TABLE, AND THIS TABLE IS WHAT THE BROWSER GETS. About a
+    # kilobyte, synced as its own trait, expanded per texel by the patched `prepareTexture`
+    # against a one-byte index. That is the whole reason the ramp stopped being fused into
+    # the texture: a palette change now costs this kilobyte and no picture at all, where it
+    # used to cost every texel in the grid re-coloured on the kernel and ~92 MB across the
+    # widget bridge.
     #
-    # It is its own cell so that it depends on `palette` ALONE. Reverse is applied to the
-    # normalised value rather than to the table, which keeps this off the path of every
-    # control that is not the palette itself.
-    ramp_lut = np.asarray(
+    # ROW 0 IS RESERVED FOR "NO DATA" and is fully transparent, which is how a texel with no
+    # elevation, no NDVI or no coverage gets punched out now that there is no alpha channel
+    # in the payload to carry it. That leaves rows 1..255, so the ramp has 255 levels rather
+    # than 256, a distinction no display and no eye resolves.
+    #
+    # REVERSE LIVES HERE, in the table, rather than on the normalised value. Same picture
+    # either way, entirely different cost: flipping the table is 1 KB and flipping the value
+    # would rebuild and resend every texture in the scene.
+    _rows = np.asarray(
         apply_continuous_cmap(
-            np.linspace(0.0, 1.0, 256), PALETTES[palette.value], alpha=1.0
+            np.linspace(0.0, 1.0, 255), PALETTES[palette.value], alpha=1.0
         )
     )[:, :3].astype("uint8")
-    return (ramp_lut,)
+    if reverse_ramp.value:
+        _rows = _rows[::-1]
+
+    ramp_lut = np.zeros((256, 4), dtype="uint8")
+    ramp_lut[1:, :3] = _rows
+    ramp_lut[1:, 3] = 255
+    ramp_lut_bytes = ramp_lut.tobytes()
+    return (ramp_lut_bytes,)
 
 
 @app.cell
@@ -2030,8 +2055,6 @@ def _(
     photo,
     ramp_hi,
     ramp_lo,
-    ramp_lut,
-    reverse_ramp,
     shade,
     surface_ok,
     view,
@@ -2077,31 +2100,37 @@ def _(
                 0.0,
                 1.0,
             )
-            if reverse_ramp.value:
-                _norm = 1.0 - _norm
-            # A 256-ENTRY LUT AND ONE `take`. NOT for speed: measured against
-            # `apply_continuous_cmap` this is 1.1x, because that call was already 2.2 ms
-            # per tile and 0.2 s for the whole grid, i.e. never the thing that made a
-            # slider feel slow. It is here because it makes the ramp an explicit TABLE.
-            # The expensive half of a colour change is the ~92 MB of RGBA crossing the
-            # widget bridge, and the only fix for that is to send this table once and the
-            # index per texel, so having the table already separated is the first step.
-            # Output matches the colormap call to within 2 counts per channel, which is
-            # the 256-level quantisation and is invisible.
-            rgb = ramp_lut[np.round(_norm * 255.0).astype("uint8")].astype("float64")
-            # The hillshade is for the DATA surfaces only. A photograph brought its own sun.
-            rgb = rgb * shade[_k][..., None]
-            visible = _ok & _dok
+            # TWO BYTES PER TEXEL, NOT FOUR, and neither of them is a colour. Byte 0 is
+            # the palette index and byte 1 is the hillshade multiplier; the browser
+            # multiplies one by the other against `ramp_lut`. Index 0 means no data and
+            # comes back transparent, which is what carries the mask now that there is no
+            # alpha channel in the payload, so valid values live in 1..254 with a +1
+            # offset.
+            #
+            # The hillshade stays a per-texel FIELD because that is what it is: it varies
+            # with the terrain and cannot live in a 256-row table. It costs the second byte
+            # and it is still half of what RGBA cost.
+            _idx = np.where(_dok & _ok, 1 + np.round(_norm * 253.0).astype("uint8"), 0)
+            _tex = np.empty((*_ok.shape, 2), dtype="uint8")
+            _tex[..., 0] = _idx
+            _tex[..., 1] = np.clip(shade[_k] * 255.0, 0, 255).astype("uint8")
+            textures.append(_tex)
+            continue
 
         _tex = np.empty((*visible.shape, 4), dtype="uint8")
         _tex[..., :3] = np.clip(rgb, 0, 255).astype("uint8")
         _tex[..., 3] = np.where(visible, 255, 0)
         textures.append(_tex)
 
+    _opaque = [
+        (t[..., 3] > 0).mean() if t.shape[-1] == 4 else (t[..., 0] > 0).mean()
+        for t in textures
+    ]
     print(
         f"texture: {len(textures)} x {textures[0].shape[1]}x{textures[0].shape[0]} "
+        f"x {textures[0].shape[2]}B "
         f"({sum(t.nbytes for t in textures) / 1e6:.1f} MB) · "
-        f"{float(np.mean([(t[..., 3] > 0).mean() for t in textures])) * 100:.1f}% opaque"
+        f"{float(np.mean(_opaque)) * 100:.1f}% opaque"
     )
     return (textures,)
 
@@ -2226,6 +2255,7 @@ def _(
     SurfaceLayer,
     bbox,
     np,
+    traitlets,
 ):
     # The Map is built ONCE. This cell references no control, so marimo never re-runs it and
     # the view you flew to survives every adjustment. The update cell at the bottom puts the
@@ -2245,8 +2275,19 @@ def _(
     #
     # So the scene starts with ONE blank layer and the update cell grows the list to the tile
     # count and trims it back. Idle cost is one draw call of nothing.
+    # ONE NEW TRAIT, AND IT IS THE WHOLE INTERACTIVITY STORY. `ramp_lut` is a 256 x 4 uint8
+    # palette, about a kilobyte, synced to the browser beside the texture. The patched
+    # `prepareTexture` reads it off the model and expands an indexed payload through it, so
+    # changing the ramp costs that kilobyte and no texture transfer at all.
+    #
+    # Nothing on the JS side had to be taught about the trait: anything tagged `sync=True`
+    # reaches the model, and lonboard's base class already listens for `change` on the whole
+    # model, so setting it redraws.
+    class RampSurfaceLayer(SurfaceLayer):
+        ramp_lut = traitlets.Bytes(b"").tag(sync=True)
+
     def new_surface():
-        return SurfaceLayer(
+        return RampSurfaceLayer(
             positions=np.zeros((4, 3), dtype="float32"),
             triangles=np.array([[0, 1, 2], [1, 3, 2]], dtype="uint32"),
             tex_coords=np.zeros((4, 2), dtype="float32"),
@@ -2450,6 +2491,7 @@ def _(
 def _(
     fill_opacity,
     new_surface,
+    np,
     positions,
     scene,
     surfaces,
@@ -2471,6 +2513,17 @@ def _(
     while len(surfaces) < _need:
         surfaces.append(new_surface())
 
+    # THE INDEXED PAYLOAD GOES ROUND lonboard's TextureTrait rather than through it. That
+    # trait insists on 3 or 4 channels, but it passes a dict with exactly the keys
+    # {height, width, data} through untouched as already-validated layer state, which is
+    # precisely the shape the JS side reads. So a 2-channel array is handed over as that
+    # dict, and the 4-channel photograph still goes through the normal numpy path.
+    def _payload(t):
+        if t.shape[-1] == 4:
+            return t
+        _c = np.ascontiguousarray(t)
+        return {"height": _c.shape[0], "width": _c.shape[1], "data": memoryview(_c)}
+
     # BATCHED PER LAYER, because positions, tex_coords and triangles have to agree about
     # vertex indices. Moving Texels/quad changes all three, and if they reach the frontend
     # one at a time the widget briefly holds indices past the end of a buffer.
@@ -2480,7 +2533,7 @@ def _(
             _layer.positions = positions[_k]
             _layer.tex_coords = tex_coords
             _layer.triangles = triangles
-            _layer.texture = textures[_k]
+            _layer.texture = _payload(textures[_k])
             _layer.wireframe = wireframe.value
             _layer.opacity = fill_opacity.value
 
@@ -2490,6 +2543,18 @@ def _(
     # wrong. `surfaces` keeps them so a later, larger tile set can reuse the objects.
     if len(scene.layers) != _need:
         scene.layers = tuple(surfaces[:_need])
+    return
+
+
+@app.cell
+def _(positions, ramp_lut_bytes, surfaces):
+    # THE PALETTE IS PUSHED ON ITS OWN, IN ITS OWN CELL, and that separation IS the feature.
+    # This cell depends on the table and the layer list, never on `textures`, so changing
+    # Ramp or Reverse ramp re-runs exactly this loop: one kilobyte per layer, no texture
+    # rebuilt on the kernel and no picture crossing the bridge. Fold it back into the cell
+    # above and every palette change would resend every texel in the scene again.
+    for _layer in surfaces[: len(positions)]:
+        _layer.ramp_lut = ramp_lut_bytes
     return
 
 
