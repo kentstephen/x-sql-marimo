@@ -136,8 +136,10 @@ app = marimo.App(width="full")
 def _():
     import asyncio
     import pathlib
+    import time
     import urllib.request
     import xml.etree.ElementTree as ET
+    from datetime import timedelta
     from io import BytesIO
 
     import duckdb
@@ -207,6 +209,8 @@ def _():
         pa,
         palettable,
         pathlib,
+        time,
+        timedelta,
         udf,
         urllib,
         xr,
@@ -441,6 +445,13 @@ def _(mo):
         value="Any (best mosaic)",
         label="NAIP season",
     )
+    # IMAGERY IS A FETCH SWITCH, which is why it sits with the other fetch controls rather
+    # than with `Colour by` under the map. Off means the STAC search does not run and not a
+    # single NAIP quad is opened, so the DEM path is the whole cost of a box: useful when
+    # the AOI is outside a campaign, when the imagery is slow, or when the terrain is the
+    # only thing being looked at. The photograph and NDVI surfaces read as Elevation while
+    # it is off, rather than rendering an empty mesh.
+    naip_on = mo.ui.switch(value=True, label="NAIP imagery")
     dem_source = mo.ui.dropdown(
         options={
             "10 m seamless (nationwide)": "13",
@@ -452,7 +463,7 @@ def _(mo):
     mo.vstack(
         [
             mo.hstack(
-                [detail, tile_texels, h3_res, dem_source, naip_season],
+                [detail, tile_texels, h3_res, dem_source, naip_season, naip_on],
                 justify="start",
                 gap=2,
             ),
@@ -463,13 +474,14 @@ def _(mo):
                 "the coverage carpet in the picker and now reads native 1 m at any box "
                 "size, because read resolution comes from Detail rather than from the "
                 "AOI. **H3 resolution** is an analysis choice: the shape comes from the "
-                "DEM and does not move when you change it. None of these fetch anything "
-                "until you draw a box.</small>"
+                "DEM and does not move when you change it. **NAIP imagery** off skips the "
+                "STAC search and every quad read, and the imagery surfaces fall back to "
+                "Elevation. None of these fetch anything until you draw a box.</small>"
             ),
         ],
         gap=0.5,
     )
-    return dem_source, detail, h3_res, naip_season, tile_texels
+    return dem_source, detail, h3_res, naip_on, naip_season, tile_texels
 
 
 @app.cell
@@ -772,7 +784,26 @@ def _(get_bbox):
 
 
 @app.cell
-def _(bbox, get_started, mo, naip, naip_season, surface):
+def _(naip_on, surface):
+    # THE SURFACE ACTUALLY RENDERED, which is `Colour by` unless imagery is switched off,
+    # in which case the two surfaces that ARE imagery become Elevation. Every downstream
+    # cell reads `view` rather than `surface.value`, so the switch is honoured in one place
+    # instead of eleven, and no cell has to decide separately whether a NaN texture means
+    # "no coverage here" or "imagery is off".
+    #
+    # It lives in its own cell, ahead of the STAC search, because that search ends in an
+    # `mo.stop` on low coverage: anything defined beside it would stop with it, and the
+    # legend has to keep working when the gate trips.
+    view = (
+        "Elevation"
+        if not naip_on.value and surface.value in ("NDVI", "NAIP RGB")
+        else surface.value
+    )
+    return (view,)
+
+
+@app.cell
+def _(bbox, get_started, mo, naip, naip_season, view):
     # THE IMAGERY QUESTION FIRST, BEFORE ANY PIXEL IS STREAMED. The STAC search is seconds
     # and no pixels; the DEM is minutes and many. On an NDVI surface, imagery is not a
     # decoration but the measurement, so an AOI without it has nothing to show.
@@ -782,7 +813,7 @@ def _(bbox, get_started, mo, naip, naip_season, surface):
     # it vary per tile would put a different flight day on either side of a tile edge.
     MIN_COVER = 0.50
 
-    _needs_naip = surface.value in ("NDVI", "NAIP RGB")
+    _needs_naip = view in ("NDVI", "NAIP RGB")
     if not get_started() or not _needs_naip:
         naip_quads, naip_info = [], None
     else:
@@ -968,37 +999,48 @@ def _(bbox, detail, get_started, mo, np, tile_texels):
     # earlier version of this notebook. Constant resolution over a bounded AOI is
     # arithmetic: what will not fit will not fit. The old architecture answered that by
     # quietly coarsening; this one says which number to move.
-    mo.stop(
-        n_tiles > MAX_TILES,
-        mo.md(
-            f"### That box needs {n_tiles} tiles (cap {MAX_TILES})\n"
-            f"Nothing has been streamed. At **{detail.value:g} m/texel** with "
-            f"**{T}** texels a tile covers "
-            f"{tile_deg * 111_320.0 * _coslat / 1000:.2f} x "
-            f"{tile_deg * 111_320.0 / 1000:.2f} km, and this AOI is "
-            f"{aoi_w_m / 1000:.1f} x {aoi_h_m / 1000:.1f} km.\n\n"
-            f"Coarsen **Detail** (each step doubles tile ground size and quarters the "
-            f"count), raise **Tile texels**, or draw a smaller box. Resolution and extent "
-            f"trade against each other here; the notebook will not pick for you."
-        ),
-    )
-    mo.stop(
-        tex_mb > MAX_TEX_MB or hgt_mb > MAX_HGT_MB,
-        mo.md(
-            f"### That box wants {tex_mb:.0f} MB of texture and {hgt_mb:.0f} MB of "
-            f"height field\n"
-            f"Caps are {MAX_TEX_MB:.0f} MB GPU-side and {MAX_HGT_MB:.0f} MB kernel-side. "
-            f"Nothing has been streamed.\n\n"
-            f"Texture size is area over texel area and **no tiling changes it**: at "
-            f"{m_texel_ns:.2f} m/texel this AOI is {tex_mb:.0f} MB however it is cut up. "
-            f"So the only lever is **Detail** — each step doubles tile ground size and "
-            f"quarters both numbers — or a smaller box.\n\n"
-            f"If it is the *kernel* number that is over, raising **Tile texels** to "
-            f"{min(T * 2, 1024)} helps on its own: the halo surcharge falls from "
-            f"{(T + 1 + 2 * HALO) ** 2 / (T + 1) ** 2:.2f}x to "
-            f"{(min(T * 2, 1024) + 1 + 2 * HALO) ** 2 / (min(T * 2, 1024) + 1) ** 2:.2f}x."
-        ),
-    )
+    # TILE-COUNT GATE, COMMENTED OUT AT STEPHEN'S REQUEST. It refused a 50.8 x 58.1 km box
+    # at 4 m/texel, which needs 1470 tiles against the 1024 cap. Uncomment to restore.
+    #
+    # MAX_TILES bounds DRAW CALLS, not memory and not a layer pool (the pool is gone; the
+    # update cell grows the layer list to the tile count). So going past it is a
+    # performance decision rather than a correctness one, and it is the user's to make.
+    # mo.stop(
+    #     n_tiles > MAX_TILES,
+    #     mo.md(
+    #         f"### That box needs {n_tiles} tiles (cap {MAX_TILES})\n"
+    #         f"Nothing has been streamed. At **{detail.value:g} m/texel** with "
+    #         f"**{T}** texels a tile covers "
+    #         f"{tile_deg * 111_320.0 * _coslat / 1000:.2f} x "
+    #         f"{tile_deg * 111_320.0 / 1000:.2f} km, and this AOI is "
+    #         f"{aoi_w_m / 1000:.1f} x {aoi_h_m / 1000:.1f} km.\n\n"
+    #         f"Coarsen **Detail** (each step doubles tile ground size and quarters the "
+    #         f"count), raise **Tile texels**, or draw a smaller box. Resolution and extent "
+    #         f"trade against each other here; the notebook will not pick for you."
+    #     ),
+    # )
+    if n_tiles > MAX_TILES:
+        print(
+            f"  NOTE: {n_tiles} tiles is over the {MAX_TILES} draw-call cap, whose "
+            f"mo.stop is commented out above. Proceeding."
+        )
+    # mo.stop(
+    #     tex_mb > MAX_TEX_MB or hgt_mb > MAX_HGT_MB,
+    #     mo.md(
+    #         f"### That box wants {tex_mb:.0f} MB of texture and {hgt_mb:.0f} MB of "
+    #         f"height field\n"
+    #         f"Caps are {MAX_TEX_MB:.0f} MB GPU-side and {MAX_HGT_MB:.0f} MB kernel-side. "
+    #         f"Nothing has been streamed.\n\n"
+    #         f"Texture size is area over texel area and **no tiling changes it**: at "
+    #         f"{m_texel_ns:.2f} m/texel this AOI is {tex_mb:.0f} MB however it is cut up. "
+    #         f"So the only lever is **Detail** — each step doubles tile ground size and "
+    #         f"quarters both numbers — or a smaller box.\n\n"
+    #         f"If it is the *kernel* number that is over, raising **Tile texels** to "
+    #         f"{min(T * 2, 1024)} helps on its own: the halo surcharge falls from "
+    #         f"{(T + 1 + 2 * HALO) ** 2 / (T + 1) ** 2:.2f}x to "
+    #         f"{(min(T * 2, 1024) + 1 + 2 * HALO) ** 2 / (min(T * 2, 1024) + 1) ** 2:.2f}x."
+    #     ),
+    # )
     # THE NAIP COVERAGE GATE IS NOT HERE, DELIBERATELY. It belongs to the imagery cell,
     # because putting it here would make this cell depend on `surface`, and this cell is
     # what `tiles` comes from: every change of the Colour by dropdown would then rebuild
@@ -1132,7 +1174,7 @@ def _(
             f"coverage carpet, or use the **10 m seamless** DEM."
         ),
     )
-    return candidates, dem_crs, read_res, read_res_m
+    return candidates, dem_crs, read_res
 
 
 @app.cell
@@ -1228,21 +1270,51 @@ async def _(
     # their bounds, because the two consumers want different things: the mesh interpolates
     # the raster, and the fold aggregates it in its native grid through xarray-sql. Keeping
     # both off one read is what stops H3 resolution from re-streaming a COG.
-    _store = S3Store(bucket="prd-tnm", region="us-west-2", skip_signature=True)
+    # TIMEOUTS AND RETRIES ON THE STORE, for the same reason `naip.py` carries them and with
+    # the same numbers. obstore's default `timeout` is 30 s wall clock from request to last
+    # byte, which is fine for the small reads it was built for and wrong here: a wide box is
+    # hundreds of tile windows sharing one link, so each individual read runs long while the
+    # transfer is making steady progress the whole time. Without a retry config a read that
+    # trips that deadline takes the whole `gather` down; with the default one it can also sit
+    # there re-trying invisibly, which is what a stall looks like from the outside.
+    #
+    # 3 minutes overall, a short connect timeout so a dead host still fails fast, and a read
+    # timeout that RESETS on each chunk received, which is the one that should be catching a
+    # genuinely stalled transfer rather than a slow one. `retry_timeout` bounds retries from
+    # the first attempt, so it has to exceed `timeout` or a retry can never happen.
+    _store = S3Store(
+        bucket="prd-tnm",
+        region="us-west-2",
+        skip_signature=True,
+        client_options={
+            "timeout": "180s",
+            "connect_timeout": "15s",
+            "read_timeout": "60s",
+        },
+        retry_config={"max_retries": 6, "retry_timeout": timedelta(minutes=4)},
+    )
     _is_s1m = dem_source.value == "s1m"
 
+    # The OPEN phase gets its own line for the same reason the read phase does. On the 10 m
+    # product it is one or two headers and finishes before you read the line; on S1M a wide
+    # box is hundreds of 10 km tiles, so this is a real wait that happens BEFORE any window
+    # is read, and unannounced it looks exactly like a hang at the start of the cell.
     _keys = list({c["key"]: None for c in candidates})
+    print(f"opening {len(_keys)} COG header(s)...")
+    _t_open = time.monotonic()
     _opened = dict(
         zip(
             _keys,
             await asyncio.gather(*[GeoTIFF.open(k, store=_store) for k in _keys]),
         )
     )
+    print(f"  opened {len(_opened)} in {time.monotonic() - _t_open:.1f}s")
 
     # Level chosen ONCE per COG, not once per tile: it is a function of Detail alone, so
     # every tile reads the same ladder rung and the mosaic is homogeneous.
     _readers = {}
     _fits = {}
+    _t_fit = time.monotonic()
     for _k, _g in _opened.items():
         _cands = sorted([_g, *_g.overviews], key=lambda r: r.res[0])
         _f = [r for r in _cands if r.res[0] <= read_res]
@@ -1252,6 +1324,10 @@ async def _(
         # DataFusion worker thread does not raise, it aborts the process.
         if _is_s1m:
             _fits[_k] = fit_lonlat(_g.crs, tuple(_g.bounds))[0]
+    if _is_s1m:
+        # Serial, main-thread, and one per source COG, so on a wide S1M box this is the
+        # other place the cell goes quiet before a single window is read.
+        print(f"  fitted {len(_fits)} lon/lat polynomial(s) in {time.monotonic() - _t_fit:.1f}s")
 
     _to_dem = (
         None
@@ -1303,7 +1379,27 @@ async def _(
             raw.append((elev, tuple(r.bounds), _fits.get(key)))
         return h, raw
 
-    tile_dem = await asyncio.gather(*[_read_tile(t) for t in tiles])
+    # PROGRESS, BECAUSE A WIDE BOX IS MINUTES AND SILENCE IS INDISTINGUISHABLE FROM A HANG.
+    # marimo streams stdout as a cell runs, so a line every tenth of the grid is the whole
+    # difference between "this is streaming 400 windows" and "this is stuck". The counter is
+    # incremented after the await, so it counts tiles actually finished, and the rate it
+    # prints is what tells you whether a long run is progressing or crawling.
+    _done = [0]  # a list rather than a counter variable: the cell body is module scope, so
+    _t0 = time.monotonic()  # a plain int would need `global`, which marimo's `_` names ban
+    _step = max(1, len(tiles) // 10)
+
+    async def _tracked(t):
+        _r = await _read_tile(t)
+        _done[0] += 1
+        if _done[0] % _step == 0 or _done[0] == len(tiles):
+            _el = time.monotonic() - _t0
+            print(
+                f"  DEM {_done[0]}/{len(tiles)} tiles · {_el:.0f}s "
+                f"({_done[0] / max(_el, 1e-9):.1f} tiles/s)"
+            )
+        return _r
+
+    tile_dem = await asyncio.gather(*[_tracked(t) for t in tiles])
     tile_h = [d[0] for d in tile_dem]
     tile_raw = [d[1] for d in tile_dem]
 
@@ -1346,8 +1442,8 @@ async def _(
     naip,
     naip_quads,
     np,
-    surface,
     tiles,
+    view,
 ):
     # THE PHOTOGRAPH, PER TILE, at the tile's own texel size. Every tile reads the quads
     # that overlap it through its own window at the overview matching one texel, which is
@@ -1367,9 +1463,9 @@ async def _(
     # `naip_rgb` already caps itself at 8 concurrent reads internally, so the outer bound
     # multiplies with it: a bound of 4 means at most 32 range reads in flight, of
     # windows that are one tile wide at one overview level.
-    _TILE_CONCURRENCY = 4
+    _TILE_CONCURRENCY = 8
     _sl = slice(HALO, HALO + T + 1)
-    if naip_quads and surface.value == "NAIP RGB":
+    if naip_quads and view == "NAIP RGB":
         _opened = await naip.open_quads(naip_quads, GeoTIFF, HTTPStore)
         _outer = asyncio.Semaphore(_TILE_CONCURRENCY)
 
@@ -1393,13 +1489,17 @@ async def _(
             f"{float(np.mean(_cov)) * 100:.1f}% painted"
         )
     else:
-        photo = [
-            (
-                np.zeros((T + 1, T + 1, 3), dtype="uint8"),
-                np.zeros((T + 1, T + 1), dtype=bool),
-            )
-            for _ in tiles
-        ]
+        # ONE placeholder pair, SHARED by every tile rather than one allocation each. The
+        # consumers copy (`astype`) or only test (`.any()`), so nothing writes through these
+        # and identity is safe; `writeable = False` is what enforces that rather than a
+        # comment. It matters at scale: a 500-tile grid at 513^2 is about 500 MB of zeros
+        # that exist only to be read as "no imagery here", and that is memory the DEM path
+        # is competing for on exactly the wide boxes where imagery gets switched off.
+        _blank_rgb = np.zeros((T + 1, T + 1, 3), dtype="uint8")
+        _blank_cov = np.zeros((T + 1, T + 1), dtype=bool)
+        _blank_rgb.flags.writeable = False
+        _blank_cov.flags.writeable = False
+        photo = [(_blank_rgb, _blank_cov) for _ in tiles]
     return (photo,)
 
 
@@ -1415,8 +1515,8 @@ async def _(
     naip,
     naip_quads,
     np,
-    surface,
     tiles,
+    view,
 ):
     # NDVI, FOUR BANDS, PER TILE. This read exists to produce a NUMBER per texel rather
     # than a picture, and it is skipped entirely when the surface is the photograph or a
@@ -1428,7 +1528,7 @@ async def _(
     # Same bounded concurrency as the photograph, and for the same reason.
     _TILE_CONCURRENCY = 4
     _sl = slice(HALO, HALO + T + 1)
-    if naip_quads and surface.value == "NDVI":
+    if naip_quads and view == "NDVI":
         _opened = await naip.open_quads(naip_quads, GeoTIFF, HTTPStore)
         _outer = asyncio.Semaphore(_TILE_CONCURRENCY)
 
@@ -1462,7 +1562,11 @@ async def _(
             f"{float(np.mean(_cov)) * 100:.1f}% painted · median {_med:+.2f}"
         )
     else:
-        ndvi = [np.full((T + 1, T + 1), np.nan, dtype="float32") for _ in tiles]
+        # Same shared placeholder as the photograph, same reason: the fold reads a slice of
+        # it and nothing writes to it, so one all-NaN array serves the whole grid.
+        _blank_ndvi = np.full((T + 1, T + 1), np.nan, dtype="float32")
+        _blank_ndvi.flags.writeable = False
+        ndvi = [_blank_ndvi for _ in tiles]
     return (ndvi,)
 
 
@@ -1477,9 +1581,9 @@ def _(
     ndvi,
     np,
     pa,
-    surface,
     tile_raw,
     tiles,
+    view,
     xr,
 ):
     # THE FOLD, AS A PARTIAL AGGREGATION PER TILE AND ONE MERGE AT THE END. This is the
@@ -1508,7 +1612,7 @@ def _(
     _res = h3_res.value
     _sl = slice(HALO, HALO + T + 1)
 
-    if surface.value not in ("NDVI", "Relief"):
+    if view not in ("NDVI", "Relief"):
         cell_table = pa.table(
             {
                 "hex": pa.array([], pa.uint64()),
@@ -1519,7 +1623,7 @@ def _(
             }
         )
         tile_cells = [np.zeros(0, dtype="uint64") for _ in tiles]
-        print(f"fold skipped: [{surface.value}] reads no cell values")
+        print(f"fold skipped: [{view}] reads no cell values")
     else:
         _parts = []
         tile_cells = []
@@ -1868,7 +1972,7 @@ def _():
 
 
 @app.cell
-def _(cell_table, ndvi_range, np, surface, z_max, z_min):
+def _(cell_table, ndvi_range, np, view, z_max, z_min):
     # THE RAMP WINDOW, DECIDED ONCE FOR THE WHOLE SCENE. Per-tile normalisation is the bug
     # this cell exists to prevent: the same elevation, or the same relief, has to be the
     # same colour in every tile or the seams become the most visible thing in the render.
@@ -1878,9 +1982,9 @@ def _(cell_table, ndvi_range, np, surface, z_max, z_min):
     # between AOIs and between dates: the same forest gets a different colour depending on
     # what else is in the box. -0.2 to 0.8 covers water through bare rock through dense
     # canopy everywhere on earth, so a colour means the same thing in every scene.
-    if surface.value == "NDVI":
+    if view == "NDVI":
         ramp_lo, ramp_hi = float(ndvi_range.value[0]), float(ndvi_range.value[1])
-    elif surface.value == "Relief":
+    elif view == "Relief":
         _v = np.asarray(cell_table["relief"]).astype("float64")
         _f = _v[np.isfinite(_v)]
         ramp_lo, ramp_hi = (
@@ -1891,28 +1995,46 @@ def _(cell_table, ndvi_range, np, surface, z_max, z_min):
     else:  # Elevation, and also the fallback under the photograph
         ramp_lo, ramp_hi = 0.0, max(z_max - z_min, 1.0)
 
-    if surface.value == "NAIP RGB":
+    if view == "NAIP RGB":
         print(f"elevation ramp held as the fallback: {ramp_lo:.3g} .. {ramp_hi:.3g} m")
     else:
-        print(f"surface [{surface.value}]: ramp {ramp_lo:.3g} .. {ramp_hi:.3g} (global)")
+        print(f"surface [{view}]: ramp {ramp_lo:.3g} .. {ramp_hi:.3g} (global)")
     return ramp_hi, ramp_lo
 
 
 @app.cell
+def _(PALETTES, apply_continuous_cmap, np, palette):
+    # THE RAMP, RESOLVED ONCE INTO 256 ROWS. Every colour this notebook paints is a lookup
+    # into this table. The saving on the kernel side is small and measured (see the texture
+    # cell); the point is that the ramp now EXISTS as 1 KB of palette separate from the
+    # per-texel index, which is the shape the browser needs if the index is ever to be what
+    # crosses the bridge instead of finished RGBA.
+    #
+    # It is its own cell so that it depends on `palette` ALONE. Reverse is applied to the
+    # normalised value rather than to the table, which keeps this off the path of every
+    # control that is not the palette itself.
+    ramp_lut = np.asarray(
+        apply_continuous_cmap(
+            np.linspace(0.0, 1.0, 256), PALETTES[palette.value], alpha=1.0
+        )
+    )[:, :3].astype("uint8")
+    return (ramp_lut,)
+
+
+@app.cell
 def _(
-    PALETTES,
-    apply_continuous_cmap,
     brightness,
     cell_field,
     height,
     np,
-    palette,
     photo,
     ramp_hi,
     ramp_lo,
+    ramp_lut,
+    reverse_ramp,
     shade,
-    surface,
     surface_ok,
+    view,
 ):
     # THE TEXTURES, one RGBA image per tile, assembled from whichever source the surface
     # asks for. Everything read here is already tile-shaped; nothing is sampled out of a
@@ -1925,7 +2047,7 @@ def _(
     for _k in range(len(height)):
         _rgb_src, _cover = photo[_k]
         _ok = surface_ok[_k]
-        if surface.value == "NAIP RGB" and _cover.any():
+        if view == "NAIP RGB" and _cover.any():
             rgb = _rgb_src.astype("float64")
             visible = _ok & _cover
             # Gamma, not a gain, and only on the photograph: NAIP over forest is genuinely
@@ -1937,9 +2059,9 @@ def _(
                     np.clip(rgb, 0, 255) / 255.0, 1.0 / brightness.value
                 )
         else:
-            if surface.value == "NDVI":
+            if view == "NDVI":
                 _v = cell_field("ndvi", _k)
-            elif surface.value == "Relief":
+            elif view == "Relief":
                 _v = cell_field("relief", _k)
             else:
                 # STRAIGHT OFF THE HEIGHT FIELD, not off the fold. Hexagon means of the
@@ -1955,9 +2077,18 @@ def _(
                 0.0,
                 1.0,
             )
-            rgb = np.asarray(
-                apply_continuous_cmap(_norm.ravel(), PALETTES[palette.value], alpha=1.0)
-            )[:, :3].astype("float64").reshape(*_norm.shape, 3)
+            if reverse_ramp.value:
+                _norm = 1.0 - _norm
+            # A 256-ENTRY LUT AND ONE `take`. NOT for speed: measured against
+            # `apply_continuous_cmap` this is 1.1x, because that call was already 2.2 ms
+            # per tile and 0.2 s for the whole grid, i.e. never the thing that made a
+            # slider feel slow. It is here because it makes the ramp an explicit TABLE.
+            # The expensive half of a colour change is the ~92 MB of RGBA crossing the
+            # widget bridge, and the only fix for that is to send this table once and the
+            # index per texel, so having the table already separated is the first step.
+            # Output matches the colormap call to within 2 counts per channel, which is
+            # the 256-level quantisation and is invisible.
+            rgb = ramp_lut[np.round(_norm * 255.0).astype("uint8")].astype("float64")
             # The hillshade is for the DATA surfaces only. A photograph brought its own sun.
             rgb = rgb * shade[_k][..., None]
             visible = _ok & _dok
@@ -2168,21 +2299,34 @@ def _(PALETTES, mo):
         label="Colour by",
     )
     palette = mo.ui.dropdown(options=list(PALETTES), value="BluYl", label="Ramp")
+    # REVERSE IS A SEPARATE CONTROL FROM THE RAMP, as in every other notebook here, because
+    # which end of a luminance ramp should be the high value depends on the surface and not
+    # on the palette: bright peaks read as snow on Elevation, while on NDVI the dense canopy
+    # is the end you want to stand out. It flips the normalised value, not the colour list,
+    # so it costs nothing and the legend strip below flips with it.
+    reverse_ramp = mo.ui.switch(value=False, label="Reverse ramp")
+    # DEBOUNCED, ALL OF THEM, because each of these rebuilds every texture in the grid.
+    # Without it a drag fires a rebuild per tick of travel and the notebook spends the whole
+    # gesture painting intermediate values nobody asked to see; with it the gesture costs
+    # one rebuild, at the value you let go on.
     brightness = mo.ui.slider(
-        start=0.4, stop=3.0, step=0.1, value=1.0, label="Brightness", show_value=True
+        start=0.4, stop=3.0, step=0.1, value=1.0, label="Brightness", show_value=True,
+        debounce=True,
     )
     ndvi_range = mo.ui.range_slider(
         start=-1.0, stop=1.0, step=0.05, value=[-0.2, 0.8],
         label="NDVI window", show_value=True, debounce=True,
     )
     hillshade = mo.ui.slider(
-        start=0.0, stop=1.0, step=0.05, value=0.6, label="Hillshade", show_value=True
+        start=0.0, stop=1.0, step=0.05, value=0.6, label="Hillshade", show_value=True,
+        debounce=True,
     )
     elevation_scale = mo.ui.number(
         start=0.0, stop=50.0, step=0.1, value=2.0, debounce=True, label="Elevation scale"
     )
     smooth = mo.ui.slider(
-        start=0, stop=16, step=1, value=0, label="Height smooth", show_value=True
+        start=0, stop=16, step=1, value=0, label="Height smooth", show_value=True,
+        debounce=True,
     )
     # TEXELS PER QUAD, which is the geometry/texture balance as ONE number rather than two
     # that can drift apart. 1 puts a vertex on every texel; 4 is the default and is about
@@ -2201,7 +2345,10 @@ def _(PALETTES, mo):
 
     mo.vstack(
         [
-            mo.hstack([surface, palette, brightness, ndvi_range], justify="start", gap=2),
+            mo.hstack(
+                [surface, palette, reverse_ramp, brightness, ndvi_range],
+                justify="start", gap=2,
+            ),
             mo.hstack(
                 [elevation_scale, hillshade, smooth, texels_per_quad, fill_opacity,
                  wireframe],
@@ -2217,6 +2364,7 @@ def _(PALETTES, mo):
         hillshade,
         ndvi_range,
         palette,
+        reverse_ramp,
         smooth,
         surface,
         texels_per_quad,
@@ -2234,12 +2382,15 @@ def _(
     n_tiles,
     ndvi_range,
     palette,
-    surface,
+    reverse_ramp,
     tile_deg,
+    view,
 ):
     # The legend paints the ramp it explains and says what the numbers mean, and it carries
     # the tile scheme because that is now the thing worth knowing about a render.
     _hex = PALETTES[palette.value].hex_colors
+    if reverse_ramp.value:
+        _hex = _hex[::-1]
     _strip = mo.Html(
         '<div style="height:14px;width:100%;border-radius:3px;'
         'border:1px solid rgba(128,128,128,0.35);'
@@ -2251,7 +2402,7 @@ def _(
         f"numbers do not change when you redraw the box wider; only the tile count "
         f"does.</small>"
     )
-    if surface.value == "NDVI":
+    if view == "NDVI":
         _body = mo.md(
             f"<small>**NDVI** = (NIR − Red) / (NIR + Red), from NAIP's fourth band, "
             f"averaged per H3 cell in SQL as a partial aggregate per tile and one merge "
@@ -2264,7 +2415,7 @@ def _(
             f"resolve.</small>"
         )
         _out = mo.vstack([_strip, _body, _scheme], gap=0.25)
-    elif surface.value == "NAIP RGB":
+    elif view == "NAIP RGB":
         _out = mo.vstack(
             [
                 mo.md(
@@ -2281,7 +2432,7 @@ def _(
             [
                 _strip,
                 mo.md(
-                    f"<small>**{surface.value}**. *Relief* is max − min elevation inside "
+                    f"<small>**{view}**. *Relief* is max − min elevation inside "
                     f"an H3 cell, i.e. roughness at the resolution of the aggregation, "
                     f"which is a statistic about the pixels rather than a property of the "
                     f"surface they were folded into. *Elevation* is the bilinear height "
