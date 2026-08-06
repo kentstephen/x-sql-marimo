@@ -2304,7 +2304,10 @@ def _(PALETTES, mo):
     # on the palette: bright peaks read as snow on Elevation, while on NDVI the dense canopy
     # is the end you want to stand out. It flips the normalised value, not the colour list,
     # so it costs nothing and the legend strip below flips with it.
-    reverse_ramp = mo.ui.switch(value=False, label="Reverse ramp")
+    #
+    # ON BY DEFAULT, which matches every other notebook in this repo, and on BluYl over
+    # elevation it is the right way round: the bright end lands on the peaks.
+    reverse_ramp = mo.ui.switch(value=True, label="Reverse ramp")
     # DEBOUNCED, ALL OF THEM, because each of these rebuilds every texture in the grid.
     # Without it a drag fires a rebuild per tick of travel and the notebook spends the whole
     # gesture painting intermediate values nobody asked to see; with it the gesture costs
