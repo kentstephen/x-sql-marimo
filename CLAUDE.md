@@ -106,15 +106,6 @@ so `uv sync`, a lonboard upgrade and `--sandbox` all revert it. Hard-reload the 
 after running it; the widget JS is cached client side and a kernel restart is not enough.
 Full account in `docs/xsql-naip-drape-notes.md`.
 
-The same script also rewrites `prepareTexture` so a texture payload of `width * height * 2`
-is read as **index + shade** and expanded in the browser against a `ramp_lut` trait (256 x 4
-uint8, index 0 = transparent). `xsql-naip-tiles.py` sends that for its data surfaces: two
-bytes per texel instead of four, and a palette or reverse change costs 1 KB with no texture
-crossing the widget bridge. Anything else sized `width * height * 4` still takes the
-original RGBA path, which is what the NAIP photograph uses. A notebook that sends the
-indexed payload to an unpatched bundle renders **nothing** rather than noise, and its
-lonboard check cell says which half is missing.
-
 Layer `parameters` must use luma v9 names: `depthCompare` and `depthWriteEnabled`, not the
 WebGL-1 `depthTest`, which deck reads as nothing and silently leaves depth disabled.
 
