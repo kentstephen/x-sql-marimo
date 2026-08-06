@@ -1972,7 +1972,44 @@ def _():
 
 
 @app.cell
-def _(cell_table, ndvi_range, np, view, z_max, z_min):
+def _(cell_table, mo, np, view, z_max, z_min):
+    # THE CONTRAST WINDOW, i.e. which slice of the data the ramp spends itself on. Two
+    # handles in the data's own units, sitting under the legend strip it stretches, the same
+    # control `xsql-naip-drape.py` carries. The default is the full range, so it changes
+    # nothing until you drag it, and dragging it is how a scene whose relief is all in the
+    # bottom fifth of its span gets a ramp that can show it.
+    #
+    # ITS BOUNDS ARE THE SCENE'S, so it resets when the AOI or the surface does, and it
+    # depends on the DATA ALONE. Palette and reverse must never reach this cell: picking a
+    # palette would rebuild the slider and throw away the window you dragged. Reverse flips
+    # which END of the ramp lands on the high value and leaves the window itself alone,
+    # which is why the strip above it flips and the numbers below it do not.
+    if view == "Relief":
+        _v = np.asarray(cell_table["relief"]).astype("float64")
+        _f = _v[np.isfinite(_v)]
+        _lo, _hi = (
+            (float(np.percentile(_f, 2)), float(np.percentile(_f, 98)))
+            if _f.size
+            else (0.0, 1.0)
+        )
+        _label = "Relief window (m)"
+    else:
+        # Elevation, and also the window the photograph falls back to.
+        _lo, _hi = 0.0, max(z_max - z_min, 1.0)
+        _label = "Elevation window (m)"
+    if _hi <= _lo:
+        _hi = _lo + 1.0
+
+    contrast = mo.ui.range_slider(
+        start=_lo, stop=_hi, value=[_lo, _hi],
+        step=max((_hi - _lo) / 200.0, 0.01),
+        label=_label, show_value=True, full_width=True, debounce=True,
+    )
+    return (contrast,)
+
+
+@app.cell
+def _(contrast, ndvi_range, view):
     # THE RAMP WINDOW, DECIDED ONCE FOR THE WHOLE SCENE. Per-tile normalisation is the bug
     # this cell exists to prevent: the same elevation, or the same relief, has to be the
     # same colour in every tile or the seams become the most visible thing in the render.
@@ -1983,17 +2020,12 @@ def _(cell_table, ndvi_range, np, view, z_max, z_min):
     # what else is in the box. -0.2 to 0.8 covers water through bare rock through dense
     # canopy everywhere on earth, so a colour means the same thing in every scene.
     if view == "NDVI":
+        # NDVI keeps its OWN window, fixed in NDVI units and not stretched to the scene, so
+        # a colour means the same thing in every AOI. `contrast` is in metres and would
+        # break exactly that.
         ramp_lo, ramp_hi = float(ndvi_range.value[0]), float(ndvi_range.value[1])
-    elif view == "Relief":
-        _v = np.asarray(cell_table["relief"]).astype("float64")
-        _f = _v[np.isfinite(_v)]
-        ramp_lo, ramp_hi = (
-            (float(np.percentile(_f, 2)), float(np.percentile(_f, 98)))
-            if _f.size
-            else (0.0, 1.0)
-        )
-    else:  # Elevation, and also the fallback under the photograph
-        ramp_lo, ramp_hi = 0.0, max(z_max - z_min, 1.0)
+    else:  # Elevation, Relief, and the fallback under the photograph
+        ramp_lo, ramp_hi = float(contrast.value[0]), float(contrast.value[1])
 
     if view == "NAIP RGB":
         print(f"elevation ramp held as the fallback: {ramp_lo:.3g} .. {ramp_hi:.3g} m")
@@ -2378,6 +2410,7 @@ def _(PALETTES, mo):
 @app.cell
 def _(
     PALETTES,
+    contrast,
     level,
     m_texel_ew,
     m_texel_ns,
@@ -2431,15 +2464,22 @@ def _(
             gap=0.25,
         )
     else:
+        # The window sits DIRECTLY UNDER the strip it stretches, which is the whole reason
+        # it is here rather than up in the control row: the two handles and the gradient are
+        # one control, and the strip flips with Reverse ramp while the handles stay in
+        # metres.
         _out = mo.vstack(
             [
                 _strip,
+                contrast,
                 mo.md(
                     f"<small>**{view}**. *Relief* is max − min elevation inside "
                     f"an H3 cell, i.e. roughness at the resolution of the aggregation, "
                     f"which is a statistic about the pixels rather than a property of the "
                     f"surface they were folded into. *Elevation* is the bilinear height "
-                    f"field itself, not a fold of it.</small>"
+                    f"field itself, not a fold of it. The window above narrows the ramp "
+                    f"onto a slice of the range; it starts at the full range and resets "
+                    f"when the scene does.</small>"
                 ),
                 _scheme,
             ],
