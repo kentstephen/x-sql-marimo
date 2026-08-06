@@ -239,3 +239,108 @@ The blocker is known and is not technical mystery: lonboard's `onViewStateChange
 what has burned this project before. The pattern that works is an observer writing to a
 plain dict and a debounce timer promoting it to `mo.state` once the camera has been still
 for ~400 ms and has actually moved, with nothing heavy depending on the raw trait.
+
+## Imagery is a fetch switch, not a colour one
+
+`NAIP imagery` sits in the top row with `Detail`, `Tile texels`, `H3 resolution` and
+`DEM source`, because turning it off is a decision about what gets STREAMED. Off means the
+STAC search never runs, no quad is opened, and the fold is skipped.
+
+One derived `view` carries it: `Colour by` unless imagery is off, in which case the two
+imagery surfaces read as `Elevation`. Every consumer reads `view` rather than
+`surface.value`, so the switch is honoured in one place instead of eleven, and no cell has
+to decide separately whether a NaN texture means "no coverage here" or "imagery is off".
+
+It lives in its own cell AHEAD of the coverage gate, because that gate ends in `mo.stop`
+and anything defined beside it stops with it. The legend has to keep working when the gate
+trips.
+
+**The placeholder arrays were not free.** The no-imagery branches allocated one zero RGB
+array, one coverage mask and one all-NaN NDVI grid PER TILE. At 88 tiles and 513² that is
+about 180 MB whose only content is "no imagery here"; at 500 tiles it is a gigabyte,
+competing with the DEM on exactly the wide boxes where imagery gets switched off. Now one
+shared read-only array each, with `writeable = False` enforcing that nothing writes through
+it.
+
+## The DEM stream had no timeouts and no voice
+
+Two separate bugs with the same symptom, both only visible on a wide box.
+
+`S3Store` was constructed with no `client_options` and no `retry_config`, unlike the NAIP
+path in `naip.py`, which carries both and documents why. obstore's default `timeout` is 30 s
+wall clock from request to last byte. That is right for the small reads it was built for and
+wrong here: hundreds of tile windows share one link, so each read runs long while the
+transfer is making steady progress the whole time. Now 180s/15s/60s with 6 retries, the same
+numbers and the same reasoning as the imagery path.
+
+The cell's only `print` came AFTER `asyncio.gather`, so a stall anywhere produced total
+silence, which is indistinguishable from a hang. It now prints the open phase, the S1M
+lon/lat fits (serial, main thread, one per COG, the other place a wide box goes quiet) and
+tiles/s as it goes. Measured 19 to 24 tiles/s against `prd-tnm` for the 88-tile Wasatch box.
+
+## The interactivity ceiling is the widget bridge, and one attempt at it failed
+
+Measured, so that nobody re-derives it:
+
+| | cost |
+|---|---|
+| `apply_continuous_cmap` over the whole 88-tile grid | 0.20 s |
+| the same via a 256-entry LUT and one `take` | 0.19 s, i.e. 1.1x |
+| RGBA for that grid across the widget bridge | ~92 MB |
+
+**The kernel was never the problem.** Every colour control was resending the picture. That
+is what makes the notebook stop feeling interactive on a wide box.
+
+### What worked
+
+`Reverse ramp` is back next to `Ramp`. Brightness, Hillshade and Height smooth are
+debounced, since each rebuilds every texture in the grid and a drag was costing one rebuild
+per tick of travel.
+
+### What failed, and the number that kills it
+
+Attempted and reverted (`2d62772`, reverted in `31a3eda`): send two bytes per texel, index
+plus hillshade, with the ramp as a separate 256 x 4 `ramp_lut` trait, and expand to RGBA in
+the browser via a patched `prepareTexture`.
+
+Everything about it worked except the thing that mattered:
+
+* Payload 46.3 MB where it was 92.6 MB.
+* The patched JS verified under node against the exact string the patch script writes: index
+  0 transparent, shade multiply correct, RGBA passthrough intact, missing table renders
+  transparent rather than noise. Expansion matched the old kernel-side colouring to 3 counts
+  per channel, which is the 255-level quantisation.
+* Python side verified: `ramp_lut` is a synced key serialising as a 1024-byte buffer, and
+  the `{height, width, data}` dict goes round `TextureTrait`'s 3-or-4-channel check because
+  that trait passes such a dict through as already-validated state.
+
+**And it ran the tab out of memory on an AOI that had always fit.**
+
+    RangeError: Array buffer allocation failed
+      at new Uint8ClampedArray
+      at QS.prepareTexture
+
+| | browser RAM |
+|---|---|
+| RGBA payload | 92 MB, and `prepareTexture` made a VIEW over it, allocating nothing |
+| indexed payload | 46 MB, PLUS 92 MB of expansion, all 88 tiles alive in one render pass |
+
+The bridge was halved and browser memory went up 1.5x. `new Uint8ClampedArray(buffer,
+offset, length)` is a view; `new Uint8ClampedArray(n * 4)` is an allocation, and there is one
+per tile per render. marimo's own renderer was failing `fromBase64` alongside deck, which
+says the whole tab was out of headroom rather than deck specifically.
+
+**Price browser memory, not just wire bytes.** CPU-side expansion in the browser always
+holds both representations, so it cannot win this trade at any tile count.
+
+### The version that is actually better on every axis
+
+Upload the index as an `r8unorm` texture and do the palette lookup in the fragment shader.
+Nothing is expanded on the CPU, so there is no second copy and no per-render allocation:
+browser RAM 92 -> 46 MB, GPU 92 -> 46 MB, wire halved, palette change still 1 KB.
+
+The cost is a real shader hook. `SurfaceLayer` renders through `SimpleMeshLayer`, which
+takes no modules, so this means subclassing inside the minified bundle rather than splicing
+a string like the two existing patches. The bundle does ship deck.gl-raster with a
+`renderPipeline` of shader modules, which is the mechanism worth copying. Prove the memory
+claim on a small grid before pointing it at 88 tiles.
