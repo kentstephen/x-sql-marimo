@@ -109,6 +109,25 @@ Full account in `docs/xsql-naip-drape-notes.md`.
 Layer `parameters` must use luma v9 names: `depthCompare` and `depthWriteEnabled`, not the
 WebGL-1 `depthTest`, which deck reads as nothing and silently leaves depth disabled.
 
+## Overture Maps (`overture_core.py`)
+
+Shared helpers for streaming Overture GeoParquet out of `overturemaps-us-west-2` with
+obstore. `THEMES` names every theme/type pair, so asking for several at once is a list.
+
+Two things that are not obvious and cost a session each:
+
+- **`GeoParquetDataset.open` refuses the buildings theme.** The geometry column is Polygon
+  in some parts and MultiPolygon in others, and a dataset wants one type. Read per file
+  (`load_parts`), or take WKB and concatenate (`load_wkb`).
+- **The file index is the whole performance story.** A theme is ~512 files of ~500 MB with
+  no catalog; `file_index()` reads their GeoParquet footers once (~100 s) and caches the
+  bboxes in `.cache/`, after which an AOI reads only the overlapping file (~1.4 s). The
+  alternative, a DuckDB `read_parquet` with a bbox predicate, is ~35 s on every query.
+
+`OVERTURE_RELEASE` is pinned and Overture deletes old releases (`2026-01-21.0` is already
+gone). `releases()` lists what is live. Building `height` is present on roughly 55-75% of
+footprints depending on the city; `num_floors * 3 m` is the only other source.
+
 ## Reference repos (reuse, do not rebuild)
 
 - `deck-terrain-naip-marimo/naip_terrain_viewer.py` — VRT-as-catalog parse, draw-box

@@ -10,6 +10,7 @@ dependencies = [
     "datafusion>=54.0.0",
     "duckdb>=1.5.5",
     "geoarrow-rust-core>=0.6",
+    "geoarrow-rust-io>=0.4",
     "geopy>=2.5.0",
     "h3ronpy>=0.22.0",
     "lonboard>=0.16.0",
