@@ -1413,7 +1413,7 @@ def _(cell_table, np, tex_cells, tex_lon):
 
     if tex_cells.size:
         print(f"texel index: {texel_ok.shape[0]}^2 · {texel_ok.mean() * 100:.1f}% on a cell")
-    return cell_field
+    return (cell_field,)
 
 
 @app.cell
@@ -1836,7 +1836,7 @@ def _(
             "pitch": 60,
             "bearing": -25,
         },
-        basemap=MaplibreBasemap(style=CartoBasemap.DarkMatter),
+        basemap=MaplibreBasemap(style=CartoBasemap.DarkMatterNoLabels),
         controls=[
             FullscreenControl(position="top-right"),
             NavigationControl(visualize_pitch=True),

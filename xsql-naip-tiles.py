@@ -1254,6 +1254,8 @@ async def _(
     np,
     read_res,
     tiles,
+    time,
+    timedelta,
     window_for,
 ):
     # THE DEM STREAM, PER TILE WINDOW. This is where the AOI-sized array used to be: the
@@ -1443,6 +1445,7 @@ async def _(
     naip_quads,
     np,
     tiles,
+    time,
     view,
 ):
     # THE PHOTOGRAPH, PER TILE, at the tile's own texel size. Every tile reads the quads
@@ -1460,22 +1463,44 @@ async def _(
     # notebook reaches routinely, serial round trips are the whole runtime, because each
     # window is small and the cost is latency rather than bytes.
     #
-    # `naip_rgb` already caps itself at 8 concurrent reads internally, so the outer bound
-    # multiplies with it: a bound of 4 means at most 32 range reads in flight, of
-    # windows that are one tile wide at one overview level.
-    _TILE_CONCURRENCY = 8
+    # `naip_rgb` caps itself at `MAX_CONCURRENT_READS` internally, so the outer bound
+    # MULTIPLIES with it: this times that is the real number of range reads in flight.
+    # Which way to move it depends on the regime the read-stats line reports; see the
+    # note on `MAX_CONCURRENT_READS` in naip.py. At the tile counts this notebook reaches
+    # the windows are small and the cost is round trips, so 12 x 8 errs high on purpose.
+    _TILE_CONCURRENCY = 12
     _sl = slice(HALO, HALO + T + 1)
     if naip_quads and view == "NAIP RGB":
+        naip.reset_read_stats()
         _opened = await naip.open_quads(naip_quads, GeoTIFF, HTTPStore)
         _outer = asyncio.Semaphore(_TILE_CONCURRENCY)
+
+        # PROGRESS, same reason and same shape as the DEM cell above: marimo streams stdout
+        # as a cell runs, so a line every tenth of the grid is the whole difference between
+        # "this is streaming hundreds of windows" and "this is stuck". Printed AFTER the
+        # await so it counts tiles actually finished, and the rate is the number that says
+        # whether a long run is progressing or crawling.
+        _done = [0]
+        _t0 = time.monotonic()
+        _step = max(1, len(tiles) // 10)
 
         async def _one(t):
             _lon, _lat = np.meshgrid(t["lon_h"][_sl], t["lat_h"][_sl])
             async with _outer:
-                return await naip.naip_rgb(
+                _r = await naip.naip_rgb(
                     naip_quads, _lon, _lat, t["bbox"], m_texel,
                     GeoTIFF, HTTPStore, Window, _opened,
                 )
+            _done[0] += 1
+            if _done[0] % _step == 0 or _done[0] == len(tiles):
+                _el = time.monotonic() - _t0
+                print(
+                    f"  NAIP {_done[0]}/{len(tiles)} tiles · {_el:.0f}s "
+                    f"({_done[0] / max(_el, 1e-9):.1f} tiles/s, "
+                    f"eta {(len(tiles) - _done[0]) * _el / max(_done[0], 1):.0f}s)",
+                    flush=True,
+                )
+            return _r
 
         _out = await asyncio.gather(*[_one(t) for t in tiles])
         photo = [(r[0], r[1]) for r in _out]
@@ -1486,8 +1511,25 @@ async def _(
             f"NAIP photo: {len(tiles)} tile(s), {_read} quad read(s) · "
             f"{m_texel:.2f} m/texel vs {_src:.2f} m native "
             f"({m_texel / _src:.1f}x coarser) · "
-            f"{float(np.mean(_cov)) * 100:.1f}% painted"
+            f"{float(np.mean(_cov)) * 100:.1f}% painted",
+            flush=True,
         )
+        # WHERE THE TIME WENT, split network vs numpy. These are sums over concurrent
+        # tiles, so they exceed wall clock; the RATIO between them is the point, because
+        # it decides whether the fix is concurrency or doing less warping.
+        print(
+            f"  time: {sum(r[2]['read_s'] for r in _out):.0f}s in reads, "
+            f"{sum(r[2]['warp_s'] for r in _out):.0f}s in warp (summed over tiles), "
+            f"{time.monotonic() - _t0:.0f}s wall",
+            flush=True,
+        )
+        # WAS THAT SLOW BECAUSE OF ME OR BECAUSE OF THEM. obstore retries 429s silently,
+        # so a throttled fetch and a healthy one differ only in wall clock unless someone
+        # is keeping the clock. `read_stats_report` keeps it; run the `probe_throttle`
+        # cell below to turn its inference into a status code.
+        _rep, _stats = naip.read_stats_report()
+        if _rep:
+            print("\n".join("  " + _l for _l in _rep.splitlines()))
     else:
         # ONE placeholder pair, SHARED by every tile rather than one allocation each. The
         # consumers copy (`astype`) or only test (`.any()`), so nothing writes through these
@@ -1516,6 +1558,7 @@ async def _(
     naip_quads,
     np,
     tiles,
+    time,
     view,
 ):
     # NDVI, FOUR BANDS, PER TILE. This read exists to produce a NUMBER per texel rather
@@ -1526,19 +1569,36 @@ async def _(
     # photograph needs three. That band is the cheapest possible demonstration that a drape
     # can carry DATA: same pixels, same stream, one more band.
     # Same bounded concurrency as the photograph, and for the same reason.
-    _TILE_CONCURRENCY = 4
+    _TILE_CONCURRENCY = 12
     _sl = slice(HALO, HALO + T + 1)
     if naip_quads and view == "NDVI":
+        naip.reset_read_stats()
         _opened = await naip.open_quads(naip_quads, GeoTIFF, HTTPStore)
         _outer = asyncio.Semaphore(_TILE_CONCURRENCY)
+
+        # Same streaming progress as the photograph cell; NDVI reads four bands, so if
+        # anything it is the slower of the two and needs the line more.
+        _done = [0]
+        _t0 = time.monotonic()
+        _step = max(1, len(tiles) // 10)
 
         async def _one_ndvi(t):
             _lon, _lat = np.meshgrid(t["lon_h"][_sl], t["lat_h"][_sl])
             async with _outer:
-                return await naip.naip_rgb(
+                _r = await naip.naip_rgb(
                     naip_quads, _lon, _lat, t["bbox"], m_texel,
                     GeoTIFF, HTTPStore, Window, _opened, bands=4,
                 )
+            _done[0] += 1
+            if _done[0] % _step == 0 or _done[0] == len(tiles):
+                _el = time.monotonic() - _t0
+                print(
+                    f"  NDVI {_done[0]}/{len(tiles)} tiles · {_el:.0f}s "
+                    f"({_done[0] / max(_el, 1e-9):.1f} tiles/s, "
+                    f"eta {(len(tiles) - _done[0]) * _el / max(_done[0], 1):.0f}s)",
+                    flush=True,
+                )
+            return _r
 
         _out = await asyncio.gather(*[_one_ndvi(t) for t in tiles])
         # NDVI = (NIR - R) / (NIR + R). uint8 in, float out; the denominator is guarded
@@ -1561,6 +1621,15 @@ async def _(
             f"NDVI: {len(tiles)} tile(s), {_read} quad read(s) at {m_texel:.2f} m/texel · "
             f"{float(np.mean(_cov)) * 100:.1f}% painted · median {_med:+.2f}"
         )
+        print(
+            f"  time: {sum(r[2]['read_s'] for r in _out):.0f}s in reads, "
+            f"{sum(r[2]['warp_s'] for r in _out):.0f}s in warp (summed over tiles), "
+            f"{time.monotonic() - _t0:.0f}s wall",
+            flush=True,
+        )
+        _rep, _stats = naip.read_stats_report()
+        if _rep:
+            print("\n".join("  " + _l for _l in _rep.splitlines()))
     else:
         # Same shared placeholder as the photograph, same reason: the fold reads a slice of
         # it and nothing writes to it, so one all-NaN array serves the whole grid.
@@ -1568,6 +1637,50 @@ async def _(
         _blank_ndvi.flags.writeable = False
         ndvi = [_blank_ndvi for _ in tiles]
     return (ndvi,)
+
+
+@app.cell
+def _(mo):
+    # THE ACTIVE THROTTLE CHECK, behind a button because it costs three requests and
+    # because firing it on every re-render would itself be the thing it is testing for.
+    probe_btn = mo.ui.run_button(label="Probe Planetary Computer for throttling")
+    probe_btn
+    return (probe_btn,)
+
+
+@app.cell
+async def _(mo, naip, naip_quads, probe_btn):
+    # The report in the fetch cells INFERS throttling from timing, because obstore's retry
+    # layer absorbs the evidence. This asks directly: three back-to-back range GETs with no
+    # retries, so a 429 or 503 arrives as a status code and Azure's own `x-ms-error-code`
+    # comes back with it. A burst of three matters: a limiter with room for one request
+    # will still refuse the third, and one 200 proves nothing.
+    #
+    # AWAITED, not called. `probe_throttle` does its blocking urllib work on a worker
+    # thread; calling a synchronous version here froze the kernel for the duration and
+    # took the websocket with it.
+    mo.stop(not probe_btn.value, mo.md("*Run the probe to test the connection directly.*"))
+    mo.stop(not naip_quads, mo.md("*No NAIP quads selected, so there is nothing to probe.*"))
+
+    _rows = await naip.probe_throttle(naip_quads[0].assets["image"].href)
+    _lines = [
+        f"| {r['attempt']} | {r.get('status') or r.get('error', '?')} | "
+        f"{r['elapsed_s']:.2f}s | {r['retry_after'] or '-'} | "
+        f"{r['provider_code'] or '-'} | {'yes' if r['throttled'] else 'no'} |"
+        for r in _rows
+    ]
+    _verdict = (
+        "**Throttled.** The server is rate limiting these reads; back off "
+        "`MAX_CONCURRENT_READS` and `_TILE_CONCURRENCY`."
+        if any(r["throttled"] for r in _rows)
+        else "**Not throttled** at this moment. Slow fetches are bandwidth or latency, "
+        "not a rate limit."
+    )
+    mo.md(
+        "| # | status | elapsed | retry-after | provider code | throttled |\n"
+        "|---|---|---|---|---|---|\n" + "\n".join(_lines) + "\n\n" + _verdict
+    )
+    return
 
 
 @app.cell

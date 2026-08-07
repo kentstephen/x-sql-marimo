@@ -29,6 +29,7 @@ import asyncio
 import time
 from collections import defaultdict, namedtuple
 from datetime import timedelta
+from functools import lru_cache
 
 import numpy as np
 from pyproj import Transformer
@@ -84,8 +85,238 @@ STAC_TRIES = 3
 # box was 35 round trips; at 1,000 it is 4, and measurably faster end to end.
 STAC_PAGE = 1000
 
-# Simultaneous quad reads. See the note in `naip_rgb`.
+# How much coarser than one texel an overview may be and still be preferred.
+#
+# MEASURED, and it is the only change here that moved the clock. A 4x4 grid at a 16.3 m
+# texel over a 0.4 x 0.3 degree box: 45.9 Mpix in 5.5 s at 1.0, 11.5 Mpix in 2.4 s at 1.4,
+# with AOI coverage identical to three decimal places. See the note in `_read_quad`.
+#
+# It is NOT free, and the cost is worth stating: at 1.4 the chosen overview can be coarser
+# than the texel, so some texels repeat a source pixel where at 1.0 they would each get
+# their own. On nearest-neighbour sampling of a photograph that is a slight softening, not
+# an artifact. Drop to 1.0 if a drape ever needs to be pixel-faithful to the source.
+OVERVIEW_TOL = 1.4
+
+# SIMULTANEOUS QUAD READS, and the thing to know is WHICH REGIME YOU ARE IN, because the
+# right answer inverts between them and the notebook can be in either.
+#
+#   BANDWIDTH-BOUND: few large tiles, coarse grid, so each window is tens of megapixels.
+#   The link is saturated, extra transfers buy no throughput, and all they do is divide
+#   the same bandwidth into more streams that each run longer against a per-request
+#   timeout. Here the bound wants to be LOW.
+#
+#   LATENCY-BOUND: many small tiles, which is what this notebook reaches routinely at 200+
+#   tiles. Each window is a fraction of a megapixel and the cost is the round trip, not
+#   the bytes. The link sits idle between requests and the bound wants to be HIGH.
+#
+# The default assumes the latency-bound case, because that is the one a tiled drape is FOR
+# and the one where a wrong setting costs minutes rather than seconds. `read_stats_report`
+# tells you which regime a given run was in: short per-read times with a low tiles/s means
+# latency-bound and under-parallelised, long per-read times near the timeout mean the
+# opposite. Tune from that rather than from this comment.
 MAX_CONCURRENT_READS = 8
+
+# ---------------------------------------------------------------------------
+# AM I BEING THROTTLED?
+#
+# The honest answer is that obstore will not tell you. `retry_config` handles 429 and 503
+# INSIDE the client: a read that was rate-limited four times and succeeded on the fifth
+# returns exactly like a read that succeeded first try, only slower. Nothing is raised,
+# nothing is logged, and the only trace left is wall clock. So throttling here has to be
+# inferred from timing, and confirmed out of band with a raw request that does not retry.
+#
+# Two signals, and they answer different questions:
+#
+#   `read_stats_report()` is the PASSIVE one. Every windowed read records when it started,
+#   how long it took and how many pixels came back. Rate limiting is not uniform slowness,
+#   it is slowness that GETS WORSE as a token bucket drains, so the report compares the
+#   median read time of the first third of the run against the last third. A link that is
+#   merely narrow is flat; a bucket that is emptying ramps. That ratio is the tell.
+#
+#   `probe_throttle(href)` is the ACTIVE one, and it is the one that gives a number rather
+#   than an inference. It issues a single small range GET with NO retry layer, so a 429 or
+#   503 arrives as a status code instead of being absorbed. Azure Blob, which is what
+#   Planetary Computer hands out, puts the reason in `x-ms-error-code` (`ServerBusy`,
+#   `TooManyRequests`) and the wait in `Retry-After`.
+#   THE DRIFT METRIC IS NORMALISED BY CONCURRENCY, and it is wrong without that. A read
+#   competing with 40 others is slower than the same read alone, and a `gather` DRAINS:
+#   the reads that start last have the fewest competitors left. So raw elapsed time always
+#   falls across a run, every run looks like it is speeding up, and a genuine token bucket
+#   emptying underneath would be hidden by the drain. Dividing each read's elapsed time by
+#   the number in flight when it started gives a per-read cost that is comparable across
+#   the run, which is the only version of this number that can detect anything.
+_READS: list[tuple[float, float, int, str, int]] = []  # (t0, elapsed, npix, kind, inflight)
+_READ_EPOCH = time.monotonic()
+_INFLIGHT = [0]
+
+# A read slower than this, at the small windows a tiled drape asks for, is not bandwidth.
+SLOW_READ_S = 20.0
+# First-third to last-third median ratio above which the run is degrading, not just slow.
+RAMP_RATIO = 1.8
+
+
+def reset_read_stats():
+    """Clear the read log. Call once before a fetch you want to measure on its own."""
+    global _READ_EPOCH
+    _READS.clear()
+    _READ_EPOCH = time.monotonic()
+    _INFLIGHT[0] = 0
+
+
+def classify_error(exc):
+    """Bucket an obstore/async-geotiff failure into something actionable.
+
+    Matching on the STRING is deliberate. obstore surfaces transport failures through a
+    small number of exception types that carry the HTTP status in their message rather
+    than as an attribute, and the type names have moved between releases, so a string
+    test survives an upgrade where an isinstance chain quietly stops matching and calls
+    every throttle an "other".
+    """
+    s = f"{type(exc).__name__}: {exc}".lower()
+    if "429" in s or "too many requests" in s or "slowdown" in s or "serverbusy" in s:
+        return "throttled"
+    if "503" in s or "service unavailable" in s:
+        return "unavailable"
+    if "timed out" in s or "timeout" in s or "deadline" in s:
+        return "timeout"
+    if "403" in s or "401" in s or "authentic" in s or "signature" in s:
+        return "auth"
+    return "other"
+
+
+def _record_read(t0, npix, kind, inflight):
+    _READS.append((t0 - _READ_EPOCH, time.monotonic() - t0, npix, kind, inflight))
+
+
+def read_stats_report():
+    """Summarise the read log as (text, dict). Empty log gives (None, {})."""
+    if not _READS:
+        return None, {}
+    rows = sorted(_READS)
+    n = len(rows)
+    ok = [r for r in rows if r[3] == "ok"]
+    fails = defaultdict(int)
+    for r in rows:
+        if r[3] != "ok":
+            fails[r[3]] += 1
+
+    def _med(xs):
+        xs = sorted(xs)
+        return xs[len(xs) // 2] if xs else float("nan")
+
+    span = max(r[0] + r[1] for r in rows)
+    elapsed = [r[1] for r in ok]
+    # Cost per read with the crowd divided out. See the note on `_READS`: raw elapsed
+    # falls across every run because the queue drains, so only this is comparable.
+    unit = [r[1] / max(r[4], 1) for r in ok]
+    third = max(1, len(ok) // 3)
+    early, late = _med(unit[:third]), _med(unit[-third:])
+    ramp = late / early if early and early == early and early > 0 else float("nan")
+    slow = sum(1 for e in elapsed if e > SLOW_READ_S)
+    mpix = sum(r[2] for r in ok) / 1e6
+    conc = _med([r[4] for r in ok])
+    mpix_read = mpix / max(len(ok), 1)
+
+    d = {
+        "reads": n, "ok": len(ok), "failures": dict(fails), "wall_s": span,
+        "median_s": _med(elapsed), "max_s": max(elapsed, default=float("nan")),
+        "early_unit_s": early, "late_unit_s": late, "ramp": ramp,
+        "median_inflight": conc, "mpix_per_read": mpix_read,
+        "slow_reads": slow, "megapixels": mpix,
+        "mpix_per_s": mpix / span if span else float("nan"),
+    }
+
+    # WHICH REGIME, which is the number that decides whether to raise or lower the
+    # concurrency bounds. Small windows mean the round trip dominates and the link is
+    # idle between requests; large ones mean the bytes dominate and it is not.
+    d["regime"] = (
+        "latency-bound (small windows: raise concurrency if tiles/s is low)"
+        if mpix_read < 2.0
+        else "bandwidth-bound (large windows: lower concurrency if reads near the timeout)"
+    )
+
+    # The verdict, in the order a reader should care about it. A hard 429 that survived
+    # six retries outranks any amount of inference from timing.
+    if fails.get("throttled"):
+        d["verdict"] = "THROTTLED (server said so, after retries were exhausted)"
+    elif fails.get("unavailable") or fails.get("timeout"):
+        d["verdict"] = "failing on timeouts/503s, which is what sustained throttling looks like once retries run out"
+    elif ramp == ramp and ramp > RAMP_RATIO and late > 5.0:
+        d["verdict"] = f"LIKELY THROTTLED: reads got {ramp:.1f}x slower across the run"
+    elif slow > n * 0.25:
+        d["verdict"] = "slow but flat, which reads as a narrow link rather than a rate limit"
+    else:
+        d["verdict"] = "no sign of throttling"
+
+    lines = [
+        f"reads: {len(ok)}/{n} ok"
+        + (f" · failures: {dict(fails)}" if fails else "")
+        + f" · {span:.1f}s wall",
+        f"per read: {d['median_s']:.1f}s median, {d['max_s']:.1f}s max, "
+        f"{slow} over {SLOW_READ_S:.0f}s",
+        f"drift: {early:.2f}s -> {late:.2f}s per read per unit of concurrency "
+        f"({ramp:.1f}x, median {conc:.0f} in flight)",
+        f"throughput: {mpix:.0f} Mpix in {span:.1f}s ({d['mpix_per_s']:.1f} Mpix/s decoded), "
+        f"{mpix_read:.2f} Mpix/read",
+        f"regime: {d['regime']}",
+        f"verdict: {d['verdict']}",
+    ]
+    return "\n".join(lines), d
+
+
+async def probe_throttle(href, nbytes=65536, tries=3, pause=1.0):
+    """Hit one signed href with a small range GET and NO retries; report what comes back.
+
+    This is the check that cannot be fooled by a retry layer. `tries` requests go out
+    back to back, because a rate limiter that has room for one request will often refuse
+    the third, and a single 200 proves nothing about a burst.
+
+    ASYNC, AND NOT AS A STYLE CHOICE. The first version was a plain function, and calling
+    it from a marimo cell froze the kernel: `urlopen` and `sleep` are blocking, so three
+    attempts hold the event loop for at least the pause and for up to 90 s if the requests
+    hang. A frozen kernel cannot service the websocket or accept a parameter change, which
+    presents as the notebook being stuck rather than as this probe being slow. The blocking
+    calls go to a worker thread; only the awaits happen here.
+
+    Returns a list of dicts, one per attempt: status, elapsed_s, retry_after, and the
+    provider's own error code where it gives one. urllib rather than httpx so this stays
+    dependency-free and usable from any of these notebooks.
+    """
+    import urllib.error
+    import urllib.request
+
+    def _once(req):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                r.read()
+                return r.status, dict(r.headers), None
+        except urllib.error.HTTPError as e:  # 429 and 503 land here, un-retried
+            return e.code, dict(e.headers or {}), None
+        except Exception as e:
+            return None, {}, f"{type(e).__name__}: {e}"
+
+    out = []
+    for i in range(tries):
+        req = urllib.request.Request(
+            href, headers={"Range": f"bytes=0-{nbytes - 1}"}, method="GET"
+        )
+        t0 = time.monotonic()
+        status, headers, err = await asyncio.to_thread(_once, req)
+        h = {k.lower(): v for k, v in headers.items()}
+        rec = {
+            "attempt": i + 1,
+            "status": status,
+            "elapsed_s": time.monotonic() - t0,
+            "retry_after": h.get("retry-after"),
+            "provider_code": h.get("x-ms-error-code") or h.get("x-amz-error-code"),
+        }
+        if err:
+            rec["error"] = err
+        rec["throttled"] = status in (429, 503) or bool(rec["retry_after"])
+        out.append(rec)
+        if i + 1 < tries:
+            await asyncio.sleep(pause)
+    return out
 
 _Year = namedtuple("_Year", "year quads one_date cov leaf_off dates")
 
@@ -377,6 +608,36 @@ def _window_for(reader, bounds_proj, Window):
     return Window(col_off=col0, row_off=row0, width=col1 - col0, height=row1 - row0)
 
 
+@lru_cache(maxsize=64)
+def _to_crs(crs):
+    """4326 -> `crs`, built once. `Transformer.from_crs` is not cheap, and a tiled drape
+    used to call it once per quad PER TILE: 200 tiles over 40 quads is 8,000 PROJ pipeline
+    constructions to produce at most a handful of distinct UTM zones."""
+    return Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+
+
+def quads_for_bbox(quads, bbox, pad=0.0):
+    """The subset of `quads` whose own footprint intersects `bbox`.
+
+    A tiled drape hands EVERY quad in the AOI to EVERY tile, so a 16-tile grid over 48
+    quads makes 768 `_read_quad` calls to issue 120 reads.
+
+    THIS IS NOT A SPEEDUP, and it was added believing it was one. Measured on that grid it
+    changed the wall clock by nothing (5.6 s against 5.5 s) and the read count by nothing,
+    because `_window_for` already rejects a non-overlapping quad before touching the
+    network: the 648 wasted calls were pure local arithmetic and cost about a tenth of a
+    second. Kept because it makes the miss explicit and keeps `quads_tried` honest in the
+    info dict, not because it buys time. The bytes are the thing; see `OVERVIEW_TOL`.
+    """
+    w, s, e, n = bbox
+    out = []
+    for q in quads:
+        qw, qs, qe, qn = q.bbox
+        if qe + pad >= w and qw - pad <= e and qn + pad >= s and qs - pad <= n:
+            out.append(q)
+    return out
+
+
 def _store_for(HTTPStore, href):
     """One store per href, with the timeouts and retries the defaults do not give."""
     return HTTPStore.from_url(
@@ -393,9 +654,27 @@ async def open_quads(quads, GeoTIFF, HTTPStore):
     window and, at a finer texel size, its own overview level.
     """
     hrefs = list({q.assets["image"].href: None for q in quads})
-    opened = await asyncio.gather(
-        *[GeoTIFF.open("", store=_store_for(HTTPStore, h)) for h in hrefs]
-    )
+    t0 = time.monotonic()
+    done = [0]
+
+    # A LINE EVERY TENTH, NOT ONE PER HEADER. Per-header was the first version and it is a
+    # websocket flood: marimo ships every print to the frontend, a wide box is 50+ quads,
+    # and both the photograph and the NDVI cell re-run this on every parameter change. The
+    # frontend spends its time rendering progress about work that has already finished.
+    step = max(1, len(hrefs) // 10)
+
+    async def _open(h):
+        g = await GeoTIFF.open("", store=_store_for(HTTPStore, h))
+        done[0] += 1
+        if done[0] % step == 0 or done[0] == len(hrefs):
+            print(
+                f"  opened {done[0]}/{len(hrefs)} COG header(s) · "
+                f"{time.monotonic() - t0:.0f}s",
+                flush=True,
+            )
+        return g
+
+    opened = await asyncio.gather(*[_open(h) for h in hrefs])
     return dict(zip(hrefs, opened))
 
 
@@ -415,13 +694,22 @@ async def _read_quad(
     # Coarsest level still at least as fine as one texel. NAIP is 0.6 m native with
     # overviews to /64, and reading a level finer than the texture can show is pure
     # download: at 2048 texels over 20 km a texel is ~10 m, which is the /16 overview.
+    #
+    # THE TOLERANCE IS WHERE THE BYTES ARE, and it is worth more than any concurrency
+    # setting. Overviews are powers of two, so a strict `res <= texel` test lands on a
+    # level that is up to 2x finer than the texture can show in EACH axis, i.e. up to 4x
+    # the pixels for a texture that cannot display one of them. A texel of 19 m with
+    # levels at 9.6 and 19.2 is the worst case and it is not a rare one. Allowing a level
+    # a little coarser than the texel collapses that: the warp below is nearest-neighbour
+    # onto the caller's lattice, so a source pixel 1.4x the texel is sampled the same way
+    # a source pixel 0.9x the texel is, and the difference does not survive to the screen.
     cands = sorted([g, *g.overviews], key=lambda r: r.res[0])
-    fits = [r for r in cands if r.res[0] <= target_res_m]
+    fits = [r for r in cands if r.res[0] <= target_res_m * OVERVIEW_TOL]
     reader = fits[-1] if fits else cands[0]
 
     # The AOI arrives in degrees; the quad is in its own UTM zone. `proj:epsg` is
     # frequently absent on PC NAIP items, so take the CRS off the COG itself.
-    fwd = Transformer.from_crs("EPSG:4326", g.crs, always_xy=True)
+    fwd = _to_crs(str(g.crs))
     xs, ys = fwd.transform(
         [bbox[0], bbox[2], bbox[2], bbox[0]], [bbox[1], bbox[1], bbox[3], bbox[3]]
     )
@@ -429,7 +717,21 @@ async def _read_quad(
     if win is None:
         return None
 
-    r = await reader.read(window=win)
+    # The only line in this function that touches the network, so it is the only one
+    # worth timing. Failures are classified and re-raised: swallowing a 429 here would
+    # turn "you are being rate limited" into "that quad had no data", which is the exact
+    # confusion this instrumentation exists to end.
+    t0 = time.monotonic()
+    _INFLIGHT[0] += 1
+    _n = _INFLIGHT[0]
+    try:
+        r = await reader.read(window=win)
+    except Exception as e:
+        _INFLIGHT[0] -= 1
+        _record_read(t0, 0, classify_error(e), _n)
+        raise
+    _INFLIGHT[0] -= 1
+    _record_read(t0, int(win.width) * int(win.height) * bands, "ok", _n)
     ma = r.as_masked()
     data = np.ma.getdata(ma)[:bands]  # NAIP band order is R, G, B, NIR
     mask = np.ma.getmaskarray(ma)
@@ -490,17 +792,32 @@ async def naip_rgb(
     # and the total is no slower because the link was the constraint either way.
     sem = asyncio.Semaphore(MAX_CONCURRENT_READS)
 
+    # Drop the quads this bbox cannot touch BEFORE opening a store or projecting a corner.
+    # See `quads_for_bbox`: on a tiled drape this is most of them, every time.
+    hits = quads_for_bbox(quads, bbox)
+
     async def read_one(q):
         async with sem:
             return await _read_quad(
                 q, bbox, target_res_m, GeoTIFF, HTTPStore, Window, opened, bands
             )
 
-    reads = await asyncio.gather(*[read_one(q) for q in quads])
+    # PHASE TIMING, because "the fetch is slow" has two completely different fixes. Time
+    # in `read` is the network and answers to concurrency and overview level; time in the
+    # warp is numpy on a 513-square lattice per quad and answers to nothing but doing less
+    # of it. Without the split, a CPU-bound warp looks exactly like a throttled link.
+    _t_read = time.monotonic()
+    reads = await asyncio.gather(*[read_one(q) for q in hits])
+    _t_read = time.monotonic() - _t_read
+    _t_warp = time.monotonic()
+
     tiles = [t for t in reads if t is not None]
     info = {
         "quads_read": len(tiles),
         "quads_found": len(quads),
+        "quads_tried": len(hits),
+        "read_s": _t_read,
+        "warp_s": 0.0,
         "source_res_m": min((t[4] for t in tiles), default=float("nan")),
     }
     rgb = np.zeros((*lon.shape, bands), dtype="uint8")
@@ -518,7 +835,7 @@ async def naip_rgb(
         by_crs[t[3]].append(t)
 
     for crs, group in by_crs.items():
-        X, Y = Transformer.from_crs("EPSG:4326", crs, always_xy=True).transform(lon, lat)
+        X, Y = _to_crs(crs).transform(lon, lat)
         for data, mask, bounds, _, _, qbbox in group:
             h, w = mask.shape
             left, bottom, right, top = bounds
@@ -541,4 +858,5 @@ async def naip_rgb(
             covered |= good
 
     info["covered"] = float(covered.mean())
+    info["warp_s"] = time.monotonic() - _t_warp
     return rgb, covered, info
