@@ -1,218 +1,200 @@
 # Annual NLCD in H3: notes
 
-Working notes from a session that got as far as a smoke-testable notebook
-(`xsql-nlcd-zoom.py`) and no further. **The notebook does not work.** The findings below
-are worth keeping; the notebook is not, in its current state.
+Notes for `xsql-nlcd-zoom.py`. The previous version of this file described a notebook that
+did not work; that notebook has been replaced. What follows is what the rebuild established,
+with the numbers it was established by.
 
-## Status: broken
+Run: `uv run marimo edit xsql-nlcd-zoom.py`
 
-Observed in the browser, not reproduced headlessly:
+## The shape of the thing
 
-- **The map disappears.** `marimo export html` exits 0 and serializes an
-  `H3HexagonLayer`, so every cell runs and the fold produces real data. Whatever kills it
-  is on the widget side, after the data is correct. Prime suspects, untested:
-  - The layer is constructed in one cell from `shown` and mutated in another cell from
-    the same `shown`. That is a redundant assignment on first run and a possible
-    ordering hazard on later runs.
-  - res 8 is 10.6M hexagons. deck computes hexagon boundaries client side via h3-js, and
-    that may simply be too many. Dropping the top band is the first thing to try.
-  - `hold_trait_notifications()` around four traits including `table` may not flush the
-    way the surface notebooks' version does.
-- **Pitch should be 0.** `view_state={... "pitch": 35}` was a bad default. A land cover
-  map is a flat map. If pitch goes to 0, the purity-as-height encoding becomes invisible
-  and needs to be replaced by something else (opacity, or a second legend).
+Nothing is read until the camera asks for it. Every fold reads **only the padded viewport**,
+from the overview that matches the H3 resolution it is about to build, registers that window
+with xarray-sql and folds it in SQL. The camera never re-runs a marimo cell: it schedules a
+coroutine that swaps traits on one live layer.
 
-Not a bug: **years are never combined.** `year.value` selects exactly one file,
-`Annual_NLCD_LndCov_{year}_CU_C1V1.tif`, and each is a standalone CONUS mosaic.
+The counter-intuitive part, and the reason res 11 is reachable at all: **the finest views are
+the cheapest reads**, because the viewport shrinks faster than the resolution grows.
 
-## The data
+| res | overview | m/px | read px | read | fold | cells | px/hex |
+|-----|----------|------|---------|------|------|-------|--------|
+| 5 | L5 | 960 | 16,245,000 | 0.26s | 0.45s | 31,629 | 277 |
+| 6 | L4 | 480 | 4,898,214 | 0.18s | 0.16s | 31,262 | 157 |
+| 7 | L4 | 480 | 672,560 | 0.16s | 0.05s | 30,539 | 22.0 |
+| 8 | L3 | 240 | 383,720 | 0.29s | 0.05s | 30,705 | 12.5 |
+| 9 | L2 | 120 | 220,527 | 0.36s | 0.04s | 30,919 | 7.1 |
+| 10 | L1 | 60 | 126,880 | 0.15s | 0.03s | 31,072 | 4.1 |
+| 11 | L0 | 30 | 72,890 | 0.17s | 0.04s | 31,183 | 2.3 |
 
-`s3://us-west-2.opendata.source.coop/kylebarron/usgs-landcover/annual-nlcd/c1/v1/cu/mosaic/`
+Python RSS stays flat (~0.68 GB) because one fixed table name means DataFusion holds exactly
+one window at a time. `ctx.deregister_table("lc")` before each `from_dataset`, or it errors
+with "table lc already exists".
 
-Lists and reads anonymously with obstore. No requester-pays, no signing, no catalog to
-parse: one file per (product, year), so the "which COG covers this AOI" problem that the
-DEM notebooks solve with a VRT does not exist here.
+**res 11 is the floor, not a cap.** A res 11 hexagon holds 2.3 pixels of 30 m NLCD; res 12
+would hold 0.6 and the map would hole out. The ceiling belongs to the data.
 
-- **240 COGs, 506 GB.** 6 products x 40 years (1985-2024): `LndCov` (class raster),
-  `FctImp` (% impervious), `ImpDsc`, `LndChg`, `LndCnf` (confidence), `SpcChg`.
-- Each file is one CONUS mosaic: 105000 x 160000, 30 m, uint8, nodata 250, DEFLATE,
-  512x512 blocks, palette photometric.
-- CRS is a custom `AEA WGS84` with **no EPSG code** (`crs.to_epsg()` returns None). It is
-  standard NLCD Albers: `+proj=aea +lat_0=23 +lon_0=-96 +lat_1=29.5 +lat_2=45.5
-  +datum=WGS84`. `g.crs` is already a pyproj CRS, so `Transformer.from_crs` takes it
-  directly.
-- 6 overview levels: 60, 120, 240, 480, 960, 1920 m.
+## Sizing: tune by SCREEN PIXELS, never by cell count
 
-**The overviews are class-pure.** Checked at 120 m, 480 m and 1920 m: unique values are
-exactly the 16 NLCD classes plus 250. Nearest or mode resampled, no averaged
-pseudo-classes. This is what makes reading a coarse level honest instead of a lie, and it
-is the single fact the whole design rests on.
+This was the biggest self-inflicted wound. `PER_RES = 1.4` is correct (each H3 step is 2.65x
+linear, `log2(2.65) = 1.4`), so hexagon size on screen stays constant across zooms. But
+`BASE_RES` was tuned to give ~215k cells per fold and that was reported as a virtue. **215k
+cells on a 1400x620 viewport is one hexagon per four pixels by definition.** Measured, at the
+band start (the worst case, since a hexagon grows 2.65x before the next step):
 
-NLCD's shipped colormap (`g.colormap.as_dict()`) is a green-forest against red-developed
-palette. Treat it as metadata and never draw it. The notebook uses 7 groups on a
-teal-to-brown axis with water in blue and the developed ramp carried by luminance.
+| BASE_RES | band start | band end | cells |
+|----------|-----------|----------|-------|
+| 7 | 0.69px | 1.82px | 692,000 |
+| 6 | 1.83px | 4.81px | 99,000 |
+| **5** | **4.84px** | 12.68px | 14,000 |
+| 4 | 12.77px | 33.47px | 2,000 |
 
-## The H3 library question
+At 0.7px you are not looking at hexagons, you are looking at aliasing. Settled on
+`BASE_RES = 5`. `math.floor`, not `int()`: int truncates toward zero, which collapsed every
+zoom below ZOOM0 onto the floor and jumped the map 4,626 -> 216,896 cells in one zoom step.
 
-`h3ronpy` 0.22 **already links h3o 0.7.0** (confirmed by pulling crate paths out of
-`h3ronpyrs.abi3.so`). h3o is the HydroniumLabs pure-Rust reimplementation, not a binding
-to Uber's C. The R package of the same name is JosiahParry's extendr bindings to that
-same crate, now maintained under extendr. There is nothing faster to swap in.
+## Colour: use NLCD's own, and check the LUMINANCE of the COMMON classes
 
-There is no `datafusion-h3` crate. The existing UDF is not row-by-row Python: DataFusion
-hands it whole batches and it makes one vectorized `coordinates_to_cells` call, so the
-per-batch overhead is one `to_numpy()` and one `pa.array()`. Measured, the H3 call is
-~0.1 s against a ~2 s fold. A native Rust `ScalarUDF` would be optimising the wrong end.
+A palette was invented here on a teal-to-brown axis, with the three forest classes separated
+by lightness. It made the map unreadable. Measured over a real southeast viewport:
 
-Module layout moved in 0.22: `h3ronpy.vector`, `h3ronpy.raster`, no `h3ronpy.arrow`, no
-`h3ronpy.op`. `h3ronpy.raster.raster_to_dataframe(arr, transform, res, nodata_value=,
-compact=)` and `nearest_h3_resolution(shape, transform)` exist and were never tried.
+| class | share of view | invented lum | NLCD lum |
+|-------|--------------|--------------|----------|
+| Deciduous forest | **39.7%** | 0.103 | 0.329 |
+| Evergreen forest | 9.2% | 0.034 | 0.086 |
+| Water | 2.1% | 0.032 | 0.143 |
+| Pasture | 21.7% | 0.558 | 0.651 |
 
-**In the browser:** h3o compiles to WASM by design, but no npm package exists, so it
-would mean vendoring your own build. Note that H3 already runs in the browser here:
-deck's `H3HexagonLayer` calls h3-js to turn cell ids into boundaries. Moving cell
-*assignment* client side would require shipping the raster instead of the much smaller
-cell table, so it makes the payload worse. The one place browser-side H3 would pay is
-`change_resolution` for zoom-out, which is pure integer math on data already resident.
+**52% of the map came out below 0.18 luminance.** The map read as black, with every lighter
+patch apparently outlined in it. Lightness ended up inversely correlated with frequency: the
+single most common class in the region got the darkest colour.
 
-## lonboard's camera
+NLCD ships its own colormap **inside the COG**: `GeoTIFF.colormap.as_dict()`. Those values
+are now written into `GROUPS` so the legend and the fill cannot drift. The lesson is not
+"invented palettes are bad", it is: **weight a palette by how much of the map each class
+actually covers before judging it.**
 
-From the 0.16 bundle (`static/index.js`):
+(NLCD's `23`/`24` developed are pure reds against forest greens, which is the one pairing a
+deuteranope cannot use. They were 1.1% of that view. Left as NLCD ships them, deliberately.)
 
-```js
-onViewStateChange: He => { $t(HTt(Ce, He.viewState)) }
-// $t  = n => { model.set("view_state", n); jye(model) }
-// jye = debounce(m => m.save_changes(), 300)
-```
+## Clusters: dissolve, then stroke the boundary
 
-- `view_state` is a real two-way trait. `map.observe(fn, names="view_state")` works.
-- The comm flush is **debounced 300 ms, trailing only, no maxWait**. Python hears nothing
-  during a drag and gets one notification after the camera settles.
-- `view_state` reaches deck as `initialViewState`, so the camera is **uncontrolled**.
-  Python assignment does not fight a drag, and the camera's echo cannot feed back into
-  itself. Only `set_view_state` and the `fly-to` custom message move it.
+`h3ronpy.vector.cells_to_wkb_polygons(cells, link_cells=True)` does the dissolve **and** the
+connected-component split in one call: neighbours merge, disconnected groups come back as
+separate polygons. 13,036 contiguous cells -> 1 polygon in 0.01s.
 
-The trait is not the problem. What breaks it in marimo is the cell graph:
+Two encodings were tried and both failed for reasons worth recording:
 
-- If the cell that builds the `Map` reads state that the observer writes, every settle
-  rebuilds the widget, resets the camera, and fires again.
-- Reassigning `deck.layers` per camera event builds a new widget model each time and
-  leaks the old one into the browser. A fast pan walks it into a crash. Mutate the
-  existing layer's traits instead.
-- The fix that matters most: **put the derived job in the state, not the camera**. The
-  observer computes the resolution and returns early if unchanged, so a pan or a zoom
-  nudge inside a band reaches nothing.
+1. **Stroking every rim cell.** At res 9, 75% of cells touch an unlike neighbour (50% at
+   res 7), so "outline the boundary cells" outlines nearly the whole map. It came out a
+   honeycomb. No threshold fixes it, because the fragments *are* the data.
+2. **Filling the dissolved polygon in the class colour.** The polygon *is* those cells, so a
+   fill in their own colour is invisible at any opacity, including 1.0. Self-cancelling by
+   construction. This should have been obvious before it was built.
 
-`MapViewState` carries `longitude, latitude, zoom, pitch, bearing, max/min_*` and
-**nothing about viewport size**, so the visible bbox is not derivable from the camera. Any
-viewport-bbox scheme has to assume a pixel size. This is why the first attempt did not
-fill the view.
+What works is **stroking the dissolved boundary**: a run of 40,000 cells becomes one line.
 
-## Why viewport reads were the wrong idea
+Dissolving everything is not viable; the speckle has to go first. Union-find over k-ring-1
+adjacency gives run sizes in 0.49s, and then (res 8, 267,511 cells):
 
-Full CONUS, measured:
+| min run | cells kept | polygons | WKB | dissolve |
+|---------|-----------|----------|-----|----------|
+| 1 | 267,511 (100%) | 43,329 | 13.2 MB | 22.5s |
+| 20 | 174,036 (65%) | 1,153 | 5.2 MB | 1.9s |
+| 100 | 136,192 (51%) | 181 | 3.6 MB | 1.3s |
+| 500 | 104,493 (39%) | 34 | 2.5 MB | 1.0s |
+| 2000 | 82,196 (31%) | 8 | 1.8 MB | 0.7s |
 
-| level | fold | cells | time | Arrow |
-|---|---|---|---|---|
-| 960 m | res 5 | 31,629 | 0.9 s | 1 MB |
-| 960 m | res 6 | 218,506 | 0.9 s | 4 MB |
-| 480 m | res 7 | 1,522,443 | 3.2 s | 30 MB |
-| 240 m | res 8 | 10,639,312 | 13.5 s | 213 MB |
+The polygon count collapses 1,200x while the cells covered only halve: almost every run is a
+handful of cells.
 
-The entire country at res 7 is 3.2 s and 30 MB. There is no viewport worth computing.
-Tiles, morecantile, per-tile caching and viewport bboxes were all solving a problem that
-does not exist at this data size. Read once, query many times.
+The adjacency is SQL. `unnest(h3_ring1(hex))` joined back to the cell table, 0.04s at 216k
+cells. The UDF must declare **`pa.large_list(pa.uint64())`**, not `pa.list_` -- h3ronpy
+returns LargeList and DataFusion rejects the mismatch outright. `c.hex > r.hex` halves the
+edge list losslessly (grid_disk emits every adjacency twice; verified 1,003,266 edges ->
+501,633 unordered-unique, identical partitions either way).
 
-## xarray-sql earns its place here
+## Things that cost a session each
 
-Manual flatten (`np.nonzero`, per-pixel interpolation, a materialized pyarrow table)
-against `ctx.from_dataset`, same fold, 480 m to res 7:
+**lonboard latches `_rows_per_chunk` in `__init__` and never recomputes it.**
+`layer/_base.py:397`. Every later assignment still rechunks through it
+(`traits/_table.py:106`, `_h3.py:130`, `_color.py:140`) and `serialize_table_to_parquet`
+writes **one Parquet file per chunk**. Build a layer against a 1-row placeholder table and
+`infer_rows_per_chunk` returns 1, latched for the layer's life, so every fold serialises one
+complete Parquet file **per hexagon**. Measured over four folds of a zoom-in: **673,581
+Parquet files and 621.94 MB, against 12 files and 6.89 MB** with `_rows_per_chunk`
+recomputed before each assignment. Nothing errors. The map just silently ships 90x the bytes,
+and it cost a machine restart. Only the reassign-in-place pattern is exposed; rebuilding the
+layer each update re-infers a sane value and hides it entirely.
 
-```
-A  manual flatten   3.2s   1,522,443 cells   + 596 MB of Python-side columns
-B  from_dataset     1.9s   1,522,443 cells
-   hex identical: True    mode identical: True (after the tie-break fix)
-```
+Corollary: **never seed a layer with a placeholder row.** Either construct from the first
+real table or pass `_rows_per_chunk=` explicitly (a real constructor kwarg).
 
-`from_dataset` takes the raw 2D numpy array, no dask needed. `y` and `x` become columns,
-`cls` becomes a column, streamed by chunk. `np.nonzero` becomes `WHERE cls != 250`. The
-Albers-to-degrees step becomes `to_lat`/`to_lon` UDFs over the `y`/`x` columns, the same
-pattern as `to_lonlat_<i>` in `xsql-s1m-h3.py`.
+**A zero-row table kills deck.** Used to blank the layer on a resolution change; the map went
+white on the first zoom and did not come back on a re-run. `infer_rows_per_chunk` also
+returns 0 for it and lonboard asserts `max_chunksize > 0`. Blanking now goes through the
+1-row seed table the layer is constructed with, which is the only shape known to survive.
 
-Reprojection detail: exact pyproj on a 64x64 control grid plus bilinear interpolation is
-within ~100 m of a per-pixel transform over CONUS, which is a fraction of a pixel at these
-levels. 4096 pyproj calls instead of 35 million.
+**geoarrow: `from_wkb` alone is not enough.** It yields the generic `geoarrow.geometry`
+union and lonboard rejects it with "Expected one of geoarrow.polygon, geoarrow.multipolygon".
+Needs `to_type=multipolygon("xy", crs="EPSG:4326")`. A *single* polygon downcasts on its own,
+which is why a one-geometry test passed and the real fold did not. Passing the crs also stops
+lonboard warning that it cannot tell whether the data is WGS84. And `pa.array(geo_array)`
+**strips the extension metadata** -- build the table with `ArroArray.from_arrow` /
+`ArroTable.from_arrays`.
 
-## Two traps worth remembering
+**marimo does not render classic ipywidgets.** `ipywidgets.HTML` produces a "please migrate
+this widget to anywidget" banner. It still *serialises* into `marimo export html`, so the
+headless check does not catch it. Replaced with a ~12-line `anywidget.AnyWidget` carrying a
+synced `traitlets.Unicode`.
 
-**1. `first_value(... ORDER BY n DESC)` is non-deterministic on ties.** Two folds that
-produced byte-identical hex columns disagreed on `mode_cls` until the tie-break was made
-explicit:
+**`Map(show_tooltip=True)` is hover; `show_side_panel` (default True) is click.**
+`show_tooltip` defaults to False, so inspection is click-only until you set it.
 
-```sql
-first_value(cls ORDER BY n DESC, cls ASC) AS mode_cls
-```
+**Positron labels over the hexes** need to be a deck layer, not the basemap: the basemap
+paints under every deck layer, so place names on it sit beneath an opaque cell. Carto serves
+the `positron-labels-only` style as `light_only_labels`; `@2x` with `tile_size=512`.
 
-This is a categorical-raster problem specifically. A 2-2 split between two classes in a
-cell is common, and without the tie-break the map changes between runs.
+## Stale state is the recurring failure mode
 
-**2. Parent rollup is not exact.** Folding at res 7 and rolling up to res 6 with
-`change_resolution` is 17x faster (0.13 s vs 2.27 s) but gives a different answer:
-218,682 cells against the direct fold's 218,628. H3 parent-of-centroid is not exact
-containment, so pixels near cell edges land in a different parent than a direct fold puts
-them in. If the levels must agree, recompute each one from the raster.
+Everything the camera drives is asynchronous, so anything left on screen from the previous
+fold is a lie that looks like a bug:
 
-## The empty-cell cliff
+- **Stale cells.** Zoom in and the old coarse cells sit at the wrong size; zoom OUT and the
+  old FINE cells are suddenly sub-pixel and alias into a black mush that reads as corruption.
+  Handled by blanking on a resolution change, plus a per-resolution cache so returning to a
+  level already folded is a dict lookup rather than a read.
+- **Stale outlines.** The wash/outline is dissolved from one fold's cells. When different
+  cells go up it is stale, and it does not *look* stale: it is clean lines in the right
+  colours over the wrong place, or a flat tint with a straight edge where the old padded box
+  stopped, which reads as a rectangular distortion across the map. `_show` now hides the
+  outline layer every time it paints cells.
 
-Which overview supports which resolution. "Coverage" is cells found against
-(CONUS area / average cell area); "1-px cells" is the share of cells holding a single
-pixel, which is the signature of a grid too fine for its source.
+`SETTLE = 0.25` debounces the camera, since every fold is a network read. Verified in
+isolation: a 120-event 60fps drag produces one fold, of the final position. No threads, no
+timers -- the debounce is an await on the kernel's own loop.
 
-```
- 960m -> res6:    218,506 cells | coverage 102.9% | 1-px   0.1%
- 960m -> res7:  1,521,538 cells | coverage 102.4% | 1-px   0.1%
- 960m -> res8:  8,584,126 cells | coverage  82.5% | 1-px  97.9%   <- holes
- 480m -> res7:  1,522,443 cells | coverage 102.5% | 1-px   0.0%
- 480m -> res8: 10,635,430 cells | coverage 102.3% | 1-px   0.1%
- 480m -> res9: 35,067,095 cells | coverage  48.2% | 1-px 100.0%   <- holes
- 240m -> res8: 10,639,312 cells | coverage 102.3% | 1-px   0.0%
- 240m -> res9: 74,415,097 cells | coverage 102.2% | 1-px  24.7%
- 240m -> res10:140,284,941 cells| coverage  27.5% | 1-px 100.0%   <- holes
-```
+## Open
 
-The cliff is sharp. Each overview supports exactly one resolution past the obvious
-pairing and then collapses. Go finer than the source supports and the map gets holes,
-because no pixel centre lands inside those cells. The native 30 m data tops out somewhere
-around res 11 (cell edge ~25 m).
+- **A glitch on zoom remains, unresolved.** Reported repeatedly: wrong resolution and
+  incomplete coverage, transiently. The blanking and the cache reduce it but do not remove
+  it. Not diagnosed.
+- `VIEW_W, VIEW_H = 1400, 620` is an **assumption** about the map's pixel size, not a
+  measurement. If the real viewport is wider, the folded box is smaller than the screen and
+  the edges go unfilled permanently. Worth reading the real size back from the browser.
+- `_note_jump` counts camera moves too large to be a drag and names where they went, to
+  separate "a marimo cell re-ran and rebuilt the Map" from a JS-side camera move. It has not
+  yet been used in anger.
+- lonboard hands deck an **uncontrolled `initialViewState`** from the same model
+  `onViewStateChange` writes back to every frame. A stale echo would snap the camera. This is
+  a candidate for the jumps, not a measurement.
 
-H3 average cell areas at CONUS latitude, for reference: res 5 = 266 km2, res 6 = 38.0,
-res 7 = 5.44, res 8 = 0.777, res 9 = 0.111, res 10 = 0.0159.
+## Process notes
 
-## lonboard API gotchas hit along the way
+Two habits caused most of the damage in the rebuild, and both are cheap to avoid:
 
-- `basemap=` wants `MaplibreBasemap(style=CartoBasemap.X)` in 0.16, not the bare enum.
-- `async_geotiff` reads want `Window(col_off=, row_off=, width=, height=)`. Passing a
-  bare `(r0, r1, c0, c1)` tuple is silently misread as col_off/row_off/width/height and
-  starts pulling most of CONUS. This looks exactly like a network hang.
-- The layer's `table` trait coerces anything arrow-ish in `__init__` but `validate()` is a
-  strict `isinstance(value, arro3.core.Table)`. An assignment that works at construction
-  fails afterwards. Convert with `ArroTable.from_arrow(...)`.
-- lonboard refuses to serialize a zero-row table, so there is no empty placeholder.
-- All columns must agree about chunking. DataFusion returns many chunks and
-  numpy-derived columns return one, so `combine_chunks()` first.
-
-## If picked up again
-
-Start from the pieces, not the notebook. In rough order of what would settle the design:
-
-1. Find what kills the map. Try res 6 only, pitch 0, and a single assignment site for the
-   layer traits, then add back.
-2. Decide what carries purity once the map is flat. Height is gone; opacity is the
-   obvious substitute and it stacks with hue without adding a colour axis.
-3. `h3ronpy.raster.raster_to_dataframe` was never benchmarked against the SQL fold. It is
-   thread-pooled in Rust and goes array to H3 table in one call. It might make the whole
-   `to_lat`/`to_lon` UDF layer unnecessary, at the cost of the SQL being the point.
-4. The time axis is the interesting thing here and is untouched. 40 years on an identical
-   grid means a cell folded once is folded for every year, and `LndChg`/`SpcChg` are
-   pre-computed change products. A year slider over stable cells is a different and
-   better app than a zoom demo.
+1. **A headless `marimo export html` that exits 0 proves the Python ran, and nothing else.**
+   It caught neither the 90x serialization blowup, nor the ipywidgets banner, nor any visual
+   problem. The 126 MB export file *was* the blowup, sitting in plain sight, dismissed
+   without being opened.
+2. **Computed estimates were presented in tables that read as measurements.** Say which is
+   which, or measure it.

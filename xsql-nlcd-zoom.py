@@ -59,18 +59,21 @@ def _():
     import numpy as np
     import pyarrow as pa
     import xarray as xr
-    from arro3.core import Table as ArroTable
+    from arro3.core import Array as ArroArray, Table as ArroTable
     from pyproj import Transformer
     from obstore.store import S3Store
     from async_geotiff import GeoTIFF, Window
     from datafusion import udf
     from xarray_sql import XarrayContext
-    from h3ronpy.vector import coordinates_to_cells
-    from lonboard import Map, H3HexagonLayer, BitmapTileLayer
+    from h3ronpy import grid_disk
+    from h3ronpy.vector import cells_to_wkb_polygons, coordinates_to_cells
+    from geoarrow.rust.core import from_wkb, multipolygon
+    from lonboard import Map, H3HexagonLayer, BitmapTileLayer, PolygonLayer
     from lonboard.basemap import CartoBasemap, MaplibreBasemap
     from lonboard._serialization import infer_rows_per_chunk
 
     return (
+        ArroArray,
         ArroTable,
         BitmapTileLayer,
         CartoBasemap,
@@ -78,16 +81,21 @@ def _():
         H3HexagonLayer,
         Map,
         MaplibreBasemap,
+        PolygonLayer,
         S3Store,
         Transformer,
         Window,
         XarrayContext,
         anywidget,
         asyncio,
+        cells_to_wkb_polygons,
         coordinates_to_cells,
+        from_wkb,
+        grid_disk,
         infer_rows_per_chunk,
         math,
         mo,
+        multipolygon,
         np,
         pa,
         traitlets,
@@ -157,6 +165,26 @@ def _(math):
     # folding 1.8x what you can see; 1.8 would mean 3.2x.
     PAD = 1.35
 
+    # CLUSTER WASH. A run of touching cells of the same class, dissolved into one polygon
+    # with cells_to_wkb_polygons(link_cells=True) and laid over the hexes as a faint tint in
+    # the class's own colour. Both of these are meant to be turned.
+    #
+    # MIN_CLUSTER is the one that matters. Land cover is mostly speckle, so dissolving
+    # everything gives thousands of scraps: at res 8 over a full viewport, measured,
+    #   min run     1 ->  43,329 polygons  13.2 MB  22.5 s   (unusable)
+    #   min run    20 ->   1,153 polygons   5.2 MB   1.9 s
+    #   min run   100 ->     181 polygons   3.6 MB   1.3 s
+    #   min run   500 ->      34 polygons   2.5 MB   1.0 s
+    #   min run  2000 ->       8 polygons   1.8 MB   0.7 s
+    # The polygon count collapses 1,200x while the cells covered only halve, because nearly
+    # all of those runs are a handful of cells. 500 leaves the genuinely large regions.
+    MIN_CLUSTER = 50
+    CLUSTER_OPACITY = 0.75
+    CLUSTER_WIDTH = 2  # stroke width in screen pixels
+    # 1.0 is the class colour exactly. Lower values darken the edge; below about 0.6 every
+    # class collapses toward black and the outlines stop telling each other apart.
+    CLUSTER_DARKEN = 1.0
+
     # Seconds of camera quiet before a fold starts. Every fold is now an object-store read,
     # so rapid back-and-forth should read once at the end, not at every position it passed
     # through. Set to 0 to fold on every event.
@@ -180,34 +208,44 @@ def _(math):
     def res_for_zoom(z):
         return max(MIN_RES, min(MAX_RES, BASE_RES + math.floor((z - ZOOM0) / PER_RES)))
 
-    # 16 NLCD classes in 7 groups on a teal-to-brown axis, water blue, developed carried
-    # by luminance. NLCD's own palette is green forest against red developed, which is the
-    # one pairing that carries nothing for a deuteranope, so it is never drawn.
+    # NLCD'S OWN COLORMAP, read out of the COG itself (`GeoTIFF.colormap.as_dict()`) and
+    # written down here so the legend and the fill cannot drift apart.
+    #
+    # The palette this replaced was invented here, on a teal-to-brown axis, with the three
+    # forest classes separated by lightness. That put DECIDUOUS FOREST at luminance 0.103
+    # and evergreen at 0.034, and deciduous forest is 39.7% of the cells over the
+    # southeast: 52% of the map came out below 0.18 luminance, so the map read as black
+    # with everything else apparently outlined in it. NLCD puts deciduous at 0.329.
+    # Lightness was the whole problem; the hues were never the point.
     GROUPS = {
-        11: ("Water", (8, 48, 107)),
-        12: ("Ice", (158, 202, 225)),
-        21: ("Developed, open", (215, 215, 215)),
-        22: ("Developed, low", (160, 160, 160)),
-        23: ("Developed, medium", (99, 99, 99)),
-        24: ("Developed, high", (37, 37, 37)),
-        31: ("Barren", (222, 217, 204)),
-        41: ("Deciduous forest", (1, 102, 94)),
-        42: ("Evergreen forest", (0, 60, 48)),
-        43: ("Mixed forest", (53, 151, 143)),
-        52: ("Shrub", (128, 205, 193)),
-        71: ("Herbaceous", (199, 234, 229)),
-        81: ("Pasture", (223, 194, 125)),
-        82: ("Cropland", (191, 129, 45)),
-        90: ("Woody wetland", (67, 147, 195)),
-        95: ("Herbaceous wetland", (146, 197, 222)),
+        11: ("Water", (70, 107, 159)),
+        12: ("Ice/Snow", (209, 222, 248)),
+        21: ("Developed, open", (222, 197, 197)),
+        22: ("Developed, low", (217, 146, 130)),
+        23: ("Developed, medium", (235, 0, 0)),
+        24: ("Developed, high", (171, 0, 0)),
+        31: ("Barren", (179, 172, 159)),
+        41: ("Deciduous forest", (104, 171, 95)),
+        42: ("Evergreen forest", (28, 95, 44)),
+        43: ("Mixed forest", (181, 197, 143)),
+        52: ("Shrub", (204, 184, 121)),
+        71: ("Herbaceous", (223, 223, 194)),
+        81: ("Pasture/Hay", (220, 217, 57)),
+        82: ("Cultivated crops", (171, 108, 40)),
+        90: ("Woody wetland", (184, 217, 235)),
+        95: ("Herbaceous wetland", (108, 159, 184)),
     }
     # One year, pinned. The slider is out until the camera path is proven: a year change
     # is a fresh read of the whole country, and there is no point putting that behind a
     # control while the thing it feeds is still the open question.
     YEAR = 2024
     return (
+        CLUSTER_DARKEN,
+        CLUSTER_OPACITY,
+        CLUSTER_WIDTH,
         GROUPS,
         LEVEL_FOR_RES,
+        MIN_CLUSTER,
         NODATA,
         PAD,
         PREFIX,
@@ -232,6 +270,7 @@ def _():
         "extent": None,  # the raster's Albers bounds, to clamp against
         "res": None,  # H3 resolution currently on screen
         "box": None,  # padded Albers box the current hexes cover
+        "cache": {},  # res -> (box, table): a zoom back out to a level already folded
         "busy": False,  # a fold is running
         "pending": None,  # newest camera position seen while busy, folded next
         "jumps": 0,  # camera moves too big to be a drag; see _note_jump
@@ -243,7 +282,18 @@ def _():
 
 
 @app.cell
-def _(ArroTable, GROUPS, coordinates_to_cells, np, pa):
+def _(
+    ArroArray,
+    ArroTable,
+    GROUPS,
+    cells_to_wkb_polygons,
+    coordinates_to_cells,
+    from_wkb,
+    grid_disk,
+    multipolygon,
+    np,
+    pa,
+):
     _lut = np.full((256, 3), 120, dtype=np.uint8)
     for _c, (_lbl, _rgb) in GROUPS.items():
         _lut[_c] = _rgb
@@ -271,6 +321,96 @@ def _(ArroTable, GROUPS, coordinates_to_cells, np, pa):
             )
         )
 
+    def to_cluster_table(tbl, min_cluster, darken=1.0):
+        """Runs of touching like cells, dissolved into one polygon each.
+
+        `cells_to_wkb_polygons(..., link_cells=True)` does the dissolve AND the connected
+        -component split in one call: neighbours merge, disconnected groups come back as
+        separate polygons. The union-find here is only to get run SIZES, so the speckle can
+        be dropped before dissolving. That ordering is the whole performance story: 22.5 s
+        and 43,329 polygons if everything is dissolved, 1.0 s and 34 at min run 500.
+
+        Returned as arro3 arrays, not pyarrow: pa.array() strips the geoarrow extension
+        metadata off the geometry and lonboard's table trait rejects it as "expected
+        geometry column in table".
+        """
+        hx = np.asarray(tbl["hex"])
+        cs = np.asarray(tbl["mode_cls"])
+        n = len(hx)
+        if n == 0:
+            return None
+
+        # k=1 ring -> adjacency between cells that are BOTH present and the same class.
+        flat = np.asarray(grid_disk(hx, 1, flatten=True))
+        per = len(flat) // n
+        src = np.repeat(np.arange(n), per)
+        order = np.argsort(hx)
+        pos = np.clip(np.searchsorted(hx[order], flat), 0, n - 1)
+        dst = order[pos]
+        keep = hx[dst] == flat
+        src, dst = src[keep], dst[keep]
+        keep = cs[src] == cs[dst]
+        src, dst = src[keep], dst[keep]
+        keep = src < dst  # grid_disk emits each adjacency twice; one direction is enough
+        src, dst = src[keep], dst[keep]
+
+        parent = np.arange(n)
+
+        def _find(a):
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]  # path halving
+                a = parent[a]
+            return a
+
+        for a, b in zip(src.tolist(), dst.tolist()):
+            ra, rb = _find(a), _find(b)
+            if ra != rb:
+                parent[ra] = rb
+        roots = np.fromiter((_find(i) for i in range(n)), np.int64, n)
+        _, inv, counts = np.unique(roots, return_inverse=True, return_counts=True)
+
+        big = counts[inv] >= min_cluster
+        if not big.any():
+            return None
+
+        wkbs, colors = [], []
+        for c in np.unique(cs[big]):
+            sub = hx[big & (cs == c)]
+            w = pa.array(cells_to_wkb_polygons(sub, link_cells=True))
+            wkbs.append(w)
+            colors.append(np.tile(_lut[c], (len(w), 1)))
+            # darkened edge, off for now:
+            # colors.append(np.tile((_lut[c] * darken).astype(np.uint8), (len(w), 1)))
+        # to_type is required, not cosmetic: from_wkb alone yields the generic
+        # `geoarrow.geometry` union and lonboard rejects it with "Expected one of
+        # geoarrow.polygon, geoarrow.multipolygon". A single polygon happens to downcast
+        # on its own, which is why a one-geometry test passed and the real data did not.
+        # The crs also stops lonboard warning that it cannot tell whether this is WGS84.
+        geom = from_wkb(
+            pa.concat_arrays(wkbs), to_type=multipolygon("xy", crs="EPSG:4326")
+        )
+        rgb = np.concatenate(colors).astype(np.uint8)
+        return ArroTable.from_arrays(
+            [
+                ArroArray.from_arrow(geom),
+                ArroArray.from_arrow(
+                    pa.FixedSizeListArray.from_arrays(pa.array(rgb.ravel()), 3)
+                ),
+            ],
+            names=["geometry", "color"],
+        )
+
+    def seed_cluster():
+        """Two touching cells so the PolygonLayer can be built before any fold has run.
+        min_cluster=0 dissolves them into one off-screen polygon; the layer starts
+        visible=False and is switched on when a real fold produces some."""
+        cells = np.asarray(
+            coordinates_to_cells(np.array([0.0, 0.0]), np.array([0.0, 0.0001]), 5)
+        )
+        return pa.table(
+            {"hex": pa.array(np.unique(cells)), "mode_cls": pa.array([41] * len(np.unique(cells)))}
+        )
+
     def seed_table():
         # One hexagon at null island, in the basemap's own dark, so the Map has a valid
         # table at build time. The first camera event replaces it. This is what lets the
@@ -290,18 +430,23 @@ def _(ArroTable, GROUPS, coordinates_to_cells, np, pa):
             )
         )
 
-    return seed_table, to_layer_table
+    return seed_cluster, seed_table, to_cluster_table, to_layer_table
 
 
 @app.cell
 def _(
     BitmapTileLayer,
+    CLUSTER_DARKEN,
+    CLUSTER_OPACITY,
+    CLUSTER_WIDTH,
     CartoBasemap,
     H3HexagonLayer,
     HOLD,
+    MIN_CLUSTER,
     Map,
     MaplibreBasemap,
     PAD,
+    PolygonLayer,
     SETTLE,
     Status,
     VIEW_H,
@@ -310,7 +455,9 @@ def _(
     infer_rows_per_chunk,
     math,
     res_for_zoom,
+    seed_cluster,
     seed_table,
+    to_cluster_table,
     to_layer_table,
 ):
     # Built exactly once. This cell depends on no control and on no state the camera can
@@ -324,6 +471,7 @@ def _(
         table=_seed,
         get_hexagon=_seed["hex"],
         get_fill_color=_seed["color"],
+        # get_line_color=_seed["color"],
         extruded=False,
         stroked=False,
         high_precision=True,
@@ -339,6 +487,27 @@ def _(
     # pickable=False so it never intercepts a hover meant for the cell underneath, and
     # @2x with tile_size 512 because the default 256 would sample retina tiles at half
     # scale and the type would blur.
+    # The cluster wash: one dissolved polygon per large run of like cells, filled in that
+    # class's own colour at CLUSTER_OPACITY over the hexes. Starts invisible and is switched
+    # on the first time a fold produces polygons, so it never has to hold a placeholder
+    # geometry. pickable=False so it never intercepts a hover meant for a cell.
+    # ONE OUTLINE PER CLUSTER, not per cell. The earlier attempt stroked every rim CELL and
+    # came out a honeycomb over the whole map; this strokes the DISSOLVED boundary, so a run
+    # of 40,000 cells is a single line. Not filled: the polygon is exactly the cells beneath
+    # it, so a fill in their own colour cannot be seen at any opacity.
+    _cseed = to_cluster_table(seed_cluster(), 0, CLUSTER_DARKEN)
+    clusters = PolygonLayer(
+        table=_cseed,
+        get_fill_color=_cseed["color"],
+        get_line_color=_cseed["color"],
+        filled=True,
+        stroked=True,
+        line_width_min_pixels=CLUSTER_WIDTH,
+        opacity=CLUSTER_OPACITY,
+        pickable=False,
+        visible=False,
+    )
+
     labels = BitmapTileLayer(
         data="https://basemaps.cartocdn.com/light_only_labels/{z}/{x}/{y}@2x.png",
         tile_size=512,
@@ -348,7 +517,7 @@ def _(
         pickable=False,
     )
     deck = Map(
-        [layer, labels],
+        [layer, clusters, labels],
         basemap=MaplibreBasemap(style=CartoBasemap.PositronNoLabels),
         view_state={"longitude": -98.5, "latitude": 39.5, "zoom": 3.8},
         height=VIEW_H,
@@ -387,48 +556,111 @@ def _(
             and outer[3] >= inner[3]
         )
 
-    async def _draw(vs, force):
-        """One read + fold, or nothing if this view is already covered."""
-        res = res_for_zoom(vs.zoom)
-        want = HOLD["to_albers"](_pad(view_to_bbox(vs)))
-        if (
-            not force
-            and res == HOLD["res"]
-            and HOLD["box"]
-            and _covers(HOLD["box"], HOLD["to_albers"](view_to_bbox(vs)))
-        ):
-            return
-        status.value = f"<b>reading…</b> res {res}"
-        raw, m_px, read_px = await HOLD["fold"](res, want)
-        if raw is None or raw.num_rows == 0:
-            status.value = f"<b>res {res}</b> · nothing here · zoom {vs.zoom:.1f}"
-            HOLD["res"], HOLD["box"] = res, want
-            return
-        tbl = to_layer_table(raw)
-
+    def _show(tbl, res, box, note):
+        """Put a table on the layer and record what it is. The ONLY place that paints."""
         # RECOMPUTE THIS BEFORE EVERY ASSIGNMENT. lonboard infers _rows_per_chunk in
         # __init__ ONLY (layer/_base.py:397) and never again, but every later assignment
         # still rechunks through it (traits/_table.py:106, _h3.py:130, _color.py:140) and
         # writes ONE PARQUET FILE PER CHUNK. Built against a 1-row seed table,
         # infer_rows_per_chunk returns 1, that 1 is latched for the life of the layer, and
-        # each fold then serialises one Parquet file PER HEXAGON. Measured over the four
-        # folds of a zoom-in: 621.94 MB in 673,581 Parquet files, against 6.89 MB in 12
-        # with this line. That is the whole difference between a live map and a machine
-        # that has to be restarted.
-        layer._rows_per_chunk = infer_rows_per_chunk(tbl)
-
+        # each fold then serialises one Parquet file PER HEXAGON. Measured over four folds
+        # of a zoom-in: 621.94 MB in 673,581 Parquet files, against 6.89 MB in 12 with this
+        # line. That is the difference between a live map and a machine that gets restarted.
+        # max(1, ...): infer_rows_per_chunk returns 0 for an empty table, and lonboard
+        # asserts max_chunksize > 0 on the way out.
+        layer._rows_per_chunk = max(1, infer_rows_per_chunk(tbl))
         # Held together so deck sees one update rather than a frame with a new table
         # against the old hexagon column.
         with layer.hold_trait_notifications():
             layer.table = tbl
             layer.get_hexagon = tbl["hex"]
             layer.get_fill_color = tbl["color"]
-        HOLD["res"], HOLD["box"] = res, want
-        status.value = (
+        # THE OUTLINES DIE WITH THE CELLS THEY DESCRIBED. They are dissolved from one
+        # fold's cells, so the moment different cells go up they are stale, and stale
+        # outlines do not look stale: they are clean lines in the right colours sitting over
+        # the wrong place. Hiding here means the only outlines ever visible are ones built
+        # from the cells underneath them.
+        clusters.visible = False
+        HOLD["res"], HOLD["box"] = res, box
+        status.value = note
+
+    async def _draw(vs, force):
+        """Make the screen authoritative for THIS view: cache hit, or clear and refold."""
+        res = res_for_zoom(vs.zoom)
+        seen = HOLD["to_albers"](view_to_bbox(vs))
+        want = HOLD["to_albers"](_pad(view_to_bbox(vs)))
+
+        # Already correct for this view.
+        if (
+            not force
+            and res == HOLD["res"]
+            and HOLD["box"]
+            and _covers(HOLD["box"], seen)
+        ):
+            return
+
+        # A resolution we have folded before, still covering the screen. This is the whole
+        # zoom-out case: coming back up to a level already visited is a dict lookup, not a
+        # read, so it lands complete and instantly instead of arriving a second later.
+        hit = HOLD["cache"].get(res)
+        if not force and hit and _covers(hit[0], seen):
+            _show(
+                hit[1],
+                res,
+                hit[0],
+                f"<b>res {res}</b> · {hit[1].num_rows:,} cells · cached"
+                f" · zoom {vs.zoom:.1f} · {HOLD['source']}",
+            )
+            return
+
+        # NOTHING ON SCREEN MAY OUTLIVE ITS RESOLUTION. Leaving the previous fold up for the
+        # duration of the read is what produces the two complaints: zoom IN and the old
+        # coarse cells sit there at the wrong size, zoom OUT and the old FINE cells are
+        # suddenly sub-pixel, which aliases into a black mush that looks like corruption.
+        # Neither is data; both are the last answer overstaying.
+        #
+        # Cleared with seed_table(), NOT an empty one. A zero-row table blanked the map and
+        # then killed deck outright, and it did not come back on a re-run. seed_table is the
+        # single off-screen hexagon the layer is CONSTRUCTED with, so it is the one shape
+        # known to survive; at null island it is never in a CONUS view.
+        if res != HOLD["res"]:
+            _show(seed_table(), None, None, f"<b>reading…</b> res {res} · zoom {vs.zoom:.1f}")
+        else:
+            status.value = f"<b>reading…</b> res {res} · zoom {vs.zoom:.1f}"
+
+        raw, m_px, read_px = await HOLD["fold"](res, want)
+        if raw is None or raw.num_rows == 0:
+            HOLD["res"], HOLD["box"] = res, want
+            status.value = f"<b>res {res}</b> · nothing here · zoom {vs.zoom:.1f}"
+            return
+        tbl = to_layer_table(raw)
+        HOLD["cache"][res] = (want, tbl)
+        _show(
+            tbl,
+            res,
+            want,
             f"<b>res {res}</b> · {tbl.num_rows:,} cells · {m_px:.0f} m"
             f" · {read_px / 1e6:.2f}M px read · zoom {vs.zoom:.1f} · {HOLD['source']}"
-            + (f" · <b style='color:#E69F00'>{HOLD['jumps']} jumps</b>" if HOLD["jumps"] else "")
+            + (f" · <b style='color:#E69F00'>{HOLD['jumps']} jumps</b>" if HOLD["jumps"] else ""),
         )
+
+        # THE CELLS GO OUT FIRST, ON THEIR OWN. The cluster pass costs about 1.5 s at res 8
+        # (0.5 union-find, 1.0 dissolve) and the map is already showing the previous fold
+        # for the whole read; making the cells wait on the wash would lengthen exactly the
+        # window that reads as a glitch. sleep(0) hands the loop back so the cells actually
+        # reach the browser before the dissolve blocks it again.
+        await asyncio.sleep(0)
+        if HOLD["pending"] is not None:
+            return  # camera moved on; this wash would be for a view that is gone
+        ctbl = to_cluster_table(raw, MIN_CLUSTER, CLUSTER_DARKEN)
+        if ctbl is None:
+            clusters.visible = False
+            return
+        clusters._rows_per_chunk = max(1, infer_rows_per_chunk(ctbl))
+        with clusters.hold_trait_notifications():
+            clusters.table = ctbl
+            clusters.get_line_color = ctbl["color"]
+            clusters.visible = True
 
     async def refresh(vs, force=False):
         """Fold what the camera is looking at, once it has stopped moving.
