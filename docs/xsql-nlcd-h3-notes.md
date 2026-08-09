@@ -175,29 +175,64 @@ timers -- the debounce is an await on the kernel's own loop.
 
 ## Open
 
-- **TODO: find more use for the multipolygons.** The dissolve already produces real
-  geometry, one polygon per contiguous run of like cells, and right now it is spent
-  entirely on drawing: a fill and an outline. That is the least it could be. The polygons
-  carry area, perimeter, holes, neighbours and containment, none of which the hexagons can
-  answer on their own, and they are built for free as a side effect of a fold that has
-  already happened. Directions, none of them picked:
-  - **Measure them.** Area per class per view, patch-size distributions, the largest
-    contiguous run on screen. Landscape ecology reads this way already (patch area, edge
-    density, contagion), and the numbers fall out of geometry that exists.
-  - **Fragmentation as the thing rendered.** Perimeter over area, or run count per unit
-    area, is a different map from land cover: how broken up a class is, rather than what
-    class is present. Same fold, different question.
-  - **Query targets.** A dissolved polygon is a natural AOI. Click a forest run and it
-    becomes the boundary for the next read: elevation inside it, imagery clipped to it, a
-    join against Overture footprints that fall in it.
-  - **Holes are information.** A hole in a crop polygon is a town, a lake, a woodlot.
-    `cells_to_wkb_polygons(link_cells=True)` already returns interior rings and nothing
-    downstream looks at them.
-  - **Across years.** The year is pinned at 2024 with the slider deliberately out. Two
-    years of the same AOI dissolved and overlaid is change as geometry: what a run gained,
-    lost, or split into, rather than a per-cell diff.
-  - **Export.** They are proper WKB polygons and could leave the notebook as GeoParquet or
-    FlatGeobuf, which makes the fold a data product rather than a picture.
+## TODO: analytics
+
+Nothing here is started. Written down so the framing survives, not as a plan.
+
+### What the polygons are actually for
+
+**Hexagons are a sample grid. Polygons are objects.** A cell knows what class it is; it
+does not know what it is part of. That line decides which questions need the dissolve and
+which do not, and it is worth checking against before building anything:
+
+- **Cells answer these, cheaper and better.** How much of each class is on screen. Purity.
+  Anything joined on cell id at any resolution, including another dataset folded to the
+  same grid. Year-on-year change as a per-cell diff. If the analytic is area or
+  composition, the polygons add NOTHING and are decoration.
+- **Only objects answer these.** How many separate forests, rather than how much forest.
+  The size distribution of those patches. Whether a class is one block or ten thousand
+  scraps, which is invisible in a class total: two views can have identical composition and
+  completely different structure. What borders what, and over how much edge. What is
+  enclosed by what. Whether two areas are connected, which is the union-find already
+  running in `to_cluster_table` and thrown away after it is used to drop speckle.
+
+### The caveat that would quietly corrupt half of it
+
+**The polygon boundaries are hex staircases, not real edges.** Area is trustworthy: it is
+the cell count. **Perimeter is not.** The zigzag inflates it by a factor that depends on
+resolution, so perimeter-to-area ratios are comparable WITHIN a resolution and misleading
+ACROSS one. Any fragmentation metric either normalises for this or stays inside one res.
+Anything that reports a perimeter in metres without saying this is lying politely.
+
+### The ladder, cheapest first
+
+1. **A stats line for the current view.** START HERE. Class composition, patch count,
+   largest run, all from tables already in memory: no new read, no new geometry, and it
+   answers whether the patch numbers are interesting enough to justify the rest. The signal
+   to look for is the ratio of patches to cells: at res 8 over one viewport, min run 1 gives
+   43,329 polygons against 176,539 cells; at res 5 over the whole country, 1,774. That ratio
+   IS the fragmentation signal and nothing currently reads it.
+2. **Hover or click a cluster.** Its class, area in km², its rank by size, its hole count.
+   The polygons are already there; `pickable=False` only to keep hovers off the cells.
+3. **A distribution, rendered.** Patch sizes as a small chart under the map. This is where
+   speckle-versus-structure becomes visible rather than a number.
+4. **Fragmentation as the fill colour.** Recolour clusters by patch density or size instead
+   of class, so the map answers "how broken up is this" rather than "what is here". Same
+   fold, different question. A lightness ramp suits it and stays colourblind-safe.
+5. **Two years overlaid.** The expensive one: a second read of everything. Change as
+   geometry (what a run gained, lost, or split into) rather than as a cell diff. The year is
+   pinned at 2024 with the slider deliberately out, so this is a decision, not an omission.
+
+### Also open, unranked
+
+- **Query targets.** A dissolved run is a natural AOI: click a forest and it becomes the
+  boundary for the next read. Elevation inside it, imagery clipped to it, an Overture join
+  against the footprints that fall in it.
+- **Holes are information.** A hole in a crop polygon is a town, a lake, a woodlot.
+  `cells_to_wkb_polygons(link_cells=True)` already returns interior rings and nothing
+  downstream looks at them.
+- **Export.** They are proper WKB polygons and could leave as GeoParquet or FlatGeobuf,
+  which makes the fold a data product rather than a picture.
 
 - **A glitch on zoom remains, unresolved.** Reported repeatedly: wrong resolution and
   incomplete coverage, transiently. The blanking and the cache reduce it but do not remove
