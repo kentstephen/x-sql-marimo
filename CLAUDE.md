@@ -3,6 +3,13 @@
 Guidance for Claude Code working in this repository. Inherits the global rules in
 `~/CLAUDE.md` (tone, no em dashes, memory location, colorblind-safe encodings).
 
+## Repository layout
+
+`xsql-nlcd-zoom.py` is the notebook this repo is for. Everything else that was built
+along the way lives in `archive/` (earlier notebooks, the Overture and NAIP helpers, the
+lonboard patch script) and is kept for reference, not maintained. The published notebook
+imports none of it: its only dependencies are the third-party ones in its PEP 723 header.
+
 ## Project overview
 
 A marimo notebook to **free-fly across the USA**: draw a box anywhere on a map, and
@@ -38,7 +45,7 @@ overviews it needs; DataFusion + h3ronpy do the H3 aggregation as a SQL UDF; lon
 
 4. **Raster -> H3, in SQL.** For each valid pixel derive (lat, lng, elevation) from the
    COG geotransform, then aggregate with the DataFusion UDF already in
-   `xsql-dem-h3.py`: `h3_latlng_to_cell(lat, lng, res) -> UBIGINT`. Group by cell,
+   `archive/xsql-dem-h3.py`: `h3_latlng_to_cell(lat, lng, res) -> UBIGINT`. Group by cell,
    aggregate elevation (mean/min/max). This is the whole reason the repo exists (the
    `x-sql` / xarray-sql + DataFusion angle).
 
@@ -49,7 +56,7 @@ overviews it needs; DataFusion + h3ronpy do the H3 aggregation as a SQL UDF; lon
 
 ## H3 UDF (already present)
 
-`xsql-dem-h3.py` registers the DataFusion UDF via h3ronpy:
+`archive/xsql-dem-h3.py` registers the DataFusion UDF via h3ronpy:
 
 ```python
 from h3ronpy import cells_to_string
@@ -93,7 +100,7 @@ move fast.
 ### Required for every SurfaceLayer notebook
 
 ```bash
-uv run python tools/patch_lonboard_surface.py   # re-run after ANY install
+uv run python archive/tools/patch_lonboard_surface.py   # re-run after ANY install
 ```
 
 Without it the textured mesh comes back covered in pale quadrilateral facets. lonboard's
@@ -109,7 +116,7 @@ Full account in `docs/xsql-naip-drape-notes.md`.
 Layer `parameters` must use luma v9 names: `depthCompare` and `depthWriteEnabled`, not the
 WebGL-1 `depthTest`, which deck reads as nothing and silently leaves depth disabled.
 
-## Overture Maps (`overture_core.py`)
+## Overture Maps (`archive/overture_core.py`)
 
 Shared helpers for streaming Overture GeoParquet out of `overturemaps-us-west-2` with
 obstore. `THEMES` names every theme/type pair, so asking for several at once is a list.
