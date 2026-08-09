@@ -1610,7 +1610,8 @@ def _(GROUPS, controls, deck, mo, status):
                 + "".join(_sw)
                 + "</div>\n\nColour is the majority class in the cell; hover for its "
                 "**purity**. **Draw a box** (box button, bottom right) for 40 years of "
-                "analytics below."
+                "analytics below. For fullscreen use marimo's own control, not the map's: "
+                "the map's hides the legend and the layer controls with it."
             ),
             controls,
         ],
