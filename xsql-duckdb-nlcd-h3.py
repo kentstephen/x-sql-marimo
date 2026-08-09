@@ -384,7 +384,7 @@ def _(math):
     # landed a second after the cells they describe.
     #
     # Dissolving the PARENTS instead is the reachable half of AJ Friend's cells-to-polygon
-    # post (docs/aj-friend-cell-to-poly.md): his Gosper-island optimisation skips the
+    # post (ajfriend.com/blog/cells_to_poly): his Gosper-island optimisation skips the
     # internal edges of any group that compacts into a coarser cell. h3ronpy cannot do that
     # literally (link_cells refuses mixed resolutions), but coarsening buys the same thing.
     # Measured over one res-8 viewport:
