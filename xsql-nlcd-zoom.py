@@ -12,7 +12,7 @@
 #     "async-geotiff>=0.4",
 #     "lonboard>=0.16.0",
 #     "anywidget>=0.9",
-#     "numpy",
+#     "numpy==2.5.1",
 #     "pyproj>=3.7",
 #     "matplotlib==3.11.1",
 # ]
@@ -70,7 +70,7 @@ def _():
     from async_geotiff import GeoTIFF, Window
     from datafusion import udf
     from xarray_sql import XarrayContext
-    from h3ronpy import grid_disk
+    from h3ronpy import cells_resolution, change_resolution, grid_disk
     from h3ronpy.vector import cells_to_wkb_polygons, coordinates_to_cells
     from geoarrow.rust.core import from_wkb, multipolygon
     from lonboard import Map, H3HexagonLayer, BitmapTileLayer, PolygonLayer
@@ -93,7 +93,9 @@ def _():
         XarrayContext,
         anywidget,
         asyncio,
+        cells_resolution,
         cells_to_wkb_polygons,
+        change_resolution,
         coordinates_to_cells,
         from_wkb,
         grid_disk,
@@ -161,9 +163,9 @@ def _(anywidget, traitlets):
         function render({ model, el }) {
           const box = document.createElement("div");
           box.style.cssText =
-            "display:flex;flex-wrap:wrap;align-items:center;gap:.4rem 1.2rem;" +
-            "font:12.5px ui-sans-serif,system-ui,sans-serif;" +
-            "padding:.35rem 0 .1rem;user-select:none";
+            "display:flex;flex-wrap:nowrap;align-items:center;gap:.9rem;" +
+            "font:12px ui-sans-serif,system-ui,sans-serif;" +
+            "padding:.2rem 0 0;user-select:none;overflow:hidden";
 
           const check = (key, label) => {
             const l = document.createElement("label");
@@ -185,7 +187,7 @@ def _(anywidget, traitlets):
 
           const slider = (key, label) => {
             const w = document.createElement("span");
-            w.style.cssText = "display:inline-flex;align-items:center;gap:.4rem";
+            w.style.cssText = "display:inline-flex;align-items:center;gap:.35rem";
             const cap = document.createElement("span");
             const draw = () => {
               cap.textContent = label + " " + Number(model.get(key)).toFixed(2);
@@ -195,7 +197,7 @@ def _(anywidget, traitlets):
             s.type = "range";
             s.min = "0"; s.max = "1"; s.step = "0.05";
             s.value = model.get(key);
-            s.style.cssText = "width:7rem;margin:0;cursor:pointer";
+            s.style.cssText = "width:5rem;margin:0;cursor:pointer";
             s.addEventListener("input", () => {
               model.set(key, parseFloat(s.value));
               model.save_changes();
@@ -219,7 +221,7 @@ def _(anywidget, traitlets):
             s.type = "range";
             s.min = String(lo); s.max = String(hi); s.step = "1";
             s.value = model.get(key);
-            s.style.cssText = "width:7rem;margin:0;cursor:pointer";
+            s.style.cssText = "width:5rem;margin:0;cursor:pointer";
             s.addEventListener("input", () => { cap.textContent = label + " " + s.value; });
             s.addEventListener("change", () => {
               model.set(key, parseInt(s.value, 10));
@@ -238,19 +240,23 @@ def _(anywidget, traitlets):
             "font:11px ui-monospace,Menlo,monospace;letter-spacing:.06em;" +
             "text-transform:uppercase;opacity:.55";
           box.appendChild(head);
-          box.appendChild(check("cells", "H3 cells"));
-          box.appendChild(check("cluster_fill", "Cluster fill"));
-          box.appendChild(check("cluster_line", "Cluster outline"));
-          box.appendChild(slider("cell_opacity", "cell opacity"));
-          box.appendChild(slider("cell_coverage", "cell coverage"));
-          box.appendChild(slider("cluster_opacity", "cluster opacity"));
-          box.appendChild(steps("min_cluster", "min cluster", 1, 300));
+          box.appendChild(check("cells", "cells"));
+          box.appendChild(check("cluster_fill", "fill"));
+          box.appendChild(check("cluster_line", "outline"));
+          box.appendChild(slider("cell_opacity", "opacity"));
+          box.appendChild(slider("cell_coverage", "coverage"));
+          box.appendChild(slider("cluster_opacity", "outline alpha"));
+          box.appendChild(steps("min_cluster", "min run", 1, 300));
           el.appendChild(box);
         }
         export default { render };
         """
         cells = traitlets.Bool(True).tag(sync=True)
-        cluster_fill = traitlets.Bool(True).tag(sync=True)
+        # OFF by default now that the outline is dissolved on parent hexagons. The
+        # polygon is coarser than the cells and bulges past them, so filling it paints a
+        # class over cells that are not that class. As an outline it reads as "a region is
+        # about here"; as a fill it reads as data, and it would be wrong.
+        cluster_fill = traitlets.Bool(False).tag(sync=True)
         cluster_line = traitlets.Bool(True).tag(sync=True)
         cell_opacity = traitlets.Float(0.7).tag(sync=True)
         # Hexagon size as a fraction of the cell. 1.0 is edge to edge; below about
@@ -261,6 +267,9 @@ def _(anywidget, traitlets):
         # decides whether the fill-only view covers the map or leaves it nearly empty: at
         # 50, a whole-country fold produced 51 polygons, so turning the hexes off left
         # almost nothing on screen. Low values cover more and cost more, steeply.
+        # Counted in whatever `outline coarsen` is set to: cells at 0, parent hexagons
+        # above that, where one parent holds ~7 children. So dropping coarsen from 1 to 0
+        # means this wants to go up by roughly 7x to keep the same amount of speckle out.
         min_cluster = traitlets.Int(20).tag(sync=True)
 
     return (Controls,)
@@ -287,6 +296,9 @@ def _(math):
     # The map's pixel size, assumed. It only sets how much of the world the viewport box
     # covers, and PAD is deliberately loose, so being wrong by a few hundred pixels costs
     # a slightly larger query and nothing else.
+    # VIEW_H is also what the map is DRAWN at, so it decides whether the page scrolls.
+    # Status line, legend, caption and the control row come to roughly 150 px under it;
+    # 620 keeps the whole thing inside a laptop viewport without a scrollbar.
     VIEW_W, VIEW_H = 1400, 620
 
     # Fold a box larger than the screen, so a small pan lands inside what is already
@@ -313,6 +325,31 @@ def _(math):
     # 1.0 is the class colour exactly. Lower values darken the edge; below about 0.6 every
     # class collapses toward black and the outlines stop telling each other apart.
     CLUSTER_DARKEN = 2.5
+    # HOW MANY RESOLUTIONS COARSER THE OUTLINE IS DISSOLVED AT.
+    #
+    # Merging touching cells into one shape is the slowest thing the notebook does, and it
+    # is super-linear in cell count: 9.5k cells dissolve in 21 ms, 76k in 536 ms. One class
+    # over one viewport was 76,076 cells, so the whole wash cost 652 ms and the outlines
+    # landed a second after the cells they describe.
+    #
+    # Dissolving the PARENTS instead is the reachable half of AJ Friend's cells-to-polygon
+    # post (docs/aj-friend-cell-to-poly.md): his Gosper-island optimisation skips the
+    # internal edges of any group that compacts into a coarser cell. h3ronpy cannot do that
+    # literally (link_cells refuses mixed resolutions), but coarsening buys the same thing.
+    # Measured over one res-8 viewport:
+    #   0 (as before)  110,613 cells  277 polys  652 ms
+    #   1               22,738 cells  111 polys   30 ms
+    #   2                4,317 cells   66 polys    6 ms
+    # THE OUTLINE IS NOT THE EXACT CELL SET ANY MORE. A parent is included when ANY of its
+    # children are, so the boundary bulges outward by up to one parent hexagon and steps in
+    # bigger jumps. That is the trade: this layer says "roughly here is a region of this
+    # class", and the cells underneath remain exact.
+    # 0 = trace the exact cell set. DEFAULT, because anything else draws a line that is
+    # not where the data changes. Past zoom ~13.6 the resolution is capped at MAX_RES and
+    # the hexagons keep growing on screen, and there a parent-level outline visibly cuts
+    # THROUGH cells and encloses ones of other classes. It is a plausible trade only while
+    # the hexagons are small; the slider in the panel makes it a live choice.
+    OUTLINE_COARSEN = 0
 
     # Seconds of camera quiet before a fold starts. Every fold is now an object-store read,
     # so rapid back-and-forth should read once at the end, not at every position it passed
@@ -379,6 +416,7 @@ def _(math):
         CLUSTER_OPACITY,
         CLUSTER_WIDTH,
         GROUPS,
+        OUTLINE_COARSEN,
         LEVEL_FOR_RES,
         MIN_CLUSTER,
         NODATA,
@@ -432,7 +470,10 @@ def _(
     ArroArray,
     ArroTable,
     GROUPS,
+    OUTLINE_COARSEN,
+    cells_resolution,
     cells_to_wkb_polygons,
+    change_resolution,
     coordinates_to_cells,
     from_wkb,
     grid_disk,
@@ -467,7 +508,7 @@ def _(
             )
         )
 
-    def to_cluster_table(tbl, min_cluster, darken=1.0):
+    def to_cluster_table(tbl, min_cluster, darken=1.0, coarsen=OUTLINE_COARSEN):
         """Runs of touching like cells, dissolved into one polygon each.
 
         `cells_to_wkb_polygons(..., link_cells=True)` does the dissolve AND the connected
@@ -484,6 +525,32 @@ def _(
         cs = np.asarray(tbl["mode_cls"])
         if len(hx) == 0:
             return None
+
+        # THE WHOLE PASS RUNS ON PARENTS, not just the dissolve. Coarsening first is what
+        # makes this quick: the neighbour search and the union-find are the expensive part
+        # once the dissolve is cheap, and they both scale with cell count. One res-8
+        # viewport, measured end to end:
+        #   everything at res 8, dissolve at 7 :  adj 44 + union-find 224 + dissolve 33
+        #                                         = 301 ms
+        #   everything at res 7                :  coarsen 5 + adj 6 + union-find 34
+        #                                         + dissolve 36 = 81 ms
+        # 132,759 cells become 19,187, and the union-find is a Python loop over every
+        # adjacency, so 7x fewer cells is most of the win.
+        #
+        # THE CELLS UNDERNEATH ARE UNTOUCHED. This is the outline layer only.
+        if coarsen > 0:
+            res = int(np.asarray(cells_resolution(hx[:1]))[0])
+            par = np.asarray(change_resolution(hx, max(0, res - coarsen)))
+            hx, ix = np.unique(par, return_inverse=True)
+            # Majority class per parent, by bincount over parent * 256 + class. A parent
+            # holds ~7 children and they disagree at region edges; the majority is the
+            # same answer the cells themselves are built with, one level up.
+            hist = np.bincount(
+                ix.astype(np.int64) * 256 + cs.astype(np.int64),
+                minlength=len(hx) * 256,
+            ).reshape(len(hx), 256)
+            cs = hist.argmax(1).astype(np.int16)
+
         inv, counts = cluster_runs(hx, cs)
 
         big = counts[inv] >= min_cluster
@@ -550,6 +617,8 @@ def _(
     def dissolve(hx, cs, big):
         # No underscore: marimo resolves a cell-local name lazily and a nested
         # function referenced FORWARD from another one fails its cell-local check.
+        # Already at parent resolution: to_cluster_table coarsens before it runs the
+        # union-find, so everything here is one level up from the cells on screen.
         wkbs, colors = [], []
         for c in np.unique(cs[big]):
             sub = hx[big & (cs == c)]
@@ -896,20 +965,16 @@ def _(
                 ensure_wash()
             return
 
-        # NOTHING ON SCREEN MAY OUTLIVE ITS RESOLUTION. Leaving the previous fold up for the
-        # duration of the read is what produces the two complaints: zoom IN and the old
-        # coarse cells sit there at the wrong size, zoom OUT and the old FINE cells are
-        # suddenly sub-pixel, which aliases into a black mush that looks like corruption.
-        # Neither is data; both are the last answer overstaying.
+        # THE LAST ANSWER STAYS UP UNTIL THERE IS A NEW ONE. Nothing is cleared here: the
+        # read happens under the cells that are already on screen, and the swap is a single
+        # trait update when the new fold is complete.
         #
-        # Cleared with seed_table(), NOT an empty one. A zero-row table blanked the map and
-        # then killed deck outright, and it did not come back on a re-run. seed_table is the
-        # single off-screen hexagon the layer is CONSTRUCTED with, so it is the one shape
-        # known to survive; at null island it is never in a CONUS view.
-        if res != HOLD["res"]:
-            _show(seed_table(), None, None, f"<b>reading…</b> res {res} · zoom {vs.zoom:.1f}")
-        else:
-            status.value = f"<b>reading…</b> res {res} · zoom {vs.zoom:.1f}"
+        # This reverses an earlier rule ("nothing may outlive its resolution") that blanked
+        # to a seed table on every resolution change. Blanking made the wrong-size moment
+        # short, but it replaced it with an EMPTY map for the whole read, which is worse:
+        # a stale-but-plausible map reads as the map, an empty one reads as broken. The
+        # outlines are still hidden, because those genuinely are wrong once the cells move.
+        status.value = f"<b>reading…</b> res {res} · zoom {vs.zoom:.1f}"
 
         raw, m_px, read_px = await HOLD["fold"](res, want)
         if raw is None or raw.num_rows == 0:
@@ -1500,12 +1565,13 @@ def _(GROUPS, controls, deck, mo, status):
             mo.md(
                 "<div style='display:flex;flex-wrap:wrap;font-size:.8rem;line-height:1.7'>"
                 + "".join(_sw)
-                + "</div>\n\nColour is the majority class in the cell. Hover for its "
-                "**purity**: how much of the cell is actually that class."
+                + "</div>\n\nColour is the majority class in the cell; hover for its "
+                "**purity**. **Draw a box** (box button, bottom right) for 40 years of "
+                "analytics below."
             ),
             controls,
         ],
-        gap=0.4,
+        gap=0.15,
     )
     return
 
