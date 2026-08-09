@@ -1608,8 +1608,8 @@ def _(GROUPS, controls, deck, mo, status):
             # line the legend already owns.
             mo.md(
                 "<div style='font-size:.8rem;opacity:.75'>Fullscreen: use marimo's "
-                "control, not the map's, which takes the canvas alone and hides the "
-                "legend and layer controls with it.</div>"
+                "button, not the button in lonboard, to use the"
+                "legend and layer controls.</div>"
             ),
             status,
             deck,
