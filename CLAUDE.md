@@ -5,10 +5,19 @@ Guidance for Claude Code working in this repository. Inherits the global rules i
 
 ## Repository layout
 
-`xsql-nlcd-zoom.py` is the notebook this repo is for. Everything else that was built
-along the way lives in `archive/` (earlier notebooks, the Overture and NAIP helpers, the
-lonboard patch script) and is kept for reference, not maintained. The published notebook
-imports none of it: its only dependencies are the third-party ones in its PEP 723 header.
+Two notebooks, side by side on purpose:
+
+- `xsql-nlcd-zoom.py` folds and dissolves entirely in DataFusion + h3ronpy.
+- `xsql-duckdb-nlcd-h3.py` keeps the DataFusion fold and moves the dissolve to DuckDB's
+  h3 extension. Measured on the same viewport: the fold is 70 ms in DataFusion against
+  462 ms in DuckDB, and the dissolve is 75 ms in DuckDB against 928 ms in h3ronpy. The
+  reason is which H3 lives underneath: duckdb-h3 wraps Uber's C library, h3ronpy wraps
+  h3o. Keeping both means the comparison stays runnable rather than a claim in a commit.
+
+Everything else that was built along the way lives in `archive/` (earlier notebooks, the
+Overture and NAIP helpers, the lonboard patch script) and is kept for reference, not
+maintained. Neither notebook imports any of it: their only dependencies are the
+third-party ones in their PEP 723 headers.
 
 ## Project overview
 
