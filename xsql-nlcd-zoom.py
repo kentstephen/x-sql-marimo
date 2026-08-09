@@ -138,6 +138,94 @@ def _(anywidget, traitlets):
 
 
 @app.cell
+def _(anywidget, traitlets):
+    class Controls(anywidget.AnyWidget):
+        """Layer switches, in the flow UNDER the map, next to the legend.
+
+        Same constraint as Status, for the same reason: an `mo.ui.checkbox` would make the
+        map cell depend on it, and every click would rebuild the Map and reset the camera.
+        A widget trait syncs to the kernel, a Python observer assigns straight onto the
+        deck layers, and nothing re-runs.
+
+        One wrapping row, so it reads as a strip under the legend rather than a stack, and
+        nothing is positioned: it takes its own space in the layout like any other output.
+        """
+
+        _esm = """
+        function render({ model, el }) {
+          const box = document.createElement("div");
+          box.style.cssText =
+            "display:flex;flex-wrap:wrap;align-items:center;gap:.4rem 1.2rem;" +
+            "font:12.5px ui-sans-serif,system-ui,sans-serif;" +
+            "padding:.35rem 0 .1rem;user-select:none";
+
+          const check = (key, label) => {
+            const l = document.createElement("label");
+            l.style.cssText =
+              "display:inline-flex;align-items:center;gap:.35rem;cursor:pointer";
+            const cb = document.createElement("input");
+            cb.type = "checkbox";
+            cb.checked = model.get(key);
+            cb.style.cssText = "margin:0;cursor:pointer";
+            cb.addEventListener("change", () => {
+              model.set(key, cb.checked);
+              model.save_changes();
+            });
+            model.on("change:" + key, () => { cb.checked = model.get(key); });
+            l.appendChild(cb);
+            l.appendChild(document.createTextNode(label));
+            return l;
+          };
+
+          const slider = (key, label) => {
+            const w = document.createElement("span");
+            w.style.cssText = "display:inline-flex;align-items:center;gap:.4rem";
+            const cap = document.createElement("span");
+            const draw = () => {
+              cap.textContent = label + " " + Number(model.get(key)).toFixed(2);
+            };
+            cap.style.cssText = "opacity:.7;white-space:nowrap";
+            const s = document.createElement("input");
+            s.type = "range";
+            s.min = "0"; s.max = "1"; s.step = "0.05";
+            s.value = model.get(key);
+            s.style.cssText = "width:7rem;margin:0;cursor:pointer";
+            s.addEventListener("input", () => {
+              model.set(key, parseFloat(s.value));
+              model.save_changes();
+            });
+            model.on("change:" + key, () => { s.value = model.get(key); draw(); });
+            draw();
+            w.appendChild(cap);
+            w.appendChild(s);
+            return w;
+          };
+
+          const head = document.createElement("span");
+          head.textContent = "layers";
+          head.style.cssText =
+            "font:11px ui-monospace,Menlo,monospace;letter-spacing:.06em;" +
+            "text-transform:uppercase;opacity:.55";
+          box.appendChild(head);
+          box.appendChild(check("cells", "H3 cells"));
+          box.appendChild(check("cluster_fill", "Cluster fill"));
+          box.appendChild(check("cluster_line", "Cluster outline"));
+          box.appendChild(slider("cell_opacity", "cell opacity"));
+          box.appendChild(slider("cluster_opacity", "cluster opacity"));
+          el.appendChild(box);
+        }
+        export default { render };
+        """
+        cells = traitlets.Bool(True).tag(sync=True)
+        cluster_fill = traitlets.Bool(False).tag(sync=True)
+        cluster_line = traitlets.Bool(True).tag(sync=True)
+        cell_opacity = traitlets.Float(0.7).tag(sync=True)
+        cluster_opacity = traitlets.Float(1.0).tag(sync=True)
+
+    return (Controls,)
+
+
+@app.cell
 def _(math):
     PREFIX = "kylebarron/usgs-landcover/annual-nlcd/c1/v1/cu/mosaic"
     NODATA = 250
@@ -179,7 +267,7 @@ def _(math):
     # The polygon count collapses 1,200x while the cells covered only halve, because nearly
     # all of those runs are a handful of cells. 500 leaves the genuinely large regions.
     MIN_CLUSTER = 50
-    CLUSTER_OPACITY = 0.75
+    CLUSTER_OPACITY = 1.0
     CLUSTER_WIDTH = 2  # stroke width in screen pixels
     # 1.0 is the class colour exactly. Lower values darken the edge; below about 0.6 every
     # class collapses toward black and the outlines stop telling each other apart.
@@ -440,6 +528,7 @@ def _(
     CLUSTER_OPACITY,
     CLUSTER_WIDTH,
     CartoBasemap,
+    Controls,
     H3HexagonLayer,
     HOLD,
     MIN_CLUSTER,
@@ -467,7 +556,7 @@ def _(
     status = Status(value="<b>loading…</b>")
 
     _seed = seed_table()
-    layer = H3HexagonLayer(
+    h3_layer = H3HexagonLayer(
         table=_seed,
         get_hexagon=_seed["hex"],
         get_fill_color=_seed["color"],
@@ -493,8 +582,9 @@ def _(
     # geometry. pickable=False so it never intercepts a hover meant for a cell.
     # ONE OUTLINE PER CLUSTER, not per cell. The earlier attempt stroked every rim CELL and
     # came out a honeycomb over the whole map; this strokes the DISSOLVED boundary, so a run
-    # of 40,000 cells is a single line. Not filled: the polygon is exactly the cells beneath
-    # it, so a fill in their own colour cannot be seen at any opacity.
+    # of 40,000 cells is a single line. Fill starts OFF because the polygon is exactly the
+    # cells beneath it, so with the hexes up a fill in the same colour adds nothing; turn
+    # the hexes off in the panel and the fill becomes the map: solid regions, no honeycomb.
     _cseed = to_cluster_table(seed_cluster(), 0, CLUSTER_DARKEN)
     clusters = PolygonLayer(
         table=_cseed,
@@ -517,13 +607,49 @@ def _(
         pickable=False,
     )
     deck = Map(
-        [layer, clusters, labels],
+        [
+        h3_layer, 
+        clusters, 
+        labels
+        ],
         basemap=MaplibreBasemap(style=CartoBasemap.PositronNoLabels),
         view_state={"longitude": -98.5, "latitude": 39.5, "zoom": 3.8},
         height=VIEW_H,
         # Hover to inspect. show_tooltip defaults to False, which leaves show_side_panel
         # (click) as the only way into a cell's class and purity.
         show_tooltip=True,
+    )
+
+    # THE SWITCHES. Every one of these is a trait assignment on a layer that already
+    # exists, so a click repaints and nothing in the notebook re-runs.
+    #
+    # WANT is what the USER asked for; the fold code below owns `clusters.visible` on its
+    # own schedule (outlines are hidden the moment the cells they describe go away) and has
+    # to ask WANT before turning them back on, or a fold would undo the switch.
+    controls = Controls()
+    # "clusters": does the user want them. "built": does the layer currently hold polygons
+    # dissolved from the cells that are on screen right now. Visible needs both.
+    WANT = {"clusters": True, "built": False}
+
+    def _on_controls(change):
+        name, val = change["name"], change["new"]
+        if name == "cells":
+            h3_layer.visible = val
+        elif name == "cell_opacity":
+            h3_layer.opacity = val
+        elif name == "cluster_opacity":
+            clusters.opacity = val
+        else:
+            # Fill and outline are the two halves of the cluster layer. With both off there
+            # is nothing left to draw, so the layer itself comes off and stays off until one
+            # of them is asked for again.
+            setattr(clusters, "filled" if name == "cluster_fill" else "stroked", val)
+            WANT["clusters"] = controls.cluster_fill or controls.cluster_line
+            clusters.visible = WANT["clusters"] and WANT["built"]
+
+    controls.observe(
+        _on_controls,
+        names=["cells", "cluster_fill", "cluster_line", "cell_opacity", "cluster_opacity"],
     )
 
     def _lat_to_y(lat):
@@ -568,19 +694,20 @@ def _(
         # line. That is the difference between a live map and a machine that gets restarted.
         # max(1, ...): infer_rows_per_chunk returns 0 for an empty table, and lonboard
         # asserts max_chunksize > 0 on the way out.
-        layer._rows_per_chunk = max(1, infer_rows_per_chunk(tbl))
+        h3_layer._rows_per_chunk = max(1, infer_rows_per_chunk(tbl))
         # Held together so deck sees one update rather than a frame with a new table
         # against the old hexagon column.
-        with layer.hold_trait_notifications():
-            layer.table = tbl
-            layer.get_hexagon = tbl["hex"]
-            layer.get_fill_color = tbl["color"]
+        with h3_layer.hold_trait_notifications():
+            h3_layer.table = tbl
+            h3_layer.get_hexagon = tbl["hex"]
+            h3_layer.get_fill_color = tbl["color"]
         # THE OUTLINES DIE WITH THE CELLS THEY DESCRIBED. They are dissolved from one
         # fold's cells, so the moment different cells go up they are stale, and stale
         # outlines do not look stale: they are clean lines in the right colours sitting over
         # the wrong place. Hiding here means the only outlines ever visible are ones built
         # from the cells underneath them.
         clusters.visible = False
+        WANT["built"] = False
         HOLD["res"], HOLD["box"] = res, box
         status.value = note
 
@@ -655,12 +782,15 @@ def _(
         ctbl = to_cluster_table(raw, MIN_CLUSTER, CLUSTER_DARKEN)
         if ctbl is None:
             clusters.visible = False
+            WANT["built"] = False
             return
         clusters._rows_per_chunk = max(1, infer_rows_per_chunk(ctbl))
         with clusters.hold_trait_notifications():
             clusters.table = ctbl
             clusters.get_line_color = ctbl["color"]
-            clusters.visible = True
+            clusters.get_fill_color = ctbl["color"]
+            clusters.visible = WANT["clusters"]
+        WANT["built"] = True
 
     async def refresh(vs, force=False):
         """Fold what the camera is looking at, once it has stopped moving.
@@ -754,7 +884,7 @@ def _(
                 HOLD["task"] = asyncio.run_coroutine_threadsafe(refresh(vs), loop)
 
     deck.observe(_on_camera, names="view_state")
-    return deck, refresh, status
+    return controls, deck, refresh, status
 
 
 @app.cell
@@ -960,7 +1090,7 @@ async def _(
 
 
 @app.cell
-def _(GROUPS, deck, mo, status):
+def _(GROUPS, controls, deck, mo, status):
     _seen, _sw = set(), []
     for _c, (_lbl, (_r, _g, _b)) in GROUPS.items():
         if _lbl in _seen:
@@ -983,6 +1113,7 @@ def _(GROUPS, deck, mo, status):
                 + "</div>\n\nColour is the majority class in the cell. Hover for its "
                 "**purity**: how much of the cell is actually that class."
             ),
+            controls,
         ],
         gap=0.4,
     )
