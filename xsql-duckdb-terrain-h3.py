@@ -16,9 +16,10 @@
 #     "pyproj>=3.7",
 #     "duckdb>=1.5.5",
 #     "matplotlib==3.11.1",
+#     "pillow>=11",
 # ]
 # ///
-"""Annual NLCD land cover in H3, folded in DataFusion, dissolved in DuckDB.
+"""NLCD land cover in H3, extruded on Mapterhorn terrain. Two rasters, one cell id.
 
 TWO ENGINES, EACH DOING THE HALF IT WINS. This is the split version of
 `xsql-nlcd-zoom.py`, and the division of labour was benchmarked rather than assumed,
@@ -47,17 +48,41 @@ hexagon holds 2.3 pixels of 30 m NLCD, and res 12 would hold 0.6 and hole out. T
 is the data's, not the code's.
 
 The fold is a mode, not a mean, because land cover is categorical: each cell takes its
-most frequent class, and colour is the class. Flat, not extruded: there is no height in
-a land cover map, and hexagon walls only hide the classes behind them.
+most frequent class, and colour is the class.
+
+TWO RASTERS, JOINED ON THE CELL ID. This is the split version's other half. NLCD is a
+CONUS Albers mosaic at 30 m; Mapterhorn is a global Web Mercator PMTiles pyramid of
+terrarium-encoded WebP. They share no CRS, no grid and no resolution. They do share an
+H3 cell id, so the join is a LEFT JOIN in DataFusion on a UBIGINT and nothing has to be
+warped, resampled or reprojected into anything else first. Class comes from one raster,
+height from the other, and the hexagon carries both.
+
+The colour is still the class. The HEIGHT is the terrain, which means the extrusion is
+a second variable rather than a restatement of the first: forest climbing a ridge, crops
+stopping where the ground tilts. Exaggeration 0 is the flat map this started as, and the
+cluster outlines are dissolved on the ground plane, so turning height up eventually
+buries them. That trade is the slider's, not a mode.
+
+The Mercator half is the cheap half, which is not obvious. Mapterhorn tile pixels ARE
+lat/lon by construction, so the DEM fold registers its window with lat/lon coordinates
+and the H3 UDF reads them straight. NLCD needs a 64x64 pyproj control grid and two
+interpolating UDFs to say the same thing in Albers.
 
 The camera never re-runs a marimo cell. It schedules a coroutine that reads, folds and
 swaps three traits on the one live layer, so panning and zooming stay fluid and the view
 is never reset. Same shape as the Jupyter tutorial in `bias-bounty-map-tutorial`, which is
 where the pattern is proven.
 
-Data: Kyle Barron's mirror of USGS Annual NLCD on source.coop, public and unsigned.
+Data, both public and unsigned on source.coop:
+  land cover  Kyle Barron's mirror of USGS Annual NLCD, 30 m Albers, one COG per year
+  terrain     Mapterhorn planet.pmtiles, z0-12, 512 px terrarium WebP, 705 GB
 
-Run:  uv run marimo edit xsql-duckdb-nlcd-h3.py --sandbox
+Only planet.pmtiles is read. Its z12 is 19.1 m at the equator and 14.6 m at 40N, which
+is already finer than the 30 m NLCD this is joined against, so the 457 regional
+`6-x-y.pmtiles` archives (z13-18, 26.7 TB) are not needed: they would resolve terrain
+the land cover cannot match. z13 is the 10 m level if that ever changes.
+
+Run:  uv run marimo edit xsql-duckdb-terrain-h3.py --sandbox
 """
 
 import marimo
@@ -69,9 +94,14 @@ app = marimo.App(width="full")
 @app.cell
 def _():
     import asyncio
+    import gzip
+    import io
     import math
+    import struct
 
     import duckdb
+    import obstore
+    from PIL import Image
 
     import anywidget
     import traitlets
@@ -103,6 +133,7 @@ def _():
         CartoBasemap,
         GeoTIFF,
         H3HexagonLayer,
+        Image,
         Map,
         MaplibreBasemap,
         PolygonLayer,
@@ -116,13 +147,17 @@ def _():
         duckdb,
         from_wkb,
         grid_disk,
+        gzip,
         infer_rows_per_chunk,
+        io,
         math,
         mo,
         multipolygon,
         np,
+        obstore,
         pa,
         plt,
+        struct,
         traitlets,
         udf,
         xr,
@@ -262,15 +297,18 @@ def _(anywidget, traitlets):
           // Still fires on CHANGE, not INPUT: each stop re-dissolves the wash, which is
           // real work, so it runs when the handle is released and the caption tracks the
           // drag in the meantime.
-          const STOPS = [1, 2, 3, 5, 8, 12, 20, 30, 50, 75, 100, 150, 200, 300];
-          const nearest = (v) => {
+          const nearest = (stops, v) => {
             let best = 0;
-            for (let i = 1; i < STOPS.length; i++) {
-              if (Math.abs(STOPS[i] - v) < Math.abs(STOPS[best] - v)) best = i;
+            for (let i = 1; i < stops.length; i++) {
+              if (Math.abs(stops[i] - v) < Math.abs(stops[best] - v)) best = i;
             }
             return best;
           };
-          const steps = (key, label) => {
+          // `live` is the difference between the two sliders that use this. Height is a
+          // trait assignment on a layer that already holds its data, so it can follow the
+          // drag; min cluster re-dissolves the wash, so it waits for the handle to drop
+          // and the caption tracks the drag in the meantime.
+          const steps = (key, label, stops, width, live) => {
             const w = document.createElement("span");
             w.style.cssText = "display:inline-flex;align-items:center;gap:.4rem";
             const cap = document.createElement("span");
@@ -278,20 +316,22 @@ def _(anywidget, traitlets):
             const draw = () => { cap.textContent = label + " " + model.get(key); };
             const s = document.createElement("input");
             s.type = "range";
-            s.min = "0"; s.max = String(STOPS.length - 1); s.step = "1";
-            s.value = String(nearest(model.get(key)));
+            s.min = "0"; s.max = String(stops.length - 1); s.step = "1";
+            s.value = String(nearest(stops, model.get(key)));
             // Wider than the opacity sliders because this one is aimed rather than
             // nudged, and every pixel of track is a stop you can actually land on.
-            s.style.cssText = "width:7rem;margin:0;cursor:pointer";
-            s.addEventListener("input", () => {
-              cap.textContent = label + " " + STOPS[parseInt(s.value, 10)];
-            });
-            s.addEventListener("change", () => {
-              model.set(key, STOPS[parseInt(s.value, 10)]);
+            s.style.cssText = "width:" + width + ";margin:0;cursor:pointer";
+            const push = () => {
+              model.set(key, stops[parseInt(s.value, 10)]);
               model.save_changes();
+            };
+            s.addEventListener("input", () => {
+              cap.textContent = label + " " + stops[parseInt(s.value, 10)];
+              if (live) push();
             });
+            s.addEventListener("change", push);
             model.on("change:" + key, () => {
-              s.value = String(nearest(model.get(key)));
+              s.value = String(nearest(stops, model.get(key)));
               draw();
             });
             draw();
@@ -299,6 +339,12 @@ def _(anywidget, traitlets):
             w.appendChild(s);
             return w;
           };
+          const CLUSTER_STOPS = [1, 2, 3, 5, 8, 12, 20, 30, 50, 75, 100, 150, 200, 300];
+          // Vertical exaggeration, as a MULTIPLE of a per-resolution base scale, not as a
+          // raw elevation_scale. The base is set in the kernel from the hexagon's own edge
+          // length, because the same 1000 m of relief is invisible against 8.5 km hexagons
+          // at res 5 and a tower against 25 m ones at res 11. 0 is the flat map.
+          const EXAG_STOPS = [0, 0.25, 0.5, 1, 1.5, 2, 3, 5];
 
           // The class filter. Options come from the kernel (`class_options`) so the
           // groupings are written down once, next to the palette they select from,
@@ -343,6 +389,8 @@ def _(anywidget, traitlets):
           };
           box.appendChild(group("classes"));
           box.appendChild(choose("class_set", "class_options", "show"));
+          box.appendChild(group("terrain"));
+          box.appendChild(steps("exaggeration", "height", EXAG_STOPS, "5rem", true));
           box.appendChild(group("hexagons"));
           box.appendChild(check("cells", "show"));
           box.appendChild(slider("cell_opacity", "opacity"));
@@ -351,7 +399,7 @@ def _(anywidget, traitlets):
           box.appendChild(check("cluster_fill", "fill"));
           box.appendChild(check("cluster_line", "outline"));
           box.appendChild(slider("cluster_opacity", "opacity"));
-          box.appendChild(steps("min_cluster", "min cluster"));
+          box.appendChild(steps("min_cluster", "min cluster", CLUSTER_STOPS, "7rem", false));
           el.appendChild(box);
         }
         export default { render };
@@ -363,6 +411,11 @@ def _(anywidget, traitlets):
         class_set = traitlets.Unicode("forest").tag(sync=True)
         class_options = traitlets.List([]).tag(sync=True)
         cells = traitlets.Bool(True).tag(sync=True)
+        # 1.0, not 0. At the opening pitch the extrusion is visible without hiding
+        # anything: a top-down camera sees a hexagon's top face at the same footprint as
+        # its flat self, so the cluster outlines underneath survive until you tilt. Tilting
+        # is what trades them for relief, and that is the slider's decision to offer.
+        exaggeration = traitlets.Float(1.0).tag(sync=True)
         # OFF by default now that the outline is dissolved on parent hexagons. The
         # polygon is coarser than the cells and bulges past them, so filling it paints a
         # class over cells that are not that class. As an outline it reads as "a region is
@@ -413,6 +466,52 @@ def _(math):
     LEVEL_FOR_RES = {5: 6, 6: 5, 7: 4, 8: 3, 9: 2, 10: 1, 11: 0}
     MAX_RES = 11
 
+    # ---------------------------------------------------------------- terrain (mapterhorn)
+    PM_BUCKET = "us-west-2.opendata.source.coop"
+    PM_PATH = "mapterhorn/mapterhorn/planet.pmtiles"
+    PM_TILE = 512  # mapterhorn ships 512 px tiles, so this is the source's own grid
+    # Terrarium: elevation = (R*256 + G + B/256) - 32768. Verified against known summits
+    # on decode: the Rainier tile tops out at 4391.6 m against a true 4392.
+    DEM_FLOOR = -500.0  # below the Dead Sea; anything under this is void, not terrain
+
+    # WHICH MAPTERHORN ZOOM EACH H3 RESOLUTION READS. This is a COST table, not a
+    # resolution match, and the two axes pull against each other:
+    #
+    #   px/hex   DEM pixels landing in one hexagon. Elevation is smooth and this is a
+    #            mean, so ~8 samples is already a solid answer; the floor that matters is
+    #            not accuracy but COVERAGE, because a cell that catches no pixel has no
+    #            height and punches a hole in the extrusion.
+    #   tiles    512 px tiles the padded viewport spans, which is what the read costs.
+    #            One more zoom level is 4x the tiles.
+    #
+    # H3 steps by 7x in area and zoom by 4x, so these never line up and px/hex oscillates
+    # however the table is written. Aiming at the cheapest level clearing ~8 px/hex, at
+    # 40N (hexagon areas are H3's published averages):
+    #   res  5 -> z4   18.0 px/hex      res  9 -> z9    7.7 px/hex
+    #   res  6 -> z5   10.3 px/hex      res 10 -> z11  17.5 px/hex
+    #   res  7 -> z7   23.5 px/hex      res 11 -> z12  10.0 px/hex
+    #   res  8 -> z8   13.4 px/hex
+    # res 7 and res 10 take the jump because the level below them (5.9 and 4.4 px/hex) is
+    # where coverage starts to get patchy.
+    #
+    # THESE NUMBERS WERE WRONG BY 4x IN AN EARLIER DRAFT, in the safe direction: the table
+    # read a level finer than it needed everywhere and quadrupled the tile count at res 5,
+    # 6, 8 and 9. Caught by measuring instead of deriving. A res-8 window over the Front
+    # Range folds at 57 px/hex against 53.8 predicted, which is the check that matters.
+    #
+    # z12 is the floor of the planet pyramid, so res 11 ends at 10 px/hex. Going finer
+    # needs the regional z13+ archives and there is no point: NLCD is 30 m, so the class
+    # would stop resolving well before the terrain did.
+    DEM_ZOOM_FOR_RES = {5: 4, 6: 5, 7: 7, 8: 8, 9: 9, 10: 11, 11: 12}
+
+    # Average H3 edge length in metres. Used ONLY to size the extrusion: 1000 m of
+    # elevation should read as about half a hexagon's width whatever the resolution, or
+    # the same terrain is invisible at res 5 and a skyscraper at res 11.
+    EDGE_M = {5: 8544.4, 6: 3229.5, 7: 1220.6, 8: 461.4, 9: 174.4, 10: 65.9, 11: 24.9}
+
+    def elev_base_scale(res):
+        return EDGE_M[res] / 2000.0
+
     # The map's pixel size, assumed. It only sets how much of the world the viewport box
     # covers, and PAD is deliberately loose, so being wrong by a few hundred pixels costs
     # a slightly larger query and nothing else.
@@ -444,25 +543,28 @@ def _(math):
     # 1.0 is the class colour exactly. Lower values darken the edge; below about 0.6 every
     # class collapses toward black and the outlines stop telling each other apart.
     CLUSTER_DARKEN = 1.0
-    # HOW MANY RESOLUTIONS COARSER THE OUTLINE IS DISSOLVED AT.
+    # THE OUTLINE IS EXACT, at the resolution on screen. It was not always: coarsening the
+    # dissolve onto parent hexagons used to be the only way to keep h3ronpy's super-linear
+    # merge tractable (652 ms for one res-8 viewport), and it cost exactness, because a
+    # parent counts as included when ANY of its children are and the boundary bulges out by
+    # up to one parent hexagon. Moving the dissolve to DuckDB made that trade unnecessary:
+    # WASH_SQL dissolves `list(hex)` at native resolution in ~17 ms for the same view.
     #
-    # Merging touching cells into one shape is the slowest thing the notebook does, and it
-    # is super-linear in cell count: 9.5k cells dissolve in 21 ms, 76k in 536 ms. One class
-    # over one viewport was 76,076 cells, so the whole wash cost 652 ms and the outlines
-    # landed a second after the cells they describe.
-    #
-    # Dissolving the PARENTS instead is the reachable half of AJ Friend's cells-to-polygon
-    # post (ajfriend.com/blog/cells_to_poly): his Gosper-island optimisation skips the
-    # internal edges of any group that compacts into a coarser cell. h3ronpy cannot do that
-    # literally (link_cells refuses mixed resolutions), but coarsening buys the same thing.
-    # Measured over one res-8 viewport:
-    #   0 (as before)  110,613 cells  277 polys  652 ms
-    #   1               22,738 cells  111 polys   30 ms
-    #   2                4,317 cells   66 polys    6 ms
-    # THE OUTLINE IS NOT THE EXACT CELL SET ANY MORE. A parent is included when ANY of its
-    # children are, so the boundary bulges outward by up to one parent hexagon and steps in
-    # bigger jumps. That is the trade: this layer says "roughly here is a region of this
-    # class", and the cells underneath remain exact.
+    # DIRECTED EDGES WERE MEASURED AS THE REPLACEMENT FOR ALL OF THIS, and lost. The idea
+    # is sound: emit the shared edge wherever a cell's neighbour is absent or a different
+    # class, via h3_cells_to_directed_edge + h3_directed_edge_to_boundary_wkb, and skip
+    # polygon topology entirely. Same forest viewport, 24,902 cells:
+    #   dissolve + ST_Dump, min 20     17.3 ms     85 rows   0.110 MB
+    #   directed edges, no despeckle   38.7 ms  106,422 rows 6.070 MB
+    #   union-find despeckle -> edges  30.2 ms      3 rows   0.412 MB
+    # Two reasons it loses. ST_Dump is the real prize, not the polygons: splitting the
+    # multipolygon into its connected runs is what makes `min cluster` possible at all, and
+    # despeckling is where 98% of the payload goes. Edges have no run grouping, so the
+    # union-find this path deliberately deleted has to come back, and it is still heavier.
+    # Second, edges do not chain: every hexagon rim is its own two-point linestring, so
+    # shared vertices are stored twice. ST_LineMerge chains them for 191 ms and saves no
+    # bytes. h3ronpy cannot construct a directed edge from a cell pair at all, only render
+    # one, so this would have been DuckDB's job either way.
 
     # Seconds of camera quiet before a fold starts. Every fold is now an object-store read,
     # so rapid back-and-forth should read once at the end, not at every position it passed
@@ -547,16 +649,22 @@ def _(math):
         CLUSTER_DARKEN,
         CLUSTER_OPACITY,
         CLUSTER_WIDTH,
+        DEM_FLOOR,
+        DEM_ZOOM_FOR_RES,
         GROUPS,
         LEVEL_FOR_RES,
         NODATA,
         PAD,
+        PM_BUCKET,
+        PM_PATH,
+        PM_TILE,
         PREFIX,
         SETTLE,
         VIEW_H,
         VIEW_W,
         YEAR,
         YEARS,
+        elev_base_scale,
         res_for_zoom,
     )
 
@@ -643,6 +751,7 @@ def _(
                     "class": pa.array(list(_names[cls])),
                     "purity": tbl["purity"],
                     "pixels": tbl["px_total"],
+                    "elev": tbl["elev"],
                 }
             )
         )
@@ -801,6 +910,7 @@ def _(
                     "class": pa.array([""]),
                     "purity": pa.array([0.0]),
                     "pixels": pa.array([0], type=pa.int64()),
+                    "elev": pa.array([0.0]),
                 }
             )
         )
@@ -836,6 +946,7 @@ def _(
     VIEW_H,
     VIEW_W,
     asyncio,
+    elev_base_scale,
     filter_classes,
     infer_rows_per_chunk,
     math,
@@ -858,7 +969,11 @@ def _(
         get_hexagon=_seed["hex"],
         get_fill_color=_seed["color"],
         # get_line_color=_seed["color"],
+        get_elevation=_seed["elev"],
+        # Both set for real by apply_elevation() as soon as a resolution is known; the
+        # scale is meaningless until then, because it is derived from the hexagon size.
         extruded=False,
+        elevation_scale=0.0,
         stroked=False,
         high_precision=True,
         coverage=0.9,
@@ -910,7 +1025,11 @@ def _(
         labels
         ],
         basemap=MaplibreBasemap(style=CartoBasemap.PositronNoLabels),
-        view_state={"longitude": -98.5, "latitude": 39.5, "zoom": 3.8},
+        # PITCHED ON OPENING, because an extrusion nobody tilts to see is a flat map that
+        # costs a second raster. 40 degrees shows the Rockies standing up from the plains
+        # at the opening zoom while still reading as a map rather than a diorama.
+        # _pad() knows about pitch; view_to_bbox deliberately does not (see the note there).
+        view_state={"longitude": -98.5, "latitude": 39.5, "zoom": 3.8, "pitch": 40},
         height=VIEW_H,
         # Hover to inspect. show_tooltip defaults to False, which leaves show_side_panel
         # (click) as the only way into a cell's class and purity.
@@ -1000,6 +1119,21 @@ def _(
     # dissolved from the cells that are on screen right now. Visible needs both.
     WANT = {"clusters": True, "built": False}
 
+    def apply_elevation():
+        """Push the height slider onto the layer, scaled for the resolution on screen.
+
+        elevation_scale is NOT the slider. The slider is a multiple of a base derived from
+        the hexagon's own edge length, so that 1000 m of relief reads as about half a
+        hexagon width at every resolution. Without that, one setting is a flat smear at
+        res 5 and a forest of towers at res 11, and the slider has to be re-aimed on every
+        zoom. HOLD["res"] is None before the first fold, in which case there is no hexagon
+        size to scale against yet and the opening draw will call this again.
+        """
+        ex = float(controls.exaggeration)
+        res = HOLD["res"]
+        h3_layer.extruded = ex > 0
+        h3_layer.elevation_scale = 0.0 if res is None else elev_base_scale(res) * ex
+
     def apply_controls():
         """Push every control onto the layers, once, at build time.
 
@@ -1013,6 +1147,7 @@ def _(
         h3_layer.visible = controls.cells
         h3_layer.opacity = controls.cell_opacity
         h3_layer.coverage = controls.cell_coverage
+        apply_elevation()
         clusters.filled = controls.cluster_fill
         clusters.stroked = controls.cluster_line
         clusters.opacity = controls.cluster_opacity
@@ -1030,6 +1165,8 @@ def _(
             h3_layer.coverage = val
         elif name == "cluster_opacity":
             clusters.opacity = val
+        elif name == "exaggeration":
+            apply_elevation()
         elif name == "min_cluster":
             rewash()
         elif name == "class_set":
@@ -1054,6 +1191,7 @@ def _(
         _on_controls,
         names=[
             "class_set",
+            "exaggeration",
             "cells",
             "cluster_fill",
             "cluster_line",
@@ -1082,8 +1220,17 @@ def _(
             _y_to_lat(yc - half_y),
         )
 
-    def _pad(b):
-        dx, dy = (b[2] - b[0]) * (PAD - 1) / 2, (b[3] - b[1]) * (PAD - 1) / 2
+    def _pad(b, vs=None):
+        # PITCH EATS THE PADDING. view_to_bbox is a top-down rectangle, which is exactly
+        # right at pitch 0 and increasingly wrong as the camera tilts: a pitched view sees
+        # toward the horizon, so the ground it covers is a trapezoid that runs well past
+        # the flat box. Extrusion is the reason anyone tilts this map, so the two arrived
+        # together. Growing the pad by sin(pitch) over-reads a little to the sides in
+        # exchange for not starving the far half of a tilted view; the cap is because the
+        # trapezoid diverges as pitch approaches 90 and no finite box would cover it.
+        p = float(getattr(vs, "pitch", 0.0) or 0.0) if vs is not None else 0.0
+        grow = PAD * (1.0 + 1.5 * math.sin(math.radians(min(p, 60.0))))
+        dx, dy = (b[2] - b[0]) * (grow - 1) / 2, (b[3] - b[1]) * (grow - 1) / 2
         return (b[0] - dx, b[1] - dy, b[2] + dx, b[3] + dy)
 
     def _covers(outer, inner):
@@ -1124,10 +1271,18 @@ def _(
         # cells on a resolution change: not nodata, not the transform, just one rendered
         # frame with the colours missing. hold_sync defers the send itself and emits a
         # single message carrying all three, so no frame can see them disagree.
+        # Set BEFORE the batch below, because apply_elevation reads it to size the scale.
+        HOLD["res"], HOLD["box"] = res, box
         with h3_layer.hold_sync():
             h3_layer.table = tbl
             h3_layer.get_hexagon = tbl["hex"]
             h3_layer.get_fill_color = tbl["color"]
+            h3_layer.get_elevation = tbl["elev"]
+            # In the SAME message as the table it belongs to. A resolution change moves the
+            # hexagon size and the scale that compensates for it together, and if those
+            # arrive as two messages one frame renders the new cells at the old
+            # exaggeration: at a band boundary that is a 2.65x jump in apparent relief.
+            apply_elevation()
         # THE OUTLINES DIE WITH THE CELLS THEY DESCRIBED, unless a replacement is already
         # in hand. They are dissolved from one fold's cells, so once different cells go up
         # they are stale, and stale outlines do not look stale: they are clean lines in the
@@ -1136,14 +1291,15 @@ def _(
         if not keep_wash:
             clusters.visible = False
             WANT["built"] = False
-        HOLD["res"], HOLD["box"] = res, box
         status.value = note
 
     async def _draw(vs, force):
         """Make the screen authoritative for THIS view: cache hit, or clear and refold."""
         res = res_for_zoom(vs.zoom)
-        seen = HOLD["to_albers"](view_to_bbox(vs))
-        want = HOLD["to_albers"](_pad(view_to_bbox(vs)))
+        _box_ll = view_to_bbox(vs)
+        want_ll = _pad(_box_ll, vs)
+        seen = HOLD["to_albers"](_box_ll)
+        want = HOLD["to_albers"](want_ll)
 
         # Already correct for this view.
         if (
@@ -1204,7 +1360,7 @@ def _(
         # outlines are still hidden, because those genuinely are wrong once the cells move.
         status.value = f"<b>reading…</b> res {res} · zoom {vs.zoom:.1f}"
 
-        raw, m_px, read_px = await HOLD["fold"](res, want)
+        raw, m_px, read_px, dem_px = await HOLD["fold"](res, want, want_ll)
         if raw is None or raw.num_rows == 0:
             HOLD["res"], HOLD["box"] = res, want
             status.value = f"<b>res {res}</b> · nothing here · zoom {vs.zoom:.1f}"
@@ -1230,8 +1386,12 @@ def _(
             res,
             want,
             f"<b>res {res}</b> · {count_note(n_shown)} · {m_px:.0f} m"
-            f" · {'tiles cached' if read_px == 0 else f'{read_px / 1e6:.2f}M px fetched'}"
-            f" · zoom {vs.zoom:.1f} · {HOLD['source']}"
+            + (
+                " · tiles cached"
+                if read_px + dem_px == 0
+                else f" · {read_px / 1e6:.2f}M lc + {dem_px / 1e6:.2f}M dem px fetched"
+            )
+            + f" · zoom {vs.zoom:.1f} · {HOLD['source']}"
             + (f" · <b style='color:#E69F00'>{HOLD['jumps']} jumps</b>" if HOLD["jumps"] else ""),
             keep_wash=ctbl is not None,
         )
@@ -1440,6 +1600,254 @@ def _(
 
 @app.cell
 async def _(
+    DEM_ZOOM_FOR_RES,
+    Image,
+    PM_BUCKET,
+    PM_PATH,
+    PM_TILE,
+    S3Store,
+    asyncio,
+    gzip,
+    io,
+    math,
+    np,
+    obstore,
+    struct,
+):
+    # THE TERRAIN READER. PMTiles is an XYZ pyramid inside ONE 705 GB object, addressed by
+    # ranged GET: header, root directory, leaf directories, then tiles. That is already the
+    # shape this notebook wants, which is why it beat every COG option considered. A COG
+    # DEM at this coverage is either a single mosaic with a hand-built overview table or
+    # ~1,500 one-degree files with no shared pyramid; here the pyramid IS the file, and
+    # tile zoom maps onto H3 resolution directly (DEM_ZOOM_FOR_RES).
+    #
+    # Opening costs three reads: a 127-byte header, the root directory (6,612 B), then one
+    # leaf directory per region touched. Directories are gzipped varint deltas, parsed once
+    # and cached, so the 21.7 MB of leaf directories in the planet file are never read whole.
+    _pm_store = S3Store(PM_BUCKET, region="us-west-2", skip_signature=True)
+
+    async def _pm_range(a, b):
+        """Inclusive byte range [a, b]. obstore's `end` is exclusive."""
+        return bytes(
+            memoryview(
+                await obstore.get_range_async(_pm_store, PM_PATH, start=a, end=b + 1)
+            )
+        )
+
+    def _varint(buf, i):
+        r = s = 0
+        while True:
+            c = buf[i]
+            i += 1
+            r |= (c & 0x7F) << s
+            if not c & 0x80:
+                return r, i
+            s += 7
+
+    def _parse_dir(buf):
+        """A PMTiles v3 directory: four varint columns, tile ids delta-encoded.
+
+        Entries are (tile_id, offset, length, run_length). run_length 0 marks a pointer to
+        a LEAF directory rather than to a tile, which is how one file indexes 9.4M tiles
+        without reading a 21 MB index on open. A zero OFFSET means "immediately after the
+        previous entry", so offsets have to be reconstructed in order, not read.
+        """
+        n, i = _varint(buf, 0)
+        ids, last = [0] * n, 0
+        for k in range(n):
+            v, i = _varint(buf, i)
+            last += v
+            ids[k] = last
+        runs = [0] * n
+        for k in range(n):
+            runs[k], i = _varint(buf, i)
+        lens = [0] * n
+        for k in range(n):
+            lens[k], i = _varint(buf, i)
+        offs = [0] * n
+        for k in range(n):
+            v, i = _varint(buf, i)
+            offs[k] = (offs[k - 1] + lens[k - 1]) if v == 0 and k > 0 else v - 1
+        return list(zip(ids, offs, lens, runs))
+
+    def _tile_id(z, x, y):
+        """z/x/y -> PMTiles v3 tile id: Hilbert order within a level, levels stacked.
+
+        Hilbert rather than row-major so tiles that are near each other on the GROUND are
+        near each other in the FILE. That is what makes a viewport read touch a few
+        contiguous byte ranges instead of one seek per tile.
+        """
+        acc = sum((1 << t) * (1 << t) for t in range(z))
+        n = 1 << z
+        d, s = 0, n >> 1
+        while s > 0:
+            rx = 1 if x & s else 0
+            ry = 1 if y & s else 0
+            d += s * s * ((3 * rx) ^ ry)
+            if ry == 0:
+                if rx == 1:
+                    x, y = s - 1 - x, s - 1 - y
+                x, y = y, x
+            s >>= 1
+        return acc + d
+
+    def _find(entries, tid):
+        """Binary search, falling back to the run that COVERS tid.
+
+        The fallback is not an optimisation: directories are run-length encoded, so a tile
+        usually has no entry of its own and is covered by an earlier one. Leaf pointers
+        (run_length 0) always match this way too.
+        """
+        lo, hi = 0, len(entries) - 1
+        while lo <= hi:
+            m = (lo + hi) // 2
+            if tid < entries[m][0]:
+                hi = m - 1
+            elif tid > entries[m][0]:
+                lo = m + 1
+            else:
+                return entries[m]
+        if hi >= 0 and (entries[hi][3] == 0 or tid - entries[hi][0] < entries[hi][3]):
+            return entries[hi]
+        return None
+
+    _hdr = await _pm_range(0, 126)
+    assert _hdr[:7] == b"PMTiles" and _hdr[7] == 3, "not a PMTiles v3 archive"
+    _rd_off, _rd_len, _, _, _ld_off, _, _td_off, _ = struct.unpack("<8Q", _hdr[8:72])
+    PM_MINZ, PM_MAXZ = _hdr[100], _hdr[101]
+    # The zoom table is written against this file's pyramid, so it should fail loudly if
+    # the two ever disagree rather than silently serve whatever _find lands on: a request
+    # above max zoom resolves to SOME entry, so the map would fill with terrain from the
+    # wrong scale instead of going blank.
+    assert PM_MINZ <= min(DEM_ZOOM_FOR_RES.values()), "DEM_ZOOM_FOR_RES below the pyramid"
+    assert max(DEM_ZOOM_FOR_RES.values()) <= PM_MAXZ, (
+        f"DEM_ZOOM_FOR_RES wants z{max(DEM_ZOOM_FOR_RES.values())}, "
+        f"{PM_PATH} stops at z{PM_MAXZ}"
+    )
+    _root = _parse_dir(gzip.decompress(await _pm_range(_rd_off, _rd_off + _rd_len - 1)))
+    _leaf = {}
+
+    # Same bargain as the NLCD tile cache, for the same reason: a pan re-reads the strip it
+    # has not seen and nothing else. The difference is that these tiles are the SOURCE's own
+    # 512 px grid rather than one imposed on a COG window, so there is no snapping to do and
+    # a tile is either held or it is not. float32 after decode, so ~1 MB resident per tile.
+    _dem_tiles = {}
+    _dem_held = {"bytes": 0}
+    DEM_BUDGET = 512 * 1024 * 1024
+    _dem_sem = asyncio.Semaphore(32)
+
+    async def _dem_tile(z, x, y):
+        """One tile, walked to through the directories and decoded to float32 metres."""
+        tid, ents = _tile_id(z, x, y), _root
+        for _ in range(4):  # root + up to three leaf levels
+            e = _find(ents, tid)
+            if e is None:
+                return None
+            if e[3] == 0:
+                key = (e[1], e[2])
+                if key not in _leaf:
+                    _leaf[key] = _parse_dir(
+                        gzip.decompress(
+                            await _pm_range(_ld_off + e[1], _ld_off + e[1] + e[2] - 1)
+                        )
+                    )
+                ents = _leaf[key]
+                continue
+            async with _dem_sem:
+                blob = await _pm_range(_td_off + e[1], _td_off + e[1] + e[2] - 1)
+            # Terrarium, straight off the RGB. Measured at 4 ms/tile against ~50 ms to
+            # fetch one, so the decode this was feared to cost is not the cost.
+            rgb = np.asarray(Image.open(io.BytesIO(blob)).convert("RGB")).astype(np.float32)
+            return (rgb[..., 0] * 256.0 + rgb[..., 1] + rgb[..., 2] / 256.0) - 32768.0
+        return None
+
+    async def _dem_window(z, tx0, ty0, tx1, ty1):
+        """A rectangle of tiles, assembled. Returns (array, pixels actually fetched)."""
+        want = [(z, tx, ty) for ty in range(ty0, ty1 + 1) for tx in range(tx0, tx1 + 1)]
+        need = [k for k in want if k not in _dem_tiles]
+        fetched = 0
+        if need:
+            got = await asyncio.gather(*(_dem_tile(*k) for k in need))
+            for k, a in zip(need, got):
+                # A missing tile is ocean or off-archive, not an error. NaN so the fold
+                # drops it rather than folding a zero into somebody's mean elevation.
+                if a is None:
+                    a = np.full((PM_TILE, PM_TILE), np.nan, dtype=np.float32)
+                _dem_tiles[k] = a
+                _dem_held["bytes"] += a.nbytes
+                fetched += a.size
+            while _dem_held["bytes"] > DEM_BUDGET and len(_dem_tiles) > len(want):
+                for k in list(_dem_tiles):
+                    if k not in want:
+                        _dem_held["bytes"] -= _dem_tiles.pop(k).nbytes
+                        break
+                else:
+                    break
+        nx, ny = tx1 - tx0 + 1, ty1 - ty0 + 1
+        out = np.full((ny * PM_TILE, nx * PM_TILE), np.nan, dtype=np.float32)
+        for k in want:
+            a = _dem_tiles[k]
+            r, c = (k[2] - ty0) * PM_TILE, (k[1] - tx0) * PM_TILE
+            out[r : r + a.shape[0], c : c + a.shape[1]] = a
+        for k in want:
+            _dem_tiles[k] = _dem_tiles.pop(k)  # touch: young end of the LRU
+        return out, fetched
+
+    # WEB MERCATOR IS CLOSED FORM IN BOTH DIRECTIONS, and that is the whole reason the DEM
+    # half of this notebook is shorter than the NLCD half. x is linear in longitude and y
+    # is the inverse Gudermannian of latitude, so a tile pixel knows its own lat/lon exactly
+    # with no projection library, no 64x64 control grid and no bilinear interpolation. The
+    # Albers path upstream needs all three to say the same thing.
+    def _px_to_lon(px, z):
+        return px / (PM_TILE * (1 << z)) * 360.0 - 180.0
+
+    def _px_to_lat(py, z):
+        return np.degrees(
+            np.arctan(np.sinh(np.pi * (1.0 - 2.0 * py / (PM_TILE * (1 << z)))))
+        )
+
+    def _lon_to_tx(lon, z):
+        return (lon + 180.0) / 360.0 * (1 << z)
+
+    def _lat_to_ty(lat, z):
+        la = math.radians(max(min(lat, 85.05112), -85.05112))
+        return (1.0 - math.log(math.tan(la) + 1.0 / math.cos(la)) / math.pi) / 2.0 * (1 << z)
+
+    async def dem_read(res, box_ll):
+        """The DEM for a lon/lat box at the zoom `res` deserves.
+
+        Returns (elev, lats, lons, pixels fetched, metres per pixel). `lats` and `lons` are
+        the pixel-centre coordinate VECTORS, which is exactly what xarray-sql wants for a
+        dataset's coords, so the H3 UDF downstream reads them with no transform at all.
+        """
+        z = DEM_ZOOM_FOR_RES[res]
+        w, s, e, n = box_ll
+        span = 1 << z
+        tx0 = max(0, int(math.floor(_lon_to_tx(w, z))))
+        tx1 = min(span - 1, int(math.floor(_lon_to_tx(e, z))))
+        ty0 = max(0, int(math.floor(_lat_to_ty(n, z))))
+        ty1 = min(span - 1, int(math.floor(_lat_to_ty(s, z))))
+        if tx1 < tx0 or ty1 < ty0:
+            return None, None, None, 0, 0.0
+        arr, fetched = await _dem_window(z, tx0, ty0, tx1, ty1)
+        lons = _px_to_lon(tx0 * PM_TILE + np.arange(arr.shape[1]) + 0.5, z)
+        lats = _px_to_lat(ty0 * PM_TILE + np.arange(arr.shape[0]) + 0.5, z)
+        # Trim the tile overhang, so the fold does not carry up to a tile of margin on
+        # every side into the group-by.
+        ci = np.flatnonzero((lons >= w) & (lons <= e))
+        ri = np.flatnonzero((lats >= s) & (lats <= n))
+        if ci.size == 0 or ri.size == 0:
+            return None, None, None, fetched, 0.0
+        arr = arr[ri[0] : ri[-1] + 1, ci[0] : ci[-1] + 1]
+        mpp = 78271.517 * math.cos(math.radians((s + n) / 2)) / span
+        return arr, lats[ri[0] : ri[-1] + 1], lons[ci[0] : ci[-1] + 1], fetched, mpp
+
+    return PM_MAXZ, PM_MINZ, dem_read
+
+
+@app.cell
+async def _(
+    DEM_FLOOR,
     GeoTIFF,
     HOLD,
     LEVEL_FOR_RES,
@@ -1454,6 +1862,7 @@ async def _(
     asyncio,
     coordinates_to_cells,
     deck,
+    dem_read,
     math,
     np,
     pa,
@@ -1476,6 +1885,32 @@ async def _(
     _inv = Transformer.from_crs(_g.crs, "EPSG:4326", always_xy=True)
     _fwd = Transformer.from_crs("EPSG:4326", _g.crs, always_xy=True)
     _l, _b, _r, _t = _g.bounds
+
+    # THE NLCD FOOTPRINT, IN LON/LAT, AND IT IS A COST CONTROL. The DEM is global; the land
+    # cover is CONUS, and the JOIN IS LEFT FROM THE LAND COVER, so any terrain read outside
+    # that footprint is decoded and then thrown away. It goes unnoticed because it is
+    # correct, just wasted. Measured on the opening draw before this clamp existed:
+    # 37.75M DEM pixels against 4.10M NLCD, a 9x overread, because the padded box at res 5
+    # runs out over the Pacific and up into Canada (and the pitch-aware pad makes it worse,
+    # since tilting grows the box in every direction).
+    #
+    # Albers is curved, so the corners understate the envelope: walk the edges and take
+    # the extremes, the same argument as _to_albers going the other way.
+    _ee = np.linspace(0, 1, 33)
+    _blon, _blat = _inv.transform(
+        np.concatenate(
+            [_l + _ee * (_r - _l), _l + _ee * (_r - _l), np.full(33, _l), np.full(33, _r)]
+        ),
+        np.concatenate(
+            [np.full(33, _b), np.full(33, _t), _b + _ee * (_t - _b), _b + _ee * (_t - _b)]
+        ),
+    )
+    LL_EXTENT = (
+        float(np.nanmin(_blon)),
+        float(np.nanmin(_blat)),
+        float(np.nanmax(_blon)),
+        float(np.nanmax(_blat)),
+    )
 
     # THE ONLY CACHE THAT SHOULD EXIST: NLCD PIXELS, ON A FIXED GRID.
     #
@@ -1640,8 +2075,24 @@ async def _(
         )
     )
 
-    async def fold(res, box):
+    def _swap(name, tbl):
+        """Register `tbl` under `name`, replacing whatever was there.
+
+        One fixed name per role, so DataFusion holds ONE window at a time and RSS stays
+        flat whatever the zoom. from_arrow refuses a name that is already taken, and the
+        deregister raises when it is not, so both halves are guarded.
+        """
+        try:
+            ctx.deregister_table(name)
+        except Exception:
+            pass
+        ctx.from_arrow(tbl, name=name)
+
+    async def fold(res, box, box_ll):
         """Read the window for `box` at the overview `res` deserves, then fold it to H3.
+
+        `box` is Albers, for NLCD; `box_ll` is the same rectangle in lon/lat, for the DEM.
+        Both rasters fold to H3 independently and are joined on the cell id at the end.
 
         Everything here is per-view: the read, the control grid, the to_lat/to_lon UDFs and
         the registered table. Registering under one fixed name means DataFusion holds one
@@ -1661,7 +2112,7 @@ async def _(
         row1 = min(H, int(math.ceil((T - max(y0, B)) / px_y)))
         wpx, hpx = col1 - col0, row1 - row0
         if wpx <= 0 or hpx <= 0:
-            return None, rd.res[0], 0
+            return None, rd.res[0], 0, 0
 
         # Tiles, not a bespoke rectangle. `fetched` is what actually crossed the
         # network, which is usually far less than the window.
@@ -1702,7 +2153,7 @@ async def _(
 
         # Mode per cell. The `cls ASC` tie-break is not decoration: without it a cell whose
         # top two classes have equal counts picks a different winner run to run.
-        out = ctx.sql(f"""
+        lc_cells = ctx.sql(f"""
             WITH counts AS (
                 SELECT h3_latlng_to_cell(to_lat(y, x), to_lon(y, x), CAST({res} AS INT))
                            AS hex,
@@ -1716,7 +2167,69 @@ async def _(
                    CAST(max(n) AS DOUBLE) / sum(n) AS purity
             FROM counts GROUP BY hex
         """).to_arrow_table()
-        return out, rd.res[0], fetched
+
+        # ---- the OTHER raster, onto the same lattice --------------------------------
+        # No control grid and no to_lat/to_lon here: mapterhorn is Web Mercator, so the
+        # window's own coordinates ARE lat/lon and the H3 UDF reads them directly. This is
+        # the entire difference between the two folds, and it is why this half is shorter.
+        _w = max(box_ll[0], LL_EXTENT[0])
+        _s = max(box_ll[1], LL_EXTENT[1])
+        _e2 = min(box_ll[2], LL_EXTENT[2])
+        _n = min(box_ll[3], LL_EXTENT[3])
+        if _e2 > _w and _n > _s:
+            elev, lats, lons, dem_px, _mpp = await dem_read(res, (_w, _s, _e2, _n))
+        else:
+            elev, lats, lons, dem_px = None, None, None, 0
+        dem_cells = None
+        if elev is not None:
+            _swap_ds = xr.Dataset(
+                {"elev": (("lat", "lon"), elev)}, coords={"lat": lats, "lon": lons}
+            )
+            try:
+                ctx.deregister_table("dem")
+            except Exception:
+                pass
+            ctx.from_dataset("dem", _swap_ds, chunks={"lat": 512})
+            # `elev > DEM_FLOOR` is doing two jobs: it drops the NaN standing in for tiles
+            # the archive has no data for (NaN fails every comparison), and it drops the
+            # terrarium void below any real land surface. Ocean at 0 m is kept, because a
+            # coastal cell that is genuinely at sea level should extrude to nothing rather
+            # than drop out of the join and be COALESCEd to the same nothing by accident.
+            dem_cells = ctx.sql(f"""
+                SELECT h3_latlng_to_cell(lat, lon, CAST({res} AS INT)) AS hex,
+                       avg(elev) AS elev
+                FROM dem WHERE elev > {DEM_FLOOR}
+                GROUP BY 1
+            """).to_arrow_table()
+
+        if dem_cells is None or dem_cells.num_rows == 0:
+            return (
+                lc_cells.append_column(
+                    "elev", pa.array(np.zeros(lc_cells.num_rows, dtype=np.float64))
+                ),
+                rd.res[0],
+                fetched,
+                dem_px if elev is not None else 0,
+            )
+
+        # THE JOIN, AND IT IS THE POINT. Two rasters that share no CRS, no grid and no
+        # resolution, reconciled on a UBIGINT. LEFT from the land cover, because the land
+        # cover decides which cells exist: the DEM is global and would otherwise contribute
+        # cells over ocean and over Canada that NLCD has nothing to say about.
+        #
+        # COALESCE to 0 rather than dropping. At 8-24 px/hex a cell missing the DEM
+        # entirely is rare, but it is not impossible at a window edge or over a tile the
+        # archive has no data for, and a null there would punch a hole in the extrusion
+        # rather than flatten one cell. Flat is the honest rendering of "no height known".
+        _swap("lc_cells", lc_cells)
+        _swap("dem_cells", dem_cells)
+        out = ctx.sql("""
+            SELECT c.hex, c.mode_cls, c.px_total, c.purity,
+                   COALESCE(d.elev, 0.0) AS elev
+            FROM lc_cells c
+            LEFT JOIN dem_cells d ON d.hex = c.hex
+        """).to_arrow_table()
+        return out, rd.res[0], fetched, dem_px
 
     # ---------------------------------------------------------------- the AOI lane
     # Separate from the camera path on purpose. The camera reads ONE year and cares about
@@ -1795,6 +2308,29 @@ async def _(
         lon, lat = _inv.transform(gx.ravel(), gy.ravel())
         return YEARS, cube, lat.reshape(hpx, wpx), lon.reshape(hpx, wpx)
 
+    async def aoi_dem(box_ll, res):
+        """Mean elevation per H3 cell over the AOI. Returns (sorted cells, elevations).
+
+        ONE read, not forty. The land cover has a year and the terrain does not, so this is
+        the cheap half of the AOI: the same elevation column joins against every year, and
+        that is exactly what makes "did this class move uphill" answerable at all. Sorted
+        on the way out because the caller looks cells up with searchsorted.
+        """
+        elev, lats, lons, _f, _m = await dem_read(res, box_ll)
+        if elev is None:
+            return None, None
+        lo, la = np.meshgrid(lons, lats)
+        ok = np.isfinite(elev) & (elev > DEM_FLOOR)
+        if not ok.any():
+            return None, None
+        cells = np.asarray(coordinates_to_cells(la[ok], lo[ok], res))
+        order = np.argsort(cells, kind="stable")
+        c, v = cells[order], elev[ok][order].astype(np.float64)
+        uniq, start = np.unique(c, return_index=True)
+        # Segmented mean without a groupby: reduceat sums each run of equal cell ids.
+        return uniq, np.add.reduceat(v, start) / np.diff(np.append(start, len(v)))
+
+    HOLD["aoi_dem"] = aoi_dem
     HOLD["aoi_cube"] = aoi_cube
     # Background, unawaited: the map must not wait on it. asyncio holds only a weak
     # reference to a bare task, hence the slot in HOLD.
@@ -1844,11 +2380,11 @@ def _(GROUPS, controls, deck, mo, status):
                 # two lines: one about colour, one about the box. `<br>` rather than a
                 # blank line, which would start a second paragraph and add its margin to
                 # a height that has none to give.
-                + "</div>\n\nColour is the majority class in the cell; hover for its "
-                "**purity**. The **classes** menu picks which are drawn; it opens on "
-                "forest.<br>"
-                "**Draw a box** (box button, bottom right) for 40 years of "
-                "analytics below."
+                + "</div>\n\nColour is the majority NLCD class in the cell; **height** is "
+                "Mapterhorn terrain, joined on the cell id. Hover for both. Drag with "
+                "**ctrl** to tilt; **height 0** is the flat map.<br>"
+                "The **classes** menu picks what is drawn; it opens on forest. "
+                "**Draw a box** (box button, bottom right) for 40 years of analytics below."
             ),
             controls,
         ],
@@ -1930,7 +2466,16 @@ async def _(
             coordinates_to_cells(_lat.ravel(), _lon.ravel(), _res)
         )
         _uniq, _idx = np.unique(_cells, return_inverse=True)
-        _rows = []
+
+        # TERRAIN, ON THE SAME CELLS. Read once, outside the year loop.
+        _dh, _de = await HOLD["aoi_dem"](_box_lonlat, _res)
+        _cell_elev = np.full(len(_uniq), np.nan)
+        if _dh is not None:
+            _p = np.clip(np.searchsorted(_dh, _uniq), 0, len(_dh) - 1)
+            _hit = _dh[_p] == _uniq
+            _cell_elev[_hit] = _de[_p[_hit]]
+
+        _rows, _erows = [], []
         for _i, _y in enumerate(_years):
             _flat = _cube[_i].ravel()
             _ok = _flat != NODATA
@@ -1946,6 +2491,18 @@ async def _(
             _mode = _hist.argmax(1)[_seen].astype(np.int16)
             for _c, (_n, _p, _big) in patch_stats(_uniq[_seen], _mode).items():
                 _rows.append((int(_y), _c, _n, _p, _big))
+            # THE QUESTION THE SINGLE-RASTER VERSION CANNOT ASK. Where a class SITS, not
+            # just how much of it there is. The 95th percentile is the upper edge of a
+            # class's range rather than its maximum, which one stray misclassified cell on
+            # a summit would otherwise define; for forest that upper edge is a treeline.
+            _ez = _cell_elev[_seen]
+            for _c in np.unique(_mode):
+                _m2 = (_mode == _c) & np.isfinite(_ez)
+                if _m2.sum() >= 5:
+                    _erows.append(
+                        (int(_y), int(_c), float(np.mean(_ez[_m2])),
+                         float(np.percentile(_ez[_m2], 95)))
+                    )
         _patch = pa.table(
             {
                 "year": pa.array([r[0] for r in _rows], pa.int32()),
@@ -1955,12 +2512,22 @@ async def _(
                 "largest": pa.array([r[4] for r in _rows], pa.int32()),
             }
         )
+        _elev = pa.table(
+            {
+                "year": pa.array([r[0] for r in _erows], pa.int32()),
+                "cls": pa.array([r[1] for r in _erows], pa.int16()),
+                "mean_m": pa.array([r[2] for r in _erows], pa.float64()),
+                "p95_m": pa.array([r[3] for r in _erows], pa.float64()),
+            }
+        )
 
         # ---- stitch the two into one per-class summary, first year vs last
         _cy = np.asarray(_comp["year"]); _cc = np.asarray(_comp["cls"])
         _cp = np.asarray(_comp["pct"])
         _py = np.asarray(_patch["year"]); _pc = np.asarray(_patch["cls"])
         _pn = np.asarray(_patch["patches"])
+        _ey = np.asarray(_elev["year"]); _ec = np.asarray(_elev["cls"])
+        _em = np.asarray(_elev["mean_m"]); _ep = np.asarray(_elev["p95_m"])
         _y0, _y1 = int(min(_years)), int(max(_years))
 
         def _at(ys, cs, vs, y, c):
@@ -1973,17 +2540,26 @@ async def _(
         )
         _rows_md = [
             "| class | "
-            f"{_y0} area | {_y1} area | change | {_y0} patches | {_y1} patches | change |",
-            "|---|---:|---:|---:|---:|---:|---:|",
+            f"{_y0} area | {_y1} area | change | {_y0} patches | {_y1} patches | change "
+            f"| mean elev | upper edge | shift |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
         for _c in _classes:
             _a0, _a1 = _at(_cy, _cc, _cp, _y0, _c), _at(_cy, _cc, _cp, _y1, _c)
             if max(_a0, _a1) < 0.5:
                 continue  # under half a percent of the box in both years
             _q0, _q1 = _at(_py, _pc, _pn, _y0, _c), _at(_py, _pc, _pn, _y1, _c)
+            _h1 = _at(_ey, _ec, _em, _y1, _c)
+            _u1 = _at(_ey, _ec, _ep, _y1, _c)
+            _u0 = _at(_ey, _ec, _ep, _y0, _c)
             _rows_md.append(
                 f"| {GROUPS.get(_c, (str(_c),))[0]} | {_a0:.1f}% | {_a1:.1f}% | "
-                f"{_a1 - _a0:+.1f} | {_q0:.0f} | {_q1:.0f} | {_q1 - _q0:+.0f} |"
+                f"{_a1 - _a0:+.1f} | {_q0:.0f} | {_q1:.0f} | {_q1 - _q0:+.0f} | "
+                + (
+                    f"{_h1:,.0f} m | {_u1:,.0f} m | {_u1 - _u0:+,.0f} m |"
+                    if _u0 and _u1
+                    else "· | · | · |"
+                )
             )
 
         # ---- small multiples: area and patches per class, on their own panels.
@@ -1993,23 +2569,36 @@ async def _(
             _at(_cy, _cc, _cp, _y0, c), _at(_cy, _cc, _cp, _y1, c)) >= 0.5][:8]
         _fig = None
         if _show:
+            # Three Okabe-Ito hues, one per ROW, and the row is already named by its
+            # ylabel and fixed by its position: the colour is a reminder, never the only
+            # way to tell the panels apart. Blue / orange / reddish-purple survive a
+            # deuteranope simulation as a set, which no red-green pair does.
             _fig, _axes = plt.subplots(
-                2, len(_show), figsize=(2.05 * len(_show), 4.2), sharex=True, squeeze=False
+                3, len(_show), figsize=(2.05 * len(_show), 6.0), sharex=True, squeeze=False
             )
             for _j, _c in enumerate(_show):
                 _m = _cc == _c
                 _ax = _axes[0][_j]
-                _ax.plot(_cy[_m], _cp[_m], lw=1.6, color="#1b4b8f")
+                _ax.plot(_cy[_m], _cp[_m], lw=1.6, color="#0072B2")
                 _ax.set_title(GROUPS.get(_c, (str(_c),))[0], fontsize=8)
                 _ax.tick_params(labelsize=7)
                 _ax.set_ylim(bottom=0)
                 _m = _pc == _c
                 _ax = _axes[1][_j]
-                _ax.plot(_py[_m], _pn[_m], lw=1.6, color="#c98a00")
+                _ax.plot(_py[_m], _pn[_m], lw=1.6, color="#E69F00")
                 _ax.tick_params(labelsize=7)
                 _ax.set_ylim(bottom=0)
+                # Elevation does NOT start at zero. The others are counts, where zero is
+                # the meaningful floor; this is a height above sea level, and pinning it to
+                # zero would flatten a 60 m treeline shift into an invisible wiggle at the
+                # top of a 2,000 m axis.
+                _m = _ec == _c
+                _ax = _axes[2][_j]
+                _ax.plot(_ey[_m], _ep[_m], lw=1.6, color="#CC79A7")
+                _ax.tick_params(labelsize=7)
             _axes[0][0].set_ylabel("% of AOI", fontsize=8)
             _axes[1][0].set_ylabel("patches", fontsize=8)
+            _axes[2][0].set_ylabel("upper edge, m", fontsize=8)
             _fig.tight_layout()
 
         _out = mo.vstack(
@@ -2021,9 +2610,12 @@ async def _(
                 mo.md("\n".join(_rows_md)),
                 _fig if _fig is not None else mo.md(""),
                 mo.md(
-                    "Top row is **area**, the cell question. Bottom row is **patches**, the "
+                    "Top row is **area**, the cell question. Middle row is **patches**, the "
                     "object question: a class can hold its share of the box while breaking "
-                    "into more pieces, and only the dissolve sees that."
+                    "into more pieces, and only the dissolve sees that. Bottom row is the "
+                    "**upper edge**, the 95th percentile of the elevation a class occupies, "
+                    "which is the question neither raster can answer alone. For forest it "
+                    "is a treeline; for crops it is where the ground gets too steep."
                 ),
                 mo.accordion({"the SQL": mo.md(f"```sql{AOI_SQL}```")}),
             ],

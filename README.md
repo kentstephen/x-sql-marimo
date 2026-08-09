@@ -58,25 +58,3 @@ implementation, so that work never reaches it.
   90 patches to 121.
 
 Forty years of a drawn box costs about 300 ms of reads, for the same reason as above: the box is small and the overview matches the resolution.
-
-## Pipeline
-
-1. **Camera moves.** A debounced coroutine reads the padded viewport, so a drag reads once at the end rather than at every position it passed through.
-2. **Stream** the overview window with `obstore` + `async-geotiff`, from a 512-tile cache keyed per overview level, so panning re-reads only the new strip.
-3. **Raster to H3 in SQL** with xarray-sql over DataFusion, `h3_latlng_to_cell` wired in as an h3ronpy UDF, taking the modal class per cell.
-4. **Dissolve to outlines** in DuckDB: dissolve per class, `ST_Dump` into connected runs,
-   drop the speckle.
-5. **Render** flat H3 hexagons in NLCD's own palette, swapping traits on live layers so the camera never re-runs a marimo cell.
-
-## Colour
-
-The palette is NLCD's own, read out of the COG. The one it replaced was invented here on a teal-to-brown axis with the forests separated by lightness, which put deciduous forest at luminance 0.103 in a region where it is 39.7% of the cells: half the map came out near black. Lightness was the problem, not hue.
-
-## Also here
-
-`xsql-nlcd-zoom.py` is the same notebook with the dissolve left in h3ronpy, kept so the
-benchmark above stays runnable.
-`archive/` holds the earlier notebooks this grew out of (3DEP elevation, NAIP drapes,
-Overture buildings), kept for reference and not maintained.
-
-See `CLAUDE.md` for architecture and `docs/` for the working notes.

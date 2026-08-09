@@ -16,9 +16,11 @@
 #     "pyproj>=3.7",
 #     "duckdb>=1.5.5",
 #     "matplotlib==3.11.1",
+#     "pillow>=11",
+#     "morecantile>=7.0.3",
 # ]
 # ///
-"""Annual NLCD land cover in H3, folded in DataFusion, dissolved in DuckDB.
+"""NLCD class boundaries, drawn as lines over Sentinel-2. Is the map right?
 
 TWO ENGINES, EACH DOING THE HALF IT WINS. This is the split version of
 `xsql-nlcd-zoom.py`, and the division of labour was benchmarked rather than assumed,
@@ -47,17 +49,48 @@ hexagon holds 2.3 pixels of 30 m NLCD, and res 12 would hold 0.6 and hole out. T
 is the data's, not the code's.
 
 The fold is a mode, not a mean, because land cover is categorical: each cell takes its
-most frequent class, and colour is the class. Flat, not extruded: there is no height in
-a land cover map, and hexagon walls only hide the classes behind them.
+most frequent class, and colour is the class.
+
+WHAT THIS ONE SHOWS, AND WHY THE HEXAGONS ARE OFF. The other notebooks paint the cells
+and the map is a picture of a classification. Here the cells are hidden by default and
+only the DISSOLVED BOUNDARY is drawn, as lines, over Sentinel-2 true colour. A thin line
+over a photograph does not fight the photograph the way a translucent fill does, and it
+turns the map into something you can check rather than something you have to trust: the
+line either follows a real edge on the ground or it does not. NLCD says forest stops
+here. Here is the ground. No legend needed to judge that.
+
+The hexagons are still there behind the switch, because the boundary IS hexagon-edged and
+it should be obvious why. At res 11 a hexagon is 25 m against 30 m NLCD, so the
+crenellation is not an artifact on top of the data, it is the resolution of the data. A
+pixel-drawn boundary would be a staircase for the same reason.
+
+TWO ENGINES AND NO TILE SERVER, STILL. The imagery is not read here at all: it is a
+`RasterLayer.from_geotiff` over an obstore-backed async-geotiff handle, so the BROWSER
+does a range read per visible tile against the COG and Python never touches a pixel of it.
+That is the same object-store-direct argument the rest of the notebook makes, moved to the
+client. Earth Genome publish these already in EPSG:3857 and already cut to the
+WebMercatorQuad grid (L0 9.55 m is z13, L1 19.11 m is z12, and so on down to z9), so
+there is no reprojection and no resampling anywhere in the path.
 
 The camera never re-runs a marimo cell. It schedules a coroutine that reads, folds and
 swaps three traits on the one live layer, so panning and zooming stay fluid and the view
 is never reset. Same shape as the Jupyter tutorial in `bias-bounty-map-tutorial`, which is
 where the pattern is proven.
 
-Data: Kyle Barron's mirror of USGS Annual NLCD on source.coop, public and unsigned.
+Data, both public and unsigned on source.coop:
+  land cover  Kyle Barron's mirror of USGS Annual NLCD, 30 m Albers, one COG per year
+  imagery     Earth Genome yearly cloud-free Sentinel-2 mosaics, EPSG:3857, TCI
 
-Run:  uv run marimo edit xsql-duckdb-nlcd-h3.py --sandbox
+TCI, not B04/B03/B02. It is a precomposed 3-band uint8 visualisation product, so there is
+no stretch to pick and no chance of a per-tile brightness patchwork. It also sidesteps a
+seam bug: compositing three SEPARATELY TILED single-band COGs leaves their tile grids
+disagreeing at the sub-pixel level, which shows up as a faint grid over the whole scene.
+Its fill value is (0, 0, 0), so black is nodata and has to go transparent, not render.
+
+Items come from stac.earthgenome.org rather than a bucket listing, so an AOI resolves to
+hrefs with one POST.
+
+Run:  uv run marimo edit xsql-nlcd-sentinel2.py --sandbox
 """
 
 import marimo
@@ -69,9 +102,14 @@ app = marimo.App(width="full")
 @app.cell
 def _():
     import asyncio
+    import base64
+    import io
+    import json
     import math
+    import urllib.request
 
     import duckdb
+    from PIL import Image
 
     import anywidget
     import traitlets
@@ -92,17 +130,25 @@ def _():
     from h3ronpy import grid_disk
     from h3ronpy.vector import coordinates_to_cells
     from geoarrow.rust.core import from_wkb, multipolygon
-    from lonboard import Map, H3HexagonLayer, BitmapTileLayer, PolygonLayer
+    from lonboard import (
+        Map,
+        H3HexagonLayer,
+        BitmapLayer,
+        BitmapTileLayer,
+        PolygonLayer,
+    )
     from lonboard.basemap import CartoBasemap, MaplibreBasemap
     from lonboard._serialization import infer_rows_per_chunk
 
     return (
         ArroArray,
         ArroTable,
+        BitmapLayer,
         BitmapTileLayer,
         CartoBasemap,
         GeoTIFF,
         H3HexagonLayer,
+        Image,
         Map,
         MaplibreBasemap,
         PolygonLayer,
@@ -112,11 +158,14 @@ def _():
         XarrayContext,
         anywidget,
         asyncio,
+        base64,
         coordinates_to_cells,
         duckdb,
         from_wkb,
         grid_disk,
         infer_rows_per_chunk,
+        io,
+        json,
         math,
         mo,
         multipolygon,
@@ -125,6 +174,7 @@ def _():
         plt,
         traitlets,
         udf,
+        urllib,
         xr,
     )
 
@@ -270,6 +320,46 @@ def _(anywidget, traitlets):
             }
             return best;
           };
+          // Line width, in screen pixels. Its own control because over imagery this is
+          // not a cosmetic preference: too thin and the boundary disappears into a busy
+          // photograph, too thick and the line covers the very edge you are trying to
+          // judge it against. It fires live, since it is one trait on an existing layer.
+          const widthCtl = (key, label) => {
+            const w = document.createElement("span");
+            w.style.cssText = "display:inline-flex;align-items:center;gap:.35rem";
+            const cap = document.createElement("span");
+            cap.style.cssText = "opacity:.7;white-space:nowrap";
+            const draw = () => {
+              cap.textContent = label + " " + Number(model.get(key)).toFixed(1);
+            };
+            const s = document.createElement("input");
+            s.type = "range";
+            // Sub-pixel at the bottom end, because in pixel units the line CAN go below
+            // 1 and a hairline is what reads best over a busy photograph.
+            s.min = "0.5"; s.max = "6"; s.step = "0.5";
+            s.value = model.get(key);
+            // 12 STOPS NEED ROOM. At 4.5rem this was ~6 px of track per half-step, which
+            // is inside the slop of a trackpad drag: you aim for 1.5 and land on 2.5, and
+            // the control feels like it is fighting you. 9rem is ~12 px per stop, which is
+            // wide enough to land on deliberately.
+            s.style.cssText = "width:9rem;margin:0;cursor:pointer";
+            // LIVE. This commits on every input event, and that is right here: the whole
+            // update is three floats on one layer inside a hold_sync, so it is ONE small
+            // comm message and the line rethickens under the cursor. Deferring it to
+            // release (which an earlier version did, to cut traffic that was never the
+            // problem) just made a cheap control feel unresponsive. `min cluster` still
+            // waits for release, because that one re-dissolves the wash.
+            s.addEventListener("input", () => {
+              cap.textContent = label + " " + parseFloat(s.value).toFixed(1);
+              model.set(key, parseFloat(s.value));
+              model.save_changes();
+            });
+            model.on("change:" + key, () => { s.value = model.get(key); draw(); });
+            draw();
+            w.appendChild(cap);
+            w.appendChild(s);
+            return w;
+          };
           const steps = (key, label) => {
             const w = document.createElement("span");
             w.style.cssText = "display:inline-flex;align-items:center;gap:.4rem";
@@ -347,9 +437,10 @@ def _(anywidget, traitlets):
           box.appendChild(check("cells", "show"));
           box.appendChild(slider("cell_opacity", "opacity"));
           box.appendChild(slider("cell_coverage", "coverage"));
-          box.appendChild(group("clusters"));
-          box.appendChild(check("cluster_fill", "fill"));
+          box.appendChild(group("boundary"));
           box.appendChild(check("cluster_line", "outline"));
+          box.appendChild(check("cluster_fill", "fill"));
+          box.appendChild(widthCtl("cluster_width", "width"));
           box.appendChild(slider("cluster_opacity", "opacity"));
           box.appendChild(steps("min_cluster", "min cluster"));
           el.appendChild(box);
@@ -362,7 +453,15 @@ def _(anywidget, traitlets):
         # "all" is in the menu for the picture.
         class_set = traitlets.Unicode("forest").tag(sync=True)
         class_options = traitlets.List([]).tag(sync=True)
-        cells = traitlets.Bool(True).tag(sync=True)
+        # OFF. This is the one default that makes this notebook a different notebook: the
+        # hexagons are what the other two are FOR, and here they cover the photograph the
+        # boundary is meant to be judged against. The switch is still there, and turning it
+        # on is the fastest way to see why the line is hexagon-edged.
+        cells = traitlets.Bool(False).tag(sync=True)
+        # Screen pixels, and a Float so the line can go to a half-pixel hairline. 1.5
+        # rather than 3: over imagery a thick line hides the edge it is claiming, which is
+        # the one thing this map exists to let you look at.
+        cluster_width = traitlets.Float(0.7).tag(sync=True)
         # OFF by default now that the outline is dissolved on parent hexagons. The
         # polygon is coarser than the cells and bulges past them, so filling it paints a
         # class over cells that are not that class. As an outline it reads as "a region is
@@ -410,7 +509,22 @@ def _(math):
     # res 11 against 30 m imagery is 2.3 pixels per hexagon, and that is the floor: res 12
     # would be 0.6 and the map would hole out. This is where the data stops, not where the
     # code does.
-    LEVEL_FOR_RES = {5: 6, 6: 5, 7: 4, 8: 3, 9: 2, 10: 1, 11: 0}
+    # ONE LEVEL FINER FROM RES 7 UP, and that is a change this notebook earns where the
+    # other two do not. There the mode is the thing on screen and 12-22 px/hex already
+    # settles it; here the thing on screen is the BOUNDARY between modes, and a boundary is
+    # decided by the cells along it, where the vote is closest. More pixels under those
+    # cells is a straighter, better-placed line, which is the entire subject of the map.
+    #
+    # px/hex, four times the old count wherever the level dropped:
+    #   res 5  L6   69      res  8  L2   50      res 11  L0  2.3
+    #   res 6  L5   39      res  9  L1   28
+    #   res 7  L3   88      res 10  L0   16
+    # res 11 does not move: L0 is 30 m native and there is nothing finer to read.
+    #
+    # The cost is 4x the pixels per fold over that range, which the notebook's own
+    # inversion pays for: these are the ZOOMED-IN bands, where the viewport is small.
+    # It also lines up with the imagery, which only exists from zoom 8 (res 8) anyway.
+    LEVEL_FOR_RES = {5: 6, 6: 5, 7: 3, 8: 2, 9: 1, 10: 0, 11: 0}
     MAX_RES = 11
 
     # The map's pixel size, assumed. It only sets how much of the world the viewport box
@@ -440,7 +554,40 @@ def _(math):
     # all of those runs are a handful of cells. 500 leaves the genuinely large regions.
     MIN_CLUSTER = 50
     CLUSTER_OPACITY = 1.0
-    CLUSTER_WIDTH = 3  # stroke width in screen pixels
+    CLUSTER_WIDTH = 0.3  # stroke width in screen pixels, and now a slider (see Controls)
+
+    # ---------------------------------------------------------------- Sentinel-2 imagery
+    STAC_URL = "https://stac.earthgenome.org/search"
+    S2_COLLECTION = "sentinel2-yearly-mosaics"
+    S2_BUCKET = "us-west-2.opendata.source.coop"
+    # STAC hands back a data.source.coop URL; the bucket path is the same key without the
+    # host, and reading it through obstore rather than HTTP keeps one credential-free store
+    # type in the notebook and gets range reads without a session.
+    S2_HREF_PREFIX = "https://data.source.coop/"
+
+    # WHERE THE DEMO OPENS. The whole-country view is the WRONG first frame for this
+    # notebook: at res 5 a hexagon is 8.5 km, the dissolved boundary is "everything east of
+    # the Mississippi", and there is no imagery that coarse in the pyramid anyway. The
+    # question here is whether a 30 m boundary tracks the ground, and that is only a
+    # question at res 10 and finer.
+    #
+    # The Front Range is the sharpest test in the country: forest stops dead where the
+    # plains begin, so if the line is going to disagree with the photograph it will
+    # disagree visibly here rather than wandering through a gradient.
+    HOME = {"longitude": -105.34, "latitude": 39.78, "zoom": 11.2}
+    # WHICH COG OVERVIEW EACH H3 RESOLUTION DRAWS THE IMAGERY FROM.
+    #
+    # Earth Genome publish these in EPSG:3857 already cut to the WebMercatorQuad grid, so
+    # the overview pyramid IS the tile pyramid and this is a lookup rather than a warp:
+    #   L0 9.55 m = z13   L2 38.2 m = z11   L4 152.9 m = z9
+    #   L1 19.1 m = z12   L3 76.4 m = z10   L5 305.7 m = z8
+    # Picked one level finer than the map zoom each H3 band starts at, so the picture is
+    # sharp across the band rather than only at its top.
+    #
+    # THE RANGE IS THE POINT: outside res 8-11 there is no imagery and the basemap shows
+    # through. That is not a failure, it is the pyramid ending, and it is why this
+    # notebook opens zoomed in rather than on the whole country.
+    IMG_LEVEL_FOR_RES = {8: 4, 9: 3, 10: 2, 11: 1}
     # 1.0 is the class colour exactly. Lower values darken the edge; below about 0.6 every
     # class collapses toward black and the outlines stop telling each other apart.
     CLUSTER_DARKEN = 1.0
@@ -535,6 +682,16 @@ def _(math):
     # is a fresh read of the whole country, and there is no point putting that behind a
     # control while the thing it feeds is still the open question.
     YEAR = 2024
+    # SAME VINTAGE, DERIVED NOT REPEATED. The whole question this notebook asks is whether
+    # a boundary matches the ground, and that question is void if the line is from one year
+    # and the photograph from another: real change between the two reads as classification
+    # error, and there is no way to tell them apart by looking. Two constants would drift
+    # the first time either moved, so there is only one.
+    #
+    # The overlap is 2022-2024: Annual NLCD runs 1985-2024, Earth Genome's yearly mosaics
+    # start in 2022. Outside it there is no honest pairing to make.
+    S2_YEAR = YEAR
+    assert 2022 <= S2_YEAR <= 2024, f"no paired NLCD + S2 mosaic for {S2_YEAR}"
     # The whole Annual NLCD series on the mirror. Measured for a drawn box at the zoom's own
     # resolution: 0.45-1.5 s to read all 40 years, ~40 ms to compose them, ~30 ms/year to
     # fold to H3 and 4-10 ms to dissolve a class. The series is cheap because the BOX is
@@ -548,17 +705,196 @@ def _(math):
         CLUSTER_OPACITY,
         CLUSTER_WIDTH,
         GROUPS,
+        HOME,
+        IMG_LEVEL_FOR_RES,
         LEVEL_FOR_RES,
         NODATA,
         PAD,
         PREFIX,
+        S2_BUCKET,
+        S2_COLLECTION,
+        S2_HREF_PREFIX,
+        S2_YEAR,
         SETTLE,
+        STAC_URL,
         VIEW_H,
         VIEW_W,
         YEAR,
         YEARS,
         res_for_zoom,
     )
+
+
+@app.cell
+async def _(
+    GeoTIFF,
+    HOME,
+    IMG_LEVEL_FOR_RES,
+    Image,
+    S2_BUCKET,
+    S2_COLLECTION,
+    S2_HREF_PREFIX,
+    S2_YEAR,
+    S3Store,
+    STAC_URL,
+    VIEW_H,
+    VIEW_W,
+    Window,
+    asyncio,
+    base64,
+    io,
+    json,
+    math,
+    np,
+    urllib,
+):
+    # THE IMAGERY, READ PYTHON-SIDE. This replaces a RasterLayer.from_geotiff, which is
+    # the elegant version and did not survive here: it builds a COG-local TileMatrixSet
+    # and fetches per visible tile in the browser, and in this notebook the imagery drew
+    # on the first frame and then vanished on the first camera move. Every fold reassigns
+    # traits on the H3 and polygon layers, deck runs ONE update pass over all layers, and
+    # a throw anywhere in that pass aborts the batch and takes the raster layers with it.
+    # Clamping the zoom range, setting extent, and cutting to a single mosaic each fixed
+    # a real bug; none of them fixed that.
+    #
+    # So: one BitmapLayer, which is an image and a bounding box and nothing else. No tile
+    # matrix set, no per-tile callback into the kernel, no zoom-index arithmetic, nothing
+    # that can throw inside deck's update pass. It costs one read and one WebP encode per
+    # view instead of per tile, which the cache below makes free on a pan that stays put.
+    _s2_store = S3Store(S2_BUCKET, region="us-west-2", skip_signature=True)
+    _WORLD_M = 20037508.342789244
+
+    def _ll_to_merc(lon, lat):
+        lat = max(min(lat, 85.05112), -85.05112)
+        return (
+            lon * _WORLD_M / 180.0,
+            math.log(math.tan((90.0 + lat) * math.pi / 360.0)) * _WORLD_M / math.pi,
+        )
+
+    def _merc_to_ll(x, y):
+        return (
+            x / _WORLD_M * 180.0,
+            math.degrees(2.0 * math.atan(math.exp(y / _WORLD_M * math.pi)) - math.pi / 2),
+        )
+
+    def _stac_search(bbox, limit=12):
+        """One STAC POST. Blocking, so callers put it on a thread."""
+        req = urllib.request.Request(
+            STAC_URL,
+            data=json.dumps(
+                {"collections": [S2_COLLECTION], "bbox": list(bbox), "limit": limit}
+            ).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            feats = json.load(r)["features"]
+        # SAME VINTAGE, ENFORCED HERE. The API's datetime filter does not actually
+        # constrain these items: asking for 2024 still returns the 2023 mosaic for the
+        # same footprint. The year is matched on the item id, which carries the window
+        # explicitly, as in `13TDE_2024-01-01_2025-01-01`.
+        return [f for f in feats if f"_{S2_YEAR}-01-01_" in f["id"]]
+
+    def _view_bbox(vs, pad=1.6):
+        def _y(lat):
+            t = math.sin(math.radians(max(min(lat, 85.0), -85.0)))
+            return 0.5 - math.log((1 + t) / (1 - t)) / (4 * math.pi)
+
+        def _lat(y):
+            return math.degrees(
+                2 * math.atan(math.exp((0.5 - y) * 2 * math.pi)) - math.pi / 2
+            )
+
+        world = 512 * (2 ** vs["zoom"])
+        hlon = 360.0 * VIEW_W / world / 2 * pad
+        yc, hy = _y(vs["latitude"]), VIEW_H / world / 2 * pad
+        return (
+            vs["longitude"] - hlon,
+            _lat(yc + hy),
+            vs["longitude"] + hlon,
+            _lat(yc - hy),
+        )
+
+    _feats = await asyncio.to_thread(_stac_search, _view_bbox(HOME))
+
+    def _covers_home(f):
+        b = f.get("bbox")
+        return bool(b) and (
+            b[0] <= HOME["longitude"] <= b[2] and b[1] <= HOME["latitude"] <= b[3]
+        )
+
+    # ONE FOOTPRINT, ~147 km across, which covers any view this notebook opens at. Pan
+    # far enough and the imagery runs out and the basemap takes over.
+    _feats = sorted(_feats, key=lambda f: not _covers_home(f))[:1]
+    _levels = []
+    if _feats:
+        _href = _feats[0]["assets"]["TCI"]["href"]
+        _tif = await GeoTIFF.open(_href[len(S2_HREF_PREFIX) :], store=_s2_store)
+        _levels = [_tif, *_tif.overviews]
+
+    # Encoded windows, keyed by the exact pixel rectangle. A camera settle inside the
+    # padded box asks for the same rectangle and pays nothing.
+    _s2_cache = {}
+    _S2_CACHE_MAX = 24
+
+    async def s2_read(res, box_ll):
+        """A WebP data URI and its lon/lat bounds for `box_ll`, or (None, None).
+
+        The COG is EPSG:3857 and its overview pyramid IS the WebMercatorQuad pyramid, so
+        choosing a level is a table lookup and the window is integer arithmetic. Nothing
+        is reprojected, resampled or warped anywhere in this path.
+        """
+        li = IMG_LEVEL_FOR_RES.get(res)
+        if li is None or not _levels or li >= len(_levels):
+            return None, None
+        rd = _levels[li]
+        L, B, R, T = rd.bounds
+        H, W = rd.shape
+        px = (R - L) / W
+        x0, y0 = _ll_to_merc(box_ll[0], box_ll[1])
+        x1, y1 = _ll_to_merc(box_ll[2], box_ll[3])
+        col0 = max(0, int((max(x0, L) - L) / px))
+        col1 = min(W, int(math.ceil((min(x1, R) - L) / px)))
+        row0 = max(0, int((T - min(y1, T)) / px))
+        row1 = min(H, int(math.ceil((T - max(y0, B)) / px)))
+        w, h = col1 - col0, row1 - row0
+        if w <= 0 or h <= 0:
+            return None, None
+
+        key = (li, col0, row0, w, h)
+        if key not in _s2_cache:
+            arr = np.asarray(
+                (
+                    await rd.read(
+                        window=Window(col_off=col0, row_off=row0, width=w, height=h)
+                    )
+                ).as_masked()
+            )
+            rgb = np.transpose(arr[:3], (1, 2, 0)).astype(np.uint8)
+            # TCI's fill is (0,0,0) and a mosaic footprint is not square, so black has to
+            # go transparent or the layer paints an apron over the basemap.
+            alpha = np.where(rgb.any(axis=-1), 255, 0).astype(np.uint8)
+            buf = io.BytesIO()
+            Image.fromarray(np.dstack([rgb, alpha]), "RGBA").save(
+                buf, format="WEBP", quality=85
+            )
+            _s2_cache[key] = "data:image/webp;base64," + base64.b64encode(
+                buf.getvalue()
+            ).decode("ascii")
+            while len(_s2_cache) > _S2_CACHE_MAX:
+                _s2_cache.pop(next(iter(_s2_cache)))
+
+        west, south = _merc_to_ll(L + col0 * px, T - row1 * px)
+        east, north = _merc_to_ll(L + col1 * px, T - row0 * px)
+        return _s2_cache[key], [west, south, east, north]
+
+    s2_note = (
+        f"Sentinel-2 {S2_YEAR} &middot; {_feats[0]['id'].split('_')[0]} &middot; "
+        f"imagery at H3 res {min(IMG_LEVEL_FOR_RES)}-{max(IMG_LEVEL_FOR_RES)};"
+        f" outside that the basemap shows through"
+        if _levels
+        else f"no {S2_YEAR} imagery for this view"
+    )
+    return s2_note, s2_read
 
 
 @app.cell
@@ -817,6 +1153,7 @@ def _(
 
 @app.cell
 def _(
+    BitmapLayer,
     BitmapTileLayer,
     CLASS_OPTIONS,
     CLASS_SETS,
@@ -827,6 +1164,7 @@ def _(
     Controls,
     H3HexagonLayer,
     HOLD,
+    HOME,
     Map,
     MaplibreBasemap,
     PAD,
@@ -840,6 +1178,7 @@ def _(
     infer_rows_per_chunk,
     math,
     res_for_zoom,
+    s2_read,
     seed_cluster,
     seed_table,
     set_aoi,
@@ -889,10 +1228,37 @@ def _(
         get_line_color=_cseed["color"],
         filled=True,
         stroked=True,
-        line_width_min_pixels=CLUSTER_WIDTH,
+        # PIXELS, EXPLICITLY. deck's default line_width_units is METRES with
+        # get_line_width defaulting to 1, so the width you actually see was
+        # max(1 metre in pixels, line_width_min_pixels): two numbers in different units
+        # fighting over one line, where only the floor ever moved and nothing could take
+        # the line BELOW it. Over imagery that matters, because a boundary you cannot
+        # thin is a boundary covering the edge it is supposed to be judged against.
+        # In pixel units get_line_width is the width, full stop, and it can go sub-pixel.
+        line_width_units="pixels",
+        get_line_width=CLUSTER_WIDTH,
+        line_width_min_pixels=0,
+        line_width_max_pixels=CLUSTER_WIDTH,
         opacity=CLUSTER_OPACITY,
         pickable=False,
         visible=False,
+    )
+
+    # The imagery. One image and a bounding box, swapped by the fold.
+    #
+    # THE PLACEHOLDER IS A REAL IMAGE, NOT AN EMPTY STRING. `image` is a URL that deck
+    # hands to the browser's image loader, and "" is not a URL: the load throws, and
+    # because deck initialises every layer in ONE pass, that throw aborts the batch and
+    # takes the hexagons and the boundary down with it. The visible symptom is the
+    # confusing one, a cascade of assertion failures naming layers that are perfectly
+    # fine, and imagery that draws once and then glitches out on the next update. A 1x1
+    # transparent PNG loads cleanly and occupies no space anyone can see.
+    BLANK_PNG = (
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAA"
+        "DUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+    )
+    s2 = BitmapLayer(
+        image=BLANK_PNG, bounds=[0.0, 0.0, 1.0, 1.0], opacity=1.0, visible=False
     )
 
     labels = BitmapTileLayer(
@@ -903,14 +1269,18 @@ def _(
         opacity=0.9,
         pickable=False,
     )
+    # ORDER IS THE WHOLE DESIGN. Imagery on the bottom as the reference, the hexagons
+    # above it (off by default), the dissolved boundary above those as the claim being
+    # made, and place labels last so they stay readable over a photograph.
     deck = Map(
         [
-        h3_layer, 
-        clusters, 
+        s2,
+        h3_layer,
+        clusters,
         labels
         ],
         basemap=MaplibreBasemap(style=CartoBasemap.PositronNoLabels),
-        view_state={"longitude": -98.5, "latitude": 39.5, "zoom": 3.8},
+        view_state=HOME,
         height=VIEW_H,
         # Hover to inspect. show_tooltip defaults to False, which leaves show_side_panel
         # (click) as the only way into a cell's class and purity.
@@ -1000,6 +1370,58 @@ def _(
     # dissolved from the cells that are on screen right now. Visible needs both.
     WANT = {"clusters": True, "built": False}
 
+    def set_line_width(px):
+        """Width in screen pixels, set on all three traits that can govern it.
+
+        get_line_width alone is not enough: max_pixels stays wherever it was and silently
+        caps the value you just asked for, so widening past the old cap does nothing and
+        looks like the slider is broken above some arbitrary number.
+        """
+        with clusters.hold_sync():
+            clusters.get_line_width = float(px)
+            clusters.line_width_min_pixels = 0.0
+            clusters.line_width_max_pixels = float(px)
+
+    async def put_imagery(res, box_ll):
+        """Swap the imagery under the cells. Hidden where the pyramid does not reach.
+
+        Awaited alongside the fold rather than after it, so the picture and the boundary
+        arrive together instead of the lines landing on a blank basemap and the ground
+        appearing under them a beat later.
+        """
+        try:
+            uri, bounds = await s2_read(res, box_ll)
+        except Exception:
+            # An imagery failure must never take the fold down with it: the boundary is
+            # the data here and the photograph is the backdrop.
+            s2.visible = False
+            return
+        if uri is None:
+            # Hidden AND blanked. Leaving the last scene's image on a hidden layer means
+            # deck still holds a texture for ground the camera has left, and it flashes
+            # back for one frame the next time the layer is shown.
+            with s2.hold_sync():
+                s2.image = BLANK_PNG
+                s2.visible = False
+            return
+        with s2.hold_sync():
+            s2.image = uri
+            s2.bounds = bounds
+            s2.visible = True
+
+    def redraw_clusters():
+        """Re-push the wash so deck rebuilds the layer's sublayers.
+
+        `filled` decides whether the polygon layer has a FILL SUBLAYER at all, and
+        flipping the flag on its own is not reliably enough to make deck create one that
+        did not exist at init. Re-assigning the table forces the update. This is the
+        "fill button does nothing" fix, and it is cheap: the wash is already in hand, so
+        nothing is read, refolded or re-dissolved.
+        """
+        ent = HOLD["cache"].get(HOLD["res"])
+        if ent and ent[2] is not None:
+            put_clusters(ent[2])
+
     def apply_controls():
         """Push every control onto the layers, once, at build time.
 
@@ -1016,6 +1438,7 @@ def _(
         clusters.filled = controls.cluster_fill
         clusters.stroked = controls.cluster_line
         clusters.opacity = controls.cluster_opacity
+        set_line_width(controls.cluster_width)
         WANT["clusters"] = controls.cluster_fill or controls.cluster_line
 
     apply_controls()
@@ -1030,6 +1453,8 @@ def _(
             h3_layer.coverage = val
         elif name == "cluster_opacity":
             clusters.opacity = val
+        elif name == "cluster_width":
+            set_line_width(val)
         elif name == "min_cluster":
             rewash()
         elif name == "class_set":
@@ -1049,6 +1474,11 @@ def _(
             if WANT["clusters"]:
                 ensure_wash()
             clusters.visible = WANT["clusters"] and WANT["built"]
+            # Flipping `filled` alone does not reliably make deck build a fill sublayer
+            # that did not exist when the layer was created. Re-push what is already in
+            # hand so it rebuilds. No read, no refold, no dissolve.
+            if WANT["built"]:
+                redraw_clusters()
 
     controls.observe(
         _on_controls,
@@ -1057,6 +1487,7 @@ def _(
             "cells",
             "cluster_fill",
             "cluster_line",
+            "cluster_width",
             "cell_opacity",
             "cell_coverage",
             "cluster_opacity",
@@ -1142,8 +1573,15 @@ def _(
     async def _draw(vs, force):
         """Make the screen authoritative for THIS view: cache hit, or clear and refold."""
         res = res_for_zoom(vs.zoom)
+        # The lon/lat box is kept as well as the Albers one: NLCD folds in Albers, the
+        # imagery is read in Web Mercator, and they describe the same rectangle.
+        want_ll = _pad(view_to_bbox(vs))
         seen = HOLD["to_albers"](view_to_bbox(vs))
-        want = HOLD["to_albers"](_pad(view_to_bbox(vs)))
+        want = HOLD["to_albers"](want_ll)
+        # BEFORE the cache checks below, because those return early and the imagery has to
+        # follow the camera even when the cells do not need refolding. Cheap when the
+        # rectangle has not changed: s2_read caches on the exact pixel window.
+        await put_imagery(res, want_ll)
 
         # Already correct for this view.
         if (
@@ -1395,9 +1833,9 @@ def _(
         if dz > 0.75 or dx > 0.75 or dy > 0.75:
             HOLD["jumps"] += 1
             opening = (
-                abs(new.longitude + 98.5) < 0.01
-                and abs(new.latitude - 39.5) < 0.01
-                and abs(new.zoom - 3.8) < 0.01
+                abs(new.longitude - HOME["longitude"]) < 0.01
+                and abs(new.latitude - HOME["latitude"]) < 0.01
+                and abs(new.zoom - HOME["zoom"]) < 0.01
             )
             status.value = (
                 f"<b style='color:#E69F00'>camera jumped ({HOLD['jumps']}):</b> "
@@ -1811,7 +2249,7 @@ async def _(
 
 
 @app.cell
-def _(GROUPS, controls, deck, mo, status):
+def _(GROUPS, controls, deck, mo, s2_note, status):
     _seen, _sw = set(), []
     for _c, (_lbl, (_r, _g, _b)) in GROUPS.items():
         if _lbl in _seen:
@@ -1832,7 +2270,8 @@ def _(GROUPS, controls, deck, mo, status):
             mo.md(
                 "<div style='font-size:.8rem;opacity:.75'>Fullscreen: use marimo's "
                 "button, not the button in lonboard, to use the "
-                "legend and layer controls.</div>"
+                "legend and layer controls. &middot; "
+                f"<b>{s2_note}</b></div>"
             ),
             status,
             deck,
@@ -1844,10 +2283,11 @@ def _(GROUPS, controls, deck, mo, status):
                 # two lines: one about colour, one about the box. `<br>` rather than a
                 # blank line, which would start a second paragraph and add its margin to
                 # a height that has none to give.
-                + "</div>\n\nColour is the majority class in the cell; hover for its "
-                "**purity**. The **classes** menu picks which are drawn; it opens on "
-                "forest.<br>"
-                "**Draw a box** (box button, bottom right) for 40 years of "
+                + "</div>\n\nLines are the **dissolved NLCD boundary** for the selected "
+                "classes, over the **Sentinel-2 mosaic of the same year**. The question is "
+                "whether the line follows a real edge on the ground.<br>"
+                "Turn **hexagons** on to see why the boundary is hexagon-edged: at res 11 "
+                "a cell is 25 m against 30 m NLCD. **Draw a box** for 40 years of "
                 "analytics below."
             ),
             controls,

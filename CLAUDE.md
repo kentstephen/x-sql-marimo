@@ -5,7 +5,7 @@ Guidance for Claude Code working in this repository. Inherits the global rules i
 
 ## Repository layout
 
-Two notebooks, side by side on purpose:
+Two notebooks are the repo, side by side on purpose:
 
 - `xsql-nlcd-zoom.py` folds and dissolves entirely in DataFusion + h3ronpy.
 - `xsql-duckdb-nlcd-h3.py` keeps the DataFusion fold and moves the dissolve to DuckDB's
@@ -13,6 +13,10 @@ Two notebooks, side by side on purpose:
   462 ms in DuckDB, and the dissolve is 75 ms in DuckDB against 928 ms in h3ronpy. The
   reason is which H3 lives underneath: duckdb-h3 wraps Uber's C library, h3ronpy wraps
   h3o. Keeping both means the comparison stays runnable rather than a claim in a commit.
+
+Two more run but are parked, not maintained, and not recommended:
+`xsql-duckdb-terrain-h3.py` and `xsql-nlcd-sentinel2.py`. See "Parked experiments" below
+before touching or rebuilding either.
 
 Everything else that was built along the way lives in `archive/` (earlier notebooks, the
 Overture and NAIP helpers, the lonboard patch script) and is kept for reference, not
@@ -77,6 +81,46 @@ ctx.register_udf(h3_cell)
 
 Confirm the exact h3ronpy import path against the installed version before relying on
 it (the module layout has moved between releases).
+
+## Parked experiments (read before rebuilding either)
+
+Two notebooks here run and are **not recommended**. Both were abandoned because the map
+they produce is not worth looking at, not because the data or the SQL failed.
+
+- `xsql-duckdb-terrain-h3.py` — NLCD class joined to Mapterhorn terrain on the H3 cell id,
+  hexagons extruded by elevation. The join works and the numbers are right. Height is a
+  weak encoding for a categorical map, and the extrusion buries the dissolved outlines,
+  which are the good part of this repo.
+- `xsql-nlcd-sentinel2.py` — dissolved NLCD boundaries as lines over Earth Genome's
+  Sentinel-2 mosaic. Better idea than the extrusion, and the data side is fully solved.
+  The render side never became stable.
+
+**`docs/imagery-and-terrain-notes.md` has the full account** and most of it cost a session
+each. The load-bearing ones:
+
+- Earth Genome's S2 COGs are **EPSG:3857 already cut to the WebMercatorQuad grid**, so
+  level choice is a table lookup and the window is integer arithmetic. No warp anywhere.
+  Catalog is `stac.earthgenome.org`, not a bucket listing. Use `TCI` (uint8, fill 0,0,0),
+  never B04/B03/B02. The STAC `datetime` filter does not constrain these items; match the
+  year on the item id.
+- **A `BitmapLayer` with `image=""` aborts deck's entire update pass**, because deck
+  initialises all layers in one pass and a throw anywhere kills the batch. The symptom is
+  a cascade of assertions naming perfectly healthy layers. An assertion naming a layer is
+  weak evidence that the layer is at fault.
+- `RasterLayer.from_geotiff` ships with `min_zoom`/`max_zoom` **commented out** in
+  lonboard 0.16, and its fetcher indexes `images[len - 1 - z]`, so an out-of-range zoom
+  wraps negative onto the full-res image. Pass both through `**kwargs`.
+- An async-geotiff `Tile` carries pixels on **`.array`**, not `.data`, and the render
+  callback runs where an `AttributeError` is silent.
+- `line_width_units` defaults to **metres**; set it to `"pixels"` or width is
+  `max(1 metre, line_width_min_pixels)` and can never go below the floor.
+- `VIEW_W` is a guess and `VIEW_H` is not. Bitmaps expose that; hexagons hide it.
+
+**Directed edges were measured as a replacement for the polygon dissolve and lost**
+(17.3 ms / 0.110 MB against 30.2 ms / 0.412 MB even with a despeckle in front). `ST_Dump`
+is the prize, not the polygons. Do not re-propose without re-reading those numbers. The
+stale comment about outlines "bulging outward" was from the h3ronpy era; `WASH_SQL`
+dissolves at native resolution and the outline is exact.
 
 ## Colorblind-safe rendering (hard requirement)
 

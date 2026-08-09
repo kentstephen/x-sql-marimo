@@ -1270,6 +1270,21 @@ wheels = [
 ]
 
 [[package]]
+name = "morecantile"
+version = "7.0.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "attrs" },
+    { name = "click" },
+    { name = "pydantic" },
+    { name = "pyproj" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ab/44/fa4f0685481b51e5ce33089ca84e821453593d34f306738515a937934751/morecantile-7.0.3.tar.gz", hash = "sha256:b44419c83f310b411b1f547df2d07c115dc6d194ab7c8a4c318a154490e938c1", size = 43104, upload-time = "2026-02-04T23:03:26.423Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/98/1a/f9edb1c167bd8ad214dc87e9ae17fb208d08f7a05e724f74ce29e375c8de/morecantile-7.0.3-py3-none-any.whl", hash = "sha256:747c6b8f3a8029ddaadb04d96c834f10d2796d1898ad893bed47c896a058ddc7", size = 50885, upload-time = "2026-02-04T23:03:27.463Z" },
+]
+
+[[package]]
 name = "msgspec"
 version = "0.21.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2792,6 +2807,7 @@ dependencies = [
     { name = "lonboard" },
     { name = "marimo" },
     { name = "matplotlib" },
+    { name = "morecantile" },
     { name = "obstore" },
     { name = "palettable" },
     { name = "pillow" },
@@ -2816,6 +2832,7 @@ requires-dist = [
     { name = "lonboard", specifier = ">=0.16.0" },
     { name = "marimo", specifier = ">=0.23.16" },
     { name = "matplotlib", specifier = ">=3.11.1" },
+    { name = "morecantile", specifier = ">=7.0.3" },
     { name = "obstore", specifier = ">=0.9.2" },
     { name = "palettable", specifier = ">=3.3" },
     { name = "pillow", specifier = ">=11" },

@@ -16,6 +16,7 @@ dependencies = [
     "lonboard>=0.16.0",
     "marimo>=0.23.16",
     "matplotlib>=3.11.1",
+    "morecantile>=7.0.3",
     "obstore>=0.9.2",
     "palettable>=3.3",
     "pillow>=11",
