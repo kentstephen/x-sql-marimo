@@ -1,38 +1,86 @@
 # x-sql-marimo
 
-Draw a box anywhere in the lower 48 and see the terrain rise as extruded H3 hexagons.
+Fly across the USA and watch 40 years of land cover under you, as H3 hexagons that get
+finer as you zoom in. Nothing is read until the camera asks for it.
 
-**What runs where (honest version):** most of this is Python, one step is SQL. Streaming
-the elevation tiles (obstore + async-geotiff), turning the raster into a table, coloring,
-and rendering (numpy + lonboard) are all Python. The one SQL step is the binning: xarray-sql
-(DataFusion under the hood) runs a query that folds the pixels into H3 cells and averages
-elevation per cell, with H3 wired in as an h3ronpy UDF.
+```bash
+uv run marimo edit xsql-duckdb-nlcd-h3.py --sandbox
+```
 
-Draw an AOI, and the notebook streams the **USGS 3DEP 10m (1/3 arc-second) seamless
-DEM** for that box directly from the public `prd-tnm` S3 bucket with
-[obstore](https://developmentseed.org/obstore/), aggregates the elevation raster to
-[H3](https://h3geo.org/) cells with a **DataFusion SQL UDF**, and renders them as an
-extruded [lonboard](https://developmentseed.org/lonboard/) `H3HexagonLayer`. No tiling
-server, no STAC API, no pixels leave object storage until the AOI asks for them.
+Annual NLCD is streamed straight out of object storage with
+[obstore](https://developmentseed.org/obstore/) and
+[async-geotiff](https://developmentseed.org/async-geotiff/), folded into
+[H3](https://h3geo.org/) cells in SQL, and drawn with
+[lonboard](https://developmentseed.org/lonboard/). No tile server, no STAC API, no pixels
+leave the bucket until the viewport asks for them.
+
+## The counter-intuitive part
+
+Each fold reads only the padded viewport, from the overview matching the H3 resolution it
+is about to build. So the **finest views are the cheapest**: the viewport shrinks faster
+than the resolution grows. Measured, band by band, res 5 at 960 m reads 16.2M pixels;
+res 11 at 30 m reads 72,890.
+
+Res 11 is the floor, and it belongs to the data rather than the code: a res 11 hexagon
+holds 2.3 pixels of 30 m NLCD, and res 12 would hold 0.6 and hole out.
+
+## Two engines, each doing the half it wins
+
+The division of labour was benchmarked, not assumed, and it goes both ways. Same
+viewport, 1.58M pixels folded to 132,759 cells:
+
+| | DataFusion + h3ronpy | DuckDB |
+|---|---:|---:|
+| **fold**: pixels to cells, majority class | **70 ms** | 462 ms |
+| **dissolve**: cells to region outlines | 928 ms | **75 ms** |
+
+The fold stays in DataFusion because h3ronpy converts a whole column at once, where
+DuckDB calls `h3_latlng_to_cell` once per row, 1.58 million times. The dissolve goes to
+DuckDB because its `h3` extension wraps Uber's C library, where the cells-to-polygon work
+lives; h3ronpy wraps [h3o](https://github.com/HydroniumLabs/h3o), a separate Rust
+implementation, so that work never reaches it.
+
+## What the map answers
+
+- **Colour is the majority class** in each cell. Hover for its *purity*: how much of the
+  cell actually is that class.
+- **Outlines** are dissolved regions, one polygon per run of touching same-class cells,
+  built in a single SQL statement.
+- **Draw a box** and it is folded across all 40 years of Annual NLCD, 1985 to 2024, at
+  the resolution on screen when you drew it. Two answers side by side: **area** per class
+  per year, which is a cell question, and **patch count**, which is not. A class can hold
+  its share of the box while breaking into more pieces, and only the dissolved polygons
+  see that. Kentucky, 1985 to 2024: Pasture/Hay loses 2.9 points of area while going from
+  90 patches to 121.
+
+Forty years of a drawn box costs about 300 ms of reads, for the same reason as above: the
+box is small and the overview matches the resolution.
 
 ## Pipeline
 
-1. **Draw box** (lonboard `Map`, `selected_bounds` -> `mo.state`).
-2. **Resolve COGs** for the AOI from the nationwide USGS seamless VRT (a local bbox
-   intersection, no STAC call).
-3. **Stream** the covering COG overviews with `obstore` + `async-geotiff`.
-4. **Raster -> H3 in SQL** via the DataFusion UDF `h3_latlng_to_cell(lat, lng, res)`
-   (h3ronpy), grouped and aggregated by cell.
-5. **Render** extruded H3 hexagons, colored on a colorblind-safe viridis elevation ramp.
+1. **Camera moves.** A debounced coroutine reads the padded viewport, so a drag reads once
+   at the end rather than at every position it passed through.
+2. **Stream** the overview window with `obstore` + `async-geotiff`, from a 512-tile cache
+   keyed per overview level, so panning re-reads only the new strip.
+3. **Raster to H3 in SQL** with xarray-sql over DataFusion, `h3_latlng_to_cell` wired in
+   as an h3ronpy UDF, taking the modal class per cell.
+4. **Dissolve to outlines** in DuckDB: dissolve per class, `ST_Dump` into connected runs,
+   drop the speckle.
+5. **Render** flat H3 hexagons in NLCD's own palette, swapping traits on live layers so
+   the camera never re-runs a marimo cell.
 
-## Run
+## Colour
 
-```bash
-# DEM -> H3 (elevation)
-uv run marimo edit xsql-dem-h3.py --sandbox
+The palette is NLCD's own, read out of the COG. The one it replaced was invented here on
+a teal-to-brown axis with the forests separated by lightness, which put deciduous forest
+at luminance 0.103 in a region where it is 39.7% of the cells: half the map came out near
+black. Lightness was the problem, not hue.
 
-# DEM -> H3 with a flow offset on the elevation shading
-uv run marimo edit xsql-dem-rem.py --sandbox
-```
+## Also here
 
-See `CLAUDE.md` for architecture and the reference-repo lineage.
+`xsql-nlcd-zoom.py` is the same notebook with the dissolve left in h3ronpy, kept so the
+benchmark above stays runnable rather than being a claim in a commit message.
+`archive/` holds the earlier notebooks this grew out of (3DEP elevation, NAIP drapes,
+Overture buildings), kept for reference and not maintained.
+
+See `CLAUDE.md` for architecture and `docs/` for the working notes.
