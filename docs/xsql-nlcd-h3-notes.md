@@ -206,12 +206,20 @@ Anything that reports a perimeter in metres without saying this is lying politel
 
 ### The ladder, cheapest first
 
-1. **A stats line for the current view.** START HERE. Class composition, patch count,
-   largest run, all from tables already in memory: no new read, no new geometry, and it
-   answers whether the patch numbers are interesting enough to justify the rest. The signal
-   to look for is the ratio of patches to cells: at res 8 over one viewport, min run 1 gives
-   43,329 polygons against 176,539 cells; at res 5 over the whole country, 1,774. That ratio
-   IS the fragmentation signal and nothing currently reads it.
+1. ~~A stats line for the current view.~~ **DONE, and it became the drawn box instead.**
+   `selected_bounds` (lonboard's own draw control) captures a box AND the H3 resolution the
+   map was on when it was drawn, and the cell below folds that AOI across all 40 years:
+   area per class per year in SQL over a (year, y, x) cube, and patch counts from
+   `patch_stats` on the same H3 cells. Measured on a 0.6 x 0.4 degree box at res 8, 51,546
+   px/year: **300 ms** to read all 40 years warm, ~3.7 s cold while the COG headers are
+   still opening, which is why they are prefetched at startup. Per-year cost is the thing
+   to remember: the box is small and the overview matches the res, so 40 years of it is
+   cheaper than one whole-country view.
+
+   It works, in the sense that it says something composition alone cannot. Kentucky,
+   1985 to 2024: Pasture/Hay loses 2.9 points of area while going from 90 patches to 121,
+   and Cultivated crops gains 2.0 points while going from 23 to 52. Deciduous forest holds
+   both. That is the argument for the dissolve, in one table.
 2. **Hover or click a cluster.** Its class, area in km², its rank by size, its hole count.
    The polygons are already there; `pickable=False` only to keep hovers off the cells.
 3. **A distribution, rendered.** Patch sizes as a small chart under the map. This is where

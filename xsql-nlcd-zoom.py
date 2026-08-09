@@ -14,6 +14,7 @@
 #     "anywidget>=0.9",
 #     "numpy",
 #     "pyproj>=3.7",
+#     "matplotlib",
 # ]
 # ///
 """Annual NLCD land cover in H3, finer as you zoom in, folded for the viewport.
@@ -56,6 +57,10 @@ def _():
     import anywidget
     import traitlets
     import marimo as mo
+    import matplotlib
+
+    matplotlib.use("Agg")  # no GUI backend in a kernel
+    import matplotlib.pyplot as plt
     import numpy as np
     import pyarrow as pa
     import xarray as xr
@@ -95,6 +100,7 @@ def _():
         infer_rows_per_chunk,
         math,
         mo,
+        plt,
         multipolygon,
         np,
         pa,
@@ -362,6 +368,12 @@ def _(math):
     # is a fresh read of the whole country, and there is no point putting that behind a
     # control while the thing it feeds is still the open question.
     YEAR = 2024
+    # The whole Annual NLCD series on the mirror. Measured for a drawn box at the zoom's own
+    # resolution: 0.45-1.5 s to read all 40 years, ~40 ms to compose them, ~30 ms/year to
+    # fold to H3 and 4-10 ms to dissolve a class. The series is cheap because the BOX is
+    # small and the overview matches the res; this is the same inversion the camera path
+    # runs on. Opening 40 COG headers is the one real cost, 3,979 ms, so it is prefetched.
+    YEARS = list(range(1985, 2025))
     return (
         CLUSTER_DARKEN,
         CLUSTER_OPACITY,
@@ -376,8 +388,19 @@ def _(math):
         VIEW_H,
         VIEW_W,
         YEAR,
+        YEARS,
         res_for_zoom,
     )
+
+
+@app.cell
+def _(mo):
+    # The drawn box, and the H3 resolution the map was showing when it was drawn. State,
+    # not a plain dict, because unlike the camera this SHOULD re-run something: the cell
+    # below it. The Map cell only ever holds the setter, never reads the value, so drawing
+    # a box cannot rebuild the map or move the camera.
+    get_aoi, set_aoi = mo.state(None)
+    return get_aoi, set_aoi
 
 
 @app.cell
@@ -459,10 +482,25 @@ def _(
         """
         hx = np.asarray(tbl["hex"])
         cs = np.asarray(tbl["mode_cls"])
-        n = len(hx)
-        if n == 0:
+        if len(hx) == 0:
             return None
+        inv, counts = cluster_runs(hx, cs)
 
+        big = counts[inv] >= min_cluster
+        if not big.any():
+            return None
+        return dissolve(hx, cs, big)
+
+    def cluster_runs(hx, cs):
+        """Connected runs of touching same-class cells.
+
+        Returns (label per cell, size per label). This is the ONE piece of topology the
+        hexagons cannot express on their own: which cells are part of the same thing. The
+        wash uses it to drop speckle; the AOI analytics uses it to count patches and
+        measure the largest, which is the question a class total cannot answer (two views
+        with identical composition can be one block or ten thousand scraps).
+        """
+        n = len(hx)
         # k=1 ring -> adjacency between cells that are BOTH present and the same class.
         flat = np.asarray(grid_disk(hx, 1, flatten=True))
         per = len(flat) // n
@@ -491,11 +529,27 @@ def _(
                 parent[ra] = rb
         roots = np.fromiter((_find(i) for i in range(n)), np.int64, n)
         _, inv, counts = np.unique(roots, return_inverse=True, return_counts=True)
+        return inv, counts
 
-        big = counts[inv] >= min_cluster
-        if not big.any():
-            return None
+    def patch_stats(hx, cs, min_cluster=1):
+        """Per class: cells, number of patches, size of the largest. Objects, not cells."""
+        inv, counts = cluster_runs(hx, cs)
+        first = np.unique(inv, return_index=True)[1]
+        lab_cls = cs[first]  # every cell in a run shares its class
+        keep = counts >= min_cluster
+        out = {}
+        for c in np.unique(cs):
+            m = keep & (lab_cls == c)
+            out[int(c)] = (
+                int(counts[lab_cls == c].sum()),
+                int(m.sum()),
+                int(counts[m].max()) if m.any() else 0,
+            )
+        return out
 
+    def dissolve(hx, cs, big):
+        # No underscore: marimo resolves a cell-local name lazily and a nested
+        # function referenced FORWARD from another one fails its cell-local check.
         wkbs, colors = [], []
         for c in np.unique(cs[big]):
             sub = hx[big & (cs == c)]
@@ -553,7 +607,14 @@ def _(
             )
         )
 
-    return seed_cluster, seed_table, to_cluster_table, to_layer_table
+    return (
+        cluster_runs,
+        patch_stats,
+        seed_cluster,
+        seed_table,
+        to_cluster_table,
+        to_layer_table,
+    )
 
 
 @app.cell
@@ -581,6 +642,7 @@ def _(
     res_for_zoom,
     seed_cluster,
     seed_table,
+    set_aoi,
     to_cluster_table,
     to_layer_table,
 ):
@@ -1032,6 +1094,15 @@ def _(
             if loop is not None:
                 HOLD["task"] = asyncio.run_coroutine_threadsafe(refresh(vs), loop)
 
+    def _on_draw(change):
+        # The box, plus the resolution the map was on when it was drawn. Captured here
+        # rather than read later, so the analysis describes the view you drew it over
+        # instead of wherever the camera has wandered since.
+        b = change["new"]
+        if b:
+            set_aoi((tuple(float(v) for v in b), res_for_zoom(deck.view_state.zoom)))
+
+    deck.observe(_on_draw, names="selected_bounds")
     deck.observe(_on_camera, names="view_state")
     return controls, deck, refresh, status
 
@@ -1048,6 +1119,7 @@ async def _(
     Window,
     XarrayContext,
     YEAR,
+    YEARS,
     asyncio,
     coordinates_to_cells,
     deck,
@@ -1315,6 +1387,88 @@ async def _(
         """).to_arrow_table()
         return out, rd.res[0], fetched
 
+    # ---------------------------------------------------------------- the AOI lane
+    # Separate from the camera path on purpose. The camera reads ONE year and cares about
+    # latency; a drawn box reads FORTY and cares about being complete. They share the store
+    # and nothing else, so neither can stall the other.
+    # TASKS, not results. Two coroutines asking for the same year at the same moment is
+    # the normal case here (the prefetch is still running when the first box is drawn), and
+    # a plain `if y not in dict` check would let both of them open it. Awaiting the same
+    # task twice is free; opening the same COG twice is a wasted round trip each time.
+    _tifs = {}
+
+    def _tif_task(y):
+        if y not in _tifs:
+            _tifs[y] = asyncio.get_running_loop().create_task(
+                GeoTIFF.open(
+                    f"{PREFIX}/Annual_NLCD_LndCov_{y}_CU_C1V1.tif", store=_store
+                )
+            )
+        return _tifs[y]
+
+    async def _year_level(y, li):
+        g = _g if y == YEAR else await _tif_task(y)
+        return g if li == 0 else g.overviews[li - 1]
+
+    async def prefetch_years():
+        """Open the 40 COG headers while the map is being panned.
+
+        3,979 ms measured, and it is pure latency: without it the first drawn box wears it.
+        Headers only, no pixels.
+        """
+        await asyncio.gather(*(_year_level(y, 0) for y in YEARS))
+
+    async def aoi_cube(box, res):
+        """The AOI window at the level `res` uses, for every year, plus pixel centres.
+
+        Returns (years, cube[year, y, x], lat, lon). The grid is identical across years, so
+        the coordinates are computed ONCE and every year folds onto the same H3 cells: that
+        is what makes a 40-year patch series comparable year to year rather than a set of
+        forty differently-tiled answers.
+        """
+        li = LEVEL_FOR_RES[res]
+        rd = _levels[li]
+        L, B, R, T = rd.bounds
+        H, W = rd.shape
+        px_x, px_y = (R - L) / W, (T - B) / H
+        x0, y0, x1, y1 = box
+        col0 = max(0, int((max(x0, L) - L) / px_x))
+        col1 = min(W, int(math.ceil((min(x1, R) - L) / px_x)))
+        row0 = max(0, int((T - min(y1, T)) / px_y))
+        row1 = min(H, int(math.ceil((T - max(y0, B)) / px_y)))
+        wpx, hpx = col1 - col0, row1 - row0
+        if wpx <= 0 or hpx <= 0:
+            return None, None, None, None
+
+        sem = asyncio.Semaphore(FETCH_AT_ONCE)
+
+        async def one(y):
+            lvl = await _year_level(y, li)
+            async with sem:
+                return np.asarray(
+                    (
+                        await lvl.read(
+                            window=Window(
+                                col_off=col0, row_off=row0, width=wpx, height=hpx
+                            )
+                        )
+                    ).as_masked()[0]
+                )
+
+        cube = np.stack(await asyncio.gather(*(one(y) for y in YEARS)))
+
+        wl, wt = L + col0 * px_x, T - row0 * px_y
+        gx, gy = np.meshgrid(
+            wl + (np.arange(wpx) + 0.5) * px_x, wt - (np.arange(hpx) + 0.5) * px_y
+        )
+        lon, lat = _inv.transform(gx.ravel(), gy.ravel())
+        return YEARS, cube, lat.reshape(hpx, wpx), lon.reshape(hpx, wpx)
+
+    HOLD["aoi_cube"] = aoi_cube
+    # Background, unawaited: the map must not wait on it. asyncio holds only a weak
+    # reference to a bare task, hence the slot in HOLD.
+    HOLD["prefetch"] = asyncio.get_running_loop().create_task(prefetch_years())
+
     # Hand the fold to the camera's world and draw where the camera already is.
     HOLD["fold"] = fold
     HOLD["to_albers"] = _to_albers
@@ -1353,6 +1507,183 @@ def _(GROUPS, controls, deck, mo, status):
         ],
         gap=0.4,
     )
+    return
+
+
+@app.cell
+async def _(
+    GROUPS,
+    HOLD,
+    NODATA,
+    XarrayContext,
+    coordinates_to_cells,
+    YEARS,
+    get_aoi,
+    mo,
+    np,
+    pa,
+    patch_stats,
+    plt,
+    xr,
+):
+    # DRAW A BOX AND THIS IS WHAT IT ANSWERS. Two questions, deliberately side by side:
+    #
+    #   AREA    what the AOI is made of, per year. A CELL question: sum the pixels.
+    #   PATCHES how many separate runs that class comes in, and how big the biggest is.
+    #           An OBJECT question, and one the cells cannot answer at any resolution.
+    #
+    # Composition can hold perfectly still while patch count triples. That is a forest
+    # being cut into woodlots, and it is invisible in a class total. It is the reason the
+    # dissolve exists for anything other than drawing.
+    _aoi = get_aoi()
+    if _aoi is None:
+        _out = mo.md(
+            f"**Draw a box on the map** to fold that area across all {len(YEARS)} years "
+            f"of Annual NLCD: what it is made of, and how many pieces that comes in."
+        )
+    else:
+        _box_lonlat, _res = _aoi
+        _albers = HOLD["to_albers"](_box_lonlat)
+        _years, _cube, _lat, _lon = await HOLD["aoi_cube"](_albers, _res)
+
+    if _aoi is not None and _cube is None:
+        _out = mo.md("**That box is outside the raster.**")
+    elif _aoi is not None:
+        # THE FOLD, IN SQL, OVER A CUBE. The year is a dimension, not forty separate
+        # queries: this is the xarray-sql premise doing the thing it is for.
+        _ctx = XarrayContext()
+        _ctx.from_dataset(
+            "aoi",
+            xr.Dataset(
+                {"cls": (("year", "y", "x"), _cube)},
+                coords={
+                    "year": np.asarray(_years),
+                    "y": np.arange(_cube.shape[1]),
+                    "x": np.arange(_cube.shape[2]),
+                },
+            ),
+            chunks={"y": 256},
+        )
+        AOI_SQL = f"""
+            SELECT year,
+                   cls,
+                   count(*)                                        AS px,
+                   count(*) * 100.0 / sum(count(*)) OVER (PARTITION BY year) AS pct
+            FROM aoi
+            WHERE cls != {NODATA}
+            GROUP BY year, cls
+            ORDER BY year, cls
+        """
+        _comp = _ctx.sql(AOI_SQL).to_arrow_table().combine_chunks()
+
+        # PATCHES. The H3 cells are computed ONCE, because the pixel grid does not move
+        # between years, so a patch count in 1985 and in 2024 is counted over the same
+        # lattice and the two are comparable.
+        _cells = np.asarray(
+            coordinates_to_cells(_lat.ravel(), _lon.ravel(), _res)
+        )
+        _uniq, _idx = np.unique(_cells, return_inverse=True)
+        _rows = []
+        for _i, _y in enumerate(_years):
+            _flat = _cube[_i].ravel()
+            _ok = _flat != NODATA
+            if not _ok.any():
+                continue
+            # Majority class per H3 cell, without a groupby: one bincount over
+            # cell * 256 + class, then argmax along the class axis.
+            _hist = np.bincount(
+                _idx[_ok].astype(np.int64) * 256 + _flat[_ok],
+                minlength=len(_uniq) * 256,
+            ).reshape(len(_uniq), 256)
+            _seen = _hist.sum(1) > 0
+            _mode = _hist.argmax(1)[_seen].astype(np.int16)
+            for _c, (_n, _p, _big) in patch_stats(_uniq[_seen], _mode).items():
+                _rows.append((int(_y), _c, _n, _p, _big))
+        _patch = pa.table(
+            {
+                "year": pa.array([r[0] for r in _rows], pa.int32()),
+                "cls": pa.array([r[1] for r in _rows], pa.int16()),
+                "cells": pa.array([r[2] for r in _rows], pa.int32()),
+                "patches": pa.array([r[3] for r in _rows], pa.int32()),
+                "largest": pa.array([r[4] for r in _rows], pa.int32()),
+            }
+        )
+
+        # ---- stitch the two into one per-class summary, first year vs last
+        _cy = np.asarray(_comp["year"]); _cc = np.asarray(_comp["cls"])
+        _cp = np.asarray(_comp["pct"])
+        _py = np.asarray(_patch["year"]); _pc = np.asarray(_patch["cls"])
+        _pn = np.asarray(_patch["patches"])
+        _y0, _y1 = int(min(_years)), int(max(_years))
+
+        def _at(ys, cs, vs, y, c):
+            m = (ys == y) & (cs == c)
+            return float(vs[m][0]) if m.any() else 0.0
+
+        _classes = sorted(
+            {int(c) for c in _cc},
+            key=lambda c: -_at(_cy, _cc, _cp, _y1, c),
+        )
+        _rows_md = [
+            "| class | "
+            f"{_y0} area | {_y1} area | change | {_y0} patches | {_y1} patches | change |",
+            "|---|---:|---:|---:|---:|---:|---:|",
+        ]
+        for _c in _classes:
+            _a0, _a1 = _at(_cy, _cc, _cp, _y0, _c), _at(_cy, _cc, _cp, _y1, _c)
+            if max(_a0, _a1) < 0.5:
+                continue  # under half a percent of the box in both years
+            _q0, _q1 = _at(_py, _pc, _pn, _y0, _c), _at(_py, _pc, _pn, _y1, _c)
+            _rows_md.append(
+                f"| {GROUPS.get(_c, (str(_c),))[0]} | {_a0:.1f}% | {_a1:.1f}% | "
+                f"{_a1 - _a0:+.1f} | {_q0:.0f} | {_q1:.0f} | {_q1 - _q0:+.0f} |"
+            )
+
+        # ---- small multiples: area and patches per class, on their own panels.
+        # One panel per class, NOT sixteen lines in sixteen colours: the classes are told
+        # apart by position and label, so nothing here depends on telling two hues apart.
+        _show = [c for c in _classes if max(
+            _at(_cy, _cc, _cp, _y0, c), _at(_cy, _cc, _cp, _y1, c)) >= 0.5][:8]
+        _fig = None
+        if _show:
+            _fig, _axes = plt.subplots(
+                2, len(_show), figsize=(2.05 * len(_show), 4.2), sharex=True, squeeze=False
+            )
+            for _j, _c in enumerate(_show):
+                _m = _cc == _c
+                _ax = _axes[0][_j]
+                _ax.plot(_cy[_m], _cp[_m], lw=1.6, color="#1b4b8f")
+                _ax.set_title(GROUPS.get(_c, (str(_c),))[0], fontsize=8)
+                _ax.tick_params(labelsize=7)
+                _ax.set_ylim(bottom=0)
+                _m = _pc == _c
+                _ax = _axes[1][_j]
+                _ax.plot(_py[_m], _pn[_m], lw=1.6, color="#c98a00")
+                _ax.tick_params(labelsize=7)
+                _ax.set_ylim(bottom=0)
+            _axes[0][0].set_ylabel("% of AOI", fontsize=8)
+            _axes[1][0].set_ylabel("patches", fontsize=8)
+            _fig.tight_layout()
+
+        _out = mo.vstack(
+            [
+                mo.md(
+                    f"### AOI · res {_res} · {_cube.shape[2]}x{_cube.shape[1]} px/year "
+                    f"· {len(_years)} years"
+                ),
+                mo.md("\n".join(_rows_md)),
+                _fig if _fig is not None else mo.md(""),
+                mo.md(
+                    "Top row is **area**, the cell question. Bottom row is **patches**, the "
+                    "object question: a class can hold its share of the box while breaking "
+                    "into more pieces, and only the dissolve sees that."
+                ),
+                mo.accordion({"the SQL": mo.md(f"```sql{AOI_SQL}```")}),
+            ],
+            gap=0.5,
+        )
+
+    _out
     return
 
 
