@@ -1603,6 +1603,14 @@ def _(GROUPS, controls, deck, mo, status):
 
     mo.vstack(
         [
+            # ABOVE THE MAP, because it is only useful before you reach for the wrong
+            # button. Under the map it arrived after the mistake and was competing for the
+            # line the legend already owns.
+            mo.md(
+                "<div style='font-size:.8rem;opacity:.75'>Fullscreen: use marimo's "
+                "control, not the map's, which takes the canvas alone and hides the "
+                "legend and layer controls with it.</div>"
+            ),
             status,
             deck,
             mo.md(
@@ -1610,8 +1618,7 @@ def _(GROUPS, controls, deck, mo, status):
                 + "".join(_sw)
                 + "</div>\n\nColour is the majority class in the cell; hover for its "
                 "**purity**. **Draw a box** (box button, bottom right) for 40 years of "
-                "analytics below. For fullscreen use marimo's own control, not the map's: "
-                "the map's hides the legend and the layer controls with it."
+                "analytics below."
             ),
             controls,
         ],
