@@ -30,6 +30,52 @@ Python RSS stays flat (~0.68 GB) because one fixed table name means DataFusion h
 one window at a time. `ctx.deregister_table("lc")` before each `from_dataset`, or it errors
 with "table lc already exists".
 
+**The res 5 and res 6 rows of that table are superseded.** See below: those two reads were
+sized against a pyramid one level shorter than the one in the file.
+
+## The pyramid has SEVEN levels, and the table above only knew about six
+
+The `LEVEL_FOR_RES` comment described the source as "L0 30 m, L1 60, L2 120, L3 240, L4 480,
+L5 960" and the mapping stopped at L5. Parsing the BigTIFF IFD chain of
+`Annual_NLCD_LndCov_2024_CU_C1V1.tif` directly says otherwise:
+
+| IFD | size | m/px |
+|-----|------|------|
+| 0 | 160000 x 105000 | 30 |
+| 1-5 | ... | 60 / 120 / 240 / 480 / 960 |
+| **6** | **2500 x 1640** | **1920** |
+
+The chain terminates after IFD 6, so L6 is genuinely the last one. `_levels = [_g,
+*_g.overviews]` already contained index 6; nothing ever selected it. `LEVEL_FOR_RES` is now
+`{5: 6, 6: 5, 7: 4, 8: 3, 9: 2, 10: 1, 11: 0}`, which is also just `11 - res` and drops the
+odd doubled-up `{6: 4, 7: 4}`.
+
+| res | was | now | px/hex | read px |
+|-----|-----|-----|--------|---------|
+| 5 | L5 | **L6** | 277 -> ~69 | 16.2M -> ~4.1M |
+| 6 | L4 | **L5** | 157 -> ~39 | 4.9M -> ~1.2M |
+
+Res 7 down are untouched. The whole of L6 is 4.1M uint8 pixels for the conterminous US,
+about 4 MB, so the opening whole-country draw stops being the one read that costs anything.
+
+Two things worth keeping:
+
+- **The oversampling was visible in this file the whole time.** 277 px/hex sat in the table
+  next to 2.3 px/hex at res 11, and the fine end being usable at 2.3 is the proof that 277
+  is roughly a hundred times more than a modal class needs. The number was recorded and not
+  read as a finding.
+- **Coarse overviews of CATEGORICAL data are only safe if the pyramid is nearest or mode
+  resampled.** An `average` over class codes blends 41 and 82 into 61, which is a legal-looking
+  number and a meaningless one. Verified before the change rather than assumed: one 512x512
+  tile decoded (deflate, predictor 1) from L6, L5 and L0, and every distinct value is a legal
+  NLCD code, `{11,21,22,23,24,31,41,42,43,52,71,81,82,90,95}` plus 250 at L5. Any future
+  dataset dropped into this pipeline needs the same check before its coarse levels are used.
+
+The general lesson for other rasters: being a COG does not mean "read fewer pixels", it means
+"read the right pyramid level and only the tiles under the viewport". The tile half was
+already right, and `TILE = 512` matching the file's internal tile size is why there is no read
+amplification. The level half was loose at the coarse end only.
+
 **res 11 is the floor, not a cap.** A res 11 hexagon holds 2.3 pixels of 30 m NLCD; res 12
 would hold 0.6 and the map would hole out. The ceiling belongs to the data.
 

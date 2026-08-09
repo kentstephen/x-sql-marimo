@@ -333,16 +333,25 @@ def _(math):
     NODATA = 250
 
     # Which overview each H3 resolution reads. The source pyramid is 30 m native and
-    # doubles: L0 30 m, L1 60, L2 120, L3 240, L4 480, L5 960.
+    # doubles SEVEN times: L0 30 m, L1 60, L2 120, L3 240, L4 480, L5 960, L6 1920.
+    # L6 is 2500x1640 for the whole conterminous US, ~4 MB of uint8. This comment used to
+    # stop at L5 and so did the table below, which is the only reason the top two rows read
+    # a level finer than they need.
     #
-    # Picked so the mode has enough pixels under it to mean something. px/hex, measured:
-    #   res 5  L5   277  ·  res 6  L4  157  ·  res 7  L4  22  ·  res 8  L3  12.5
-    #   res 9  L2   7.1  ·  res 10 L1  4.1  ·  res 11 L0  2.3
+    # Picked so the mode has enough pixels under it to mean something. px/hex:
+    #   res 5  L6   69  ·  res 6  L5  39  ·  res 7  L4  22  ·  res 8  L3  12.5
+    #   res 9  L2  7.1  ·  res 10 L1  4.1  ·  res 11 L0  2.3
+    # (res 7 down are measured; res 5 and 6 are their measured 277 and 157 divided by the
+    # 4x area of one coarser level.)
+    #
+    # Using L6 at all depends on the pyramid being nearest/mode resampled, since an
+    # `average` over class codes is a blend of arbitrary integers. Verified rather than
+    # assumed: one 512x512 tile decoded from L6, L5 and L0 contains only legal NLCD codes.
     #
     # res 11 against 30 m imagery is 2.3 pixels per hexagon, and that is the floor: res 12
     # would be 0.6 and the map would hole out. This is where the data stops, not where the
     # code does.
-    LEVEL_FOR_RES = {5: 5, 6: 4, 7: 4, 8: 3, 9: 2, 10: 1, 11: 0}
+    LEVEL_FOR_RES = {5: 6, 6: 5, 7: 4, 8: 3, 9: 2, 10: 1, 11: 0}
     MAX_RES = 11
 
     # The map's pixel size, assumed. It only sets how much of the world the viewport box
