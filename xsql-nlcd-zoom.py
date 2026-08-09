@@ -201,6 +201,31 @@ def _(anywidget, traitlets):
             return w;
           };
 
+          // Integer slider, and it fires on CHANGE not INPUT: each step re-dissolves
+          // the wash, which is ~1 s of work, so it runs when the handle is released.
+          const steps = (key, label, lo, hi) => {
+            const w = document.createElement("span");
+            w.style.cssText = "display:inline-flex;align-items:center;gap:.4rem";
+            const cap = document.createElement("span");
+            cap.style.cssText = "opacity:.7;white-space:nowrap";
+            const draw = () => { cap.textContent = label + " " + model.get(key); };
+            const s = document.createElement("input");
+            s.type = "range";
+            s.min = String(lo); s.max = String(hi); s.step = "1";
+            s.value = model.get(key);
+            s.style.cssText = "width:7rem;margin:0;cursor:pointer";
+            s.addEventListener("input", () => { cap.textContent = label + " " + s.value; });
+            s.addEventListener("change", () => {
+              model.set(key, parseInt(s.value, 10));
+              model.save_changes();
+            });
+            model.on("change:" + key, () => { s.value = model.get(key); draw(); });
+            draw();
+            w.appendChild(cap);
+            w.appendChild(s);
+            return w;
+          };
+
           const head = document.createElement("span");
           head.textContent = "layers";
           head.style.cssText =
@@ -211,16 +236,26 @@ def _(anywidget, traitlets):
           box.appendChild(check("cluster_fill", "Cluster fill"));
           box.appendChild(check("cluster_line", "Cluster outline"));
           box.appendChild(slider("cell_opacity", "cell opacity"));
+          box.appendChild(slider("cell_coverage", "cell coverage"));
           box.appendChild(slider("cluster_opacity", "cluster opacity"));
+          box.appendChild(steps("min_cluster", "min cluster", 1, 300));
           el.appendChild(box);
         }
         export default { render };
         """
         cells = traitlets.Bool(True).tag(sync=True)
-        cluster_fill = traitlets.Bool(False).tag(sync=True)
+        cluster_fill = traitlets.Bool(True).tag(sync=True)
         cluster_line = traitlets.Bool(True).tag(sync=True)
         cell_opacity = traitlets.Float(0.7).tag(sync=True)
+        # Hexagon size as a fraction of the cell. 1.0 is edge to edge; below about
+        # 0.85 the gaps open up and the basemap reads through the lattice.
+        cell_coverage = traitlets.Float(0.9).tag(sync=True)
         cluster_opacity = traitlets.Float(1.0).tag(sync=True)
+        # Smallest run of touching like cells that earns a dissolved polygon. THIS is what
+        # decides whether the fill-only view covers the map or leaves it nearly empty: at
+        # 50, a whole-country fold produced 51 polygons, so turning the hexes off left
+        # almost nothing on screen. Low values cover more and cost more, steeply.
+        min_cluster = traitlets.Int(20).tag(sync=True)
 
     return (Controls,)
 
@@ -271,7 +306,7 @@ def _(math):
     CLUSTER_WIDTH = 2  # stroke width in screen pixels
     # 1.0 is the class colour exactly. Lower values darken the edge; below about 0.6 every
     # class collapses toward black and the outlines stop telling each other apart.
-    CLUSTER_DARKEN = 1.0
+    CLUSTER_DARKEN = 2.5
 
     # Seconds of camera quiet before a fold starts. Every fold is now an object-store read,
     # so rapid back-and-forth should read once at the end, not at every position it passed
@@ -631,14 +666,38 @@ def _(
     # dissolved from the cells that are on screen right now. Visible needs both.
     WANT = {"clusters": True, "built": False}
 
+    def apply_controls():
+        """Push every control onto the layers, once, at build time.
+
+        THIS IS THE FIX FOR "the fill checkbox does nothing". The layer was constructed
+        with filled=True while the checkbox defaulted to False, so the panel and the layer
+        disagreed from the first frame: the box was empty, the fill was already on, and
+        the first click set filled=True, which changed nothing anyone could see. Nothing
+        keeps two hand-written defaults in step, so the widget is now the only place a
+        default lives and the layer is told what it says.
+        """
+        h3_layer.visible = controls.cells
+        h3_layer.opacity = controls.cell_opacity
+        h3_layer.coverage = controls.cell_coverage
+        clusters.filled = controls.cluster_fill
+        clusters.stroked = controls.cluster_line
+        clusters.opacity = controls.cluster_opacity
+        WANT["clusters"] = controls.cluster_fill or controls.cluster_line
+
+    apply_controls()
+
     def _on_controls(change):
         name, val = change["name"], change["new"]
         if name == "cells":
             h3_layer.visible = val
         elif name == "cell_opacity":
             h3_layer.opacity = val
+        elif name == "cell_coverage":
+            h3_layer.coverage = val
         elif name == "cluster_opacity":
             clusters.opacity = val
+        elif name == "min_cluster":
+            rewash()
         else:
             # Fill and outline are the two halves of the cluster layer. With both off there
             # is nothing left to draw, so the layer itself comes off and stays off until one
@@ -649,7 +708,15 @@ def _(
 
     controls.observe(
         _on_controls,
-        names=["cells", "cluster_fill", "cluster_line", "cell_opacity", "cluster_opacity"],
+        names=[
+            "cells",
+            "cluster_fill",
+            "cluster_line",
+            "cell_opacity",
+            "cell_coverage",
+            "cluster_opacity",
+            "min_cluster",
+        ],
     )
 
     def _lat_to_y(lat):
@@ -695,9 +762,17 @@ def _(
         # max(1, ...): infer_rows_per_chunk returns 0 for an empty table, and lonboard
         # asserts max_chunksize > 0 on the way out.
         h3_layer._rows_per_chunk = max(1, infer_rows_per_chunk(tbl))
-        # Held together so deck sees one update rather than a frame with a new table
-        # against the old hexagon column.
-        with h3_layer.hold_trait_notifications():
+        # THE BLACK-HEXAGON FIX, and it has to be hold_sync, NOT
+        # hold_trait_notifications. hold_trait_notifications batches the traitlets
+        # NOTIFICATIONS, but ipywidgets' notify_change calls send_state(key=name) as each
+        # one fires, so the browser still received THREE separate comm messages: table,
+        # then hexagons, then colours. Between message two and three deck holds the NEW
+        # hexagon ids against the OLD, shorter colour buffer, and WebGL reads past the end
+        # of a short attribute as zeros. Zero is opaque black. That is the flash of black
+        # cells on a resolution change: not nodata, not the transform, just one rendered
+        # frame with the colours missing. hold_sync defers the send itself and emits a
+        # single message carrying all three, so no frame can see them disagree.
+        with h3_layer.hold_sync():
             h3_layer.table = tbl
             h3_layer.get_hexagon = tbl["hex"]
             h3_layer.get_fill_color = tbl["color"]
@@ -724,6 +799,15 @@ def _(
             and HOLD["box"]
             and _covers(HOLD["box"], seen)
         ):
+            # ...except possibly for the wash. THIS IS WHY THE POLYGONS SOMETIMES DID NOT
+            # RENDER. The dissolve is deliberately skipped when a camera event arrives
+            # while it is about to run, because a wash for a view that has already moved is
+            # wasted work. But nothing ever came back for it: the next _draw found the
+            # screen already correct and returned here, so the cells were right and the
+            # outlines were simply absent, for as long as you stayed put. It looked random
+            # because it depended on whether one more camera event landed inside a
+            # particular half-second.
+            ensure_wash()
             return
 
         # A resolution we have folded before, still covering the screen. This is the whole
@@ -738,6 +822,16 @@ def _(
                 f"<b>res {res}</b> · {hit[1].num_rows:,} cells · cached"
                 f" · zoom {vs.zoom:.1f} · {HOLD['source']}",
             )
+            # The wash was cached with the cells it describes, so a zoom back to a level
+            # already visited gets its outlines back instantly. Without this the cluster
+            # layer stayed hidden on every cache hit, because _show hides it and only the
+            # dissolve path ever turns it on again: zoom out and the outlines were simply
+            # gone until something forced a real fold.
+            if hit[2] is not None:
+                put_clusters(hit[2])
+            else:
+                # Cached cells, but the wash for them was skipped mid-drag. Dissolve now.
+                ensure_wash()
             return
 
         # NOTHING ON SCREEN MAY OUTLIVE ITS RESOLUTION. Leaving the previous fold up for the
@@ -761,13 +855,16 @@ def _(
             status.value = f"<b>res {res}</b> · nothing here · zoom {vs.zoom:.1f}"
             return
         tbl = to_layer_table(raw)
-        HOLD["cache"][res] = (want, tbl)
+        # box, cells, wash, raw fold. The raw one is kept so the wash threshold can be
+        # changed without reading or refolding anything.
+        HOLD["cache"][res] = [want, tbl, None, raw]
         _show(
             tbl,
             res,
             want,
             f"<b>res {res}</b> · {tbl.num_rows:,} cells · {m_px:.0f} m"
-            f" · {read_px / 1e6:.2f}M px read · zoom {vs.zoom:.1f} · {HOLD['source']}"
+            f" · {'tiles cached' if read_px == 0 else f'{read_px / 1e6:.2f}M px fetched'}"
+            f" · zoom {vs.zoom:.1f} · {HOLD['source']}"
             + (f" · <b style='color:#E69F00'>{HOLD['jumps']} jumps</b>" if HOLD["jumps"] else ""),
         )
 
@@ -779,13 +876,65 @@ def _(
         await asyncio.sleep(0)
         if HOLD["pending"] is not None:
             return  # camera moved on; this wash would be for a view that is gone
-        ctbl = to_cluster_table(raw, MIN_CLUSTER, CLUSTER_DARKEN)
+        ctbl = to_cluster_table(raw, controls.min_cluster, CLUSTER_DARKEN)
         if ctbl is None:
             clusters.visible = False
-            WANT["built"] = False
+            # Built, in the sense that this fold HAS its answer and the answer is "no run
+            # is that large". False here would make ensure_wash redo the dissolve on every
+            # settle, for the one view where it is guaranteed to find nothing.
+            WANT["built"] = True
             return
+        if res in HOLD["cache"]:
+            HOLD["cache"][res][2] = ctbl
+        put_clusters(ctbl)
+
+    def ensure_wash():
+        """Dissolve the wash for the fold on screen, if it does not have one yet.
+
+        Cheap when there is nothing to do, which is the common case: a pan inside the
+        padded box calls this on every settle.
+        """
+        if WANT["built"] or not WANT["clusters"]:
+            return
+        rewash(quiet=True)
+
+    def rewash(quiet=False):
+        """Re-dissolve the CURRENT fold at the new threshold. No read, no refold.
+
+        The raw fold is kept in the cache precisely so this costs only the dissolve: the
+        pixels and the H3 aggregation are both already done, and the only thing changing
+        is which runs are large enough to draw.
+        """
+        ent = HOLD["cache"].get(HOLD["res"])
+        if not ent or ent[3] is None:
+            return
+        if not quiet:
+            status.value = f"<b>dissolving…</b> min cluster {controls.min_cluster}"
+        ctbl = to_cluster_table(ent[3], controls.min_cluster, CLUSTER_DARKEN)
+        ent[2] = ctbl
+        if ctbl is None:
+            clusters.visible = False
+            # Nothing here dissolves at this threshold, and that is an ANSWER, not a gap.
+            # Marking it built stops ensure_wash retrying the same expensive dissolve on
+            # every settle for as long as the camera sits still.
+            WANT["built"] = True
+            if not quiet:
+                status.value = (
+                    f"<b>min cluster {controls.min_cluster}</b> · no run that large here"
+                )
+            return
+        put_clusters(ctbl)
+        if not quiet:
+            status.value = (
+                f"<b>min cluster {controls.min_cluster}</b> · {ctbl.num_rows:,} polygons"
+            )
+
+    def put_clusters(ctbl):
+        """Put a dissolved wash on the cluster layer. The only place that does."""
         clusters._rows_per_chunk = max(1, infer_rows_per_chunk(ctbl))
-        with clusters.hold_trait_notifications():
+        # hold_sync for the same reason as the cells: one message, or deck draws the
+        # new polygons against the old colour buffer.
+        with clusters.hold_sync():
             clusters.table = ctbl
             clusters.get_line_color = ctbl["color"]
             clusters.get_fill_color = ctbl["color"]
@@ -925,6 +1074,96 @@ async def _(
     _fwd = Transformer.from_crs("EPSG:4326", _g.crs, always_xy=True)
     _l, _b, _r, _t = _g.bounds
 
+    # THE ONLY CACHE THAT SHOULD EXIST: NLCD PIXELS, ON A FIXED GRID.
+    #
+    # Every fold used to issue one ranged read for its exact padded viewport, so panning
+    # half a screen re-read the half already in memory, at a different offset, and nothing
+    # could ever be reused: no two camera positions produce the same rectangle. Snapping to
+    # a fixed TILE grid per overview level is what makes a read SHAREABLE. A pan now touches
+    # the tiles it already holds plus a strip of new ones, and a zoom back to a level
+    # visited before is free.
+    #
+    # Measured against the single ranged read it replaces (source.coop, warm process):
+    #   L3 viewport 1400x620, cold    118 ms tiled  vs  162 ms direct   (parallelism wins)
+    #   L3 viewport, revisited          0 ms tiled  vs  128 ms direct
+    #   L5 whole country, cold        463 ms tiled  vs  179 ms direct   (70 tiles, once)
+    #   L5 whole country, revisited     2 ms tiled  vs  325 ms direct
+    # The one regression is the opening whole-country draw. Everything after it is free,
+    # and zoom-out is the motion that used to cost the most.
+    #
+    # FETCH_AT_ONCE is the number that matters: at 12 the same L5 read took 1,009 ms and
+    # the tiling looked like a mistake. Tiles are only faster if they are in flight
+    # together.
+    TILE = 512
+    TILE_BUDGET = 384 * 1024 * 1024  # uint8, so ~1,500 tiles resident
+    FETCH_AT_ONCE = 32
+
+    _tiles = {}  # (level, ty, tx) -> uint8 array; insertion order is LRU order
+    # A dict, not an int, because a marimo cell body is compiled at MODULE scope: `nonlocal`
+    # in a nested def is a SyntaxError there, and a bare rebind would shadow instead of
+    # accumulate. The export is what catches this; a plain import never runs the cell.
+    _held = {"bytes": 0}
+    _sem = asyncio.Semaphore(FETCH_AT_ONCE)
+
+    async def _tile(li, ty, tx):
+        rd = _levels[li]
+        H, W = rd.shape
+        r0, c0 = ty * TILE, tx * TILE
+        h, w = min(TILE, H - r0), min(TILE, W - c0)
+        async with _sem:
+            return np.asarray(
+                (
+                    await rd.read(
+                        window=Window(col_off=c0, row_off=r0, width=w, height=h)
+                    )
+                ).as_masked()[0]
+            )
+
+    async def _read_window(li, col0, row0, wpx, hpx):
+        """The window, assembled from cached tiles plus whatever is missing.
+
+        Returns (array, pixels actually fetched), so the status line reports network work
+        rather than window size. Verified byte-identical to a single ranged read of the
+        same window at L0, L2 and L4.
+        """
+        ty0, ty1 = row0 // TILE, (row0 + hpx - 1) // TILE
+        tx0, tx1 = col0 // TILE, (col0 + wpx - 1) // TILE
+        want = [(li, ty, tx) for ty in range(ty0, ty1 + 1) for tx in range(tx0, tx1 + 1)]
+        need = [k for k in want if k not in _tiles]
+
+        fetched = 0
+        if need:
+            got = await asyncio.gather(*(_tile(*k) for k in need))
+            for k, a in zip(need, got):
+                _tiles[k] = a
+                _held["bytes"] += a.nbytes
+                fetched += a.size
+            # Oldest first, and never evict a tile this window is about to read.
+            while _held["bytes"] > TILE_BUDGET and len(_tiles) > len(want):
+                for k in list(_tiles):
+                    if k not in want:
+                        _held["bytes"] -= _tiles.pop(k).nbytes
+                        break
+                else:
+                    break
+
+        out = np.full((hpx, wpx), NODATA, dtype=np.uint8)
+        for k in want:
+            _, ty, tx = k
+            a = _tiles[k]
+            sr, sc = ty * TILE, tx * TILE
+            r0, c0 = max(row0, sr), max(col0, sc)
+            r1, c1 = min(row0 + hpx, sr + a.shape[0]), min(col0 + wpx, sc + a.shape[1])
+            if r1 <= r0 or c1 <= c0:
+                continue
+            out[r0 - row0 : r1 - row0, c0 - col0 : c1 - col0] = a[
+                r0 - sr : r1 - sr, c0 - sc : c1 - sc
+            ]
+        # Touch: anything this window used goes to the young end of the LRU.
+        for k in want:
+            _tiles[k] = _tiles.pop(k)
+        return out, fetched
+
     def _bilinear(grid, gy, gx, rr, cc):
         _c = len(gy)
         fy = np.interp(rr, gy, np.arange(_c))
@@ -1005,7 +1244,8 @@ async def _(
         the registered table. Registering under one fixed name means DataFusion holds one
         window at a time, which is why RSS sits flat at 0.68 GB whatever the zoom.
         """
-        rd = _levels[LEVEL_FOR_RES[res]]
+        li = LEVEL_FOR_RES[res]
+        rd = _levels[li]
         L, B, R, T = rd.bounds
         H, W = rd.shape
         px_x, px_y = (R - L) / W, (T - B) / H
@@ -1020,13 +1260,9 @@ async def _(
         if wpx <= 0 or hpx <= 0:
             return None, rd.res[0], 0
 
-        arr = np.asarray(
-            (
-                await rd.read(
-                    window=Window(col_off=col0, row_off=row0, width=wpx, height=hpx)
-                )
-            ).as_masked()[0]
-        )
+        # Tiles, not a bespoke rectangle. `fetched` is what actually crossed the
+        # network, which is usually far less than the window.
+        arr, fetched = await _read_window(li, col0, row0, wpx, hpx)
 
         # The window's own corner, not the raster's. Everything downstream is relative to it.
         wl, wt = L + col0 * px_x, T - row0 * px_y
@@ -1077,7 +1313,7 @@ async def _(
                    CAST(max(n) AS DOUBLE) / sum(n) AS purity
             FROM counts GROUP BY hex
         """).to_arrow_table()
-        return out, rd.res[0], wpx * hpx
+        return out, rd.res[0], fetched
 
     # Hand the fold to the camera's world and draw where the camera already is.
     HOLD["fold"] = fold
