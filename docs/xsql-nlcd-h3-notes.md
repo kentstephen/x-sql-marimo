@@ -159,6 +159,34 @@ returns LargeList and DataFusion rejects the mismatch outright. `c.hex > r.hex` 
 edge list losslessly (grid_disk emits every adjacency twice; verified 1,003,266 edges ->
 501,633 unordered-unique, identical partitions either way).
 
+## The class menu: a display filter on the fold already in hand
+
+The map opens on **forest**, not on everything. All sixteen classes at once is a picture of
+the country; one grouping is a question about it, and the outlines only read as regions when
+they are not every class bordering every other. `CLASS_SETS` holds six entries (forest,
+developed, agriculture, water and wetland, barren/shrub/grass, everything) and feeds a
+`<select>` in the `Controls` widget, so the groupings are written down once, next to the
+palette they select from, and never a second time in JS.
+
+Three things decide where the filter is applied:
+
+- **On the RAW fold, before anything is derived.** `filter_classes` runs on the mode table,
+  and both the cells and the wash are built from what it returns, so an outline can only ever
+  describe cells that are actually on screen. Filtering at the layer instead would leave the
+  dissolve dissolving classes that are not drawn.
+- **No read and no refold.** The raw fold is already kept per resolution so `min cluster` can
+  be changed for the price of a dissolve; the filter rides the same cache entry. A switch is
+  one `np.isin` and one `WASH_SQL`, tens of milliseconds against a round trip to the bucket.
+- **Every other cached level is invalidated, not evicted.** `refilter` drops the derived
+  cells and wash for every resolution except the one on screen and keeps their raw folds, so
+  zooming back re-derives instead of re-reading, and no cached level can paint the previous
+  filter's cells.
+
+The empty case is real: ask for agriculture over the Sierra and nothing survives. A zero-row
+table kills deck (see below), so it goes through the same 1-row seed table the layer was
+built with, and the true count is carried in the cache entry, because the layer's `num_rows`
+is then 1 and 1 is not the answer.
+
 ## Things that cost a session each
 
 **lonboard latches `_rows_per_chunk` in `__init__` and never recomputes it.**

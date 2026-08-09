@@ -44,6 +44,10 @@ implementation, so that work never reaches it.
 
 - **Colour is the majority class** in each cell. Hover for its *purity*: how much of the
   cell actually is that class.
+- **It opens on forest.** The `classes` menu under the map switches between broad
+  groupings (forest, developed, agriculture, water and wetland, barren/shrub/grass) and
+  *Everything*. It filters the fold already in hand, so a switch costs one dissolve and
+  no read, and the outlines are dissolved from exactly the cells on screen.
 - **Outlines** are dissolved regions, one polygon per run of touching same-class cells,
   built in a single SQL statement.
 - **Draw a box** and it is folded across all 40 years of Annual NLCD, 1985 to 2024, at
@@ -53,33 +57,25 @@ implementation, so that work never reaches it.
   see that. Kentucky, 1985 to 2024: Pasture/Hay loses 2.9 points of area while going from
   90 patches to 121.
 
-Forty years of a drawn box costs about 300 ms of reads, for the same reason as above: the
-box is small and the overview matches the resolution.
+Forty years of a drawn box costs about 300 ms of reads, for the same reason as above: the box is small and the overview matches the resolution.
 
 ## Pipeline
 
-1. **Camera moves.** A debounced coroutine reads the padded viewport, so a drag reads once
-   at the end rather than at every position it passed through.
-2. **Stream** the overview window with `obstore` + `async-geotiff`, from a 512-tile cache
-   keyed per overview level, so panning re-reads only the new strip.
-3. **Raster to H3 in SQL** with xarray-sql over DataFusion, `h3_latlng_to_cell` wired in
-   as an h3ronpy UDF, taking the modal class per cell.
+1. **Camera moves.** A debounced coroutine reads the padded viewport, so a drag reads once at the end rather than at every position it passed through.
+2. **Stream** the overview window with `obstore` + `async-geotiff`, from a 512-tile cache keyed per overview level, so panning re-reads only the new strip.
+3. **Raster to H3 in SQL** with xarray-sql over DataFusion, `h3_latlng_to_cell` wired in as an h3ronpy UDF, taking the modal class per cell.
 4. **Dissolve to outlines** in DuckDB: dissolve per class, `ST_Dump` into connected runs,
    drop the speckle.
-5. **Render** flat H3 hexagons in NLCD's own palette, swapping traits on live layers so
-   the camera never re-runs a marimo cell.
+5. **Render** flat H3 hexagons in NLCD's own palette, swapping traits on live layers so the camera never re-runs a marimo cell.
 
 ## Colour
 
-The palette is NLCD's own, read out of the COG. The one it replaced was invented here on
-a teal-to-brown axis with the forests separated by lightness, which put deciduous forest
-at luminance 0.103 in a region where it is 39.7% of the cells: half the map came out near
-black. Lightness was the problem, not hue.
+The palette is NLCD's own, read out of the COG. The one it replaced was invented here on a teal-to-brown axis with the forests separated by lightness, which put deciduous forest at luminance 0.103 in a region where it is 39.7% of the cells: half the map came out near black. Lightness was the problem, not hue.
 
 ## Also here
 
 `xsql-nlcd-zoom.py` is the same notebook with the dissolve left in h3ronpy, kept so the
-benchmark above stays runnable rather than being a claim in a commit message.
+benchmark above stays runnable.
 `archive/` holds the earlier notebooks this grew out of (3DEP elevation, NAIP drapes,
 Overture buildings), kept for reference and not maintained.
 

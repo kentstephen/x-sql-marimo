@@ -40,7 +40,7 @@ Nothing is read until the camera asks for it. Each fold pulls only the padded vi
 from the overview that matches the H3 resolution it is about to build, registers that
 window with xarray-sql and folds it in SQL. The counter-intuitive part is that the FINEST
 views are the cheapest: the viewport shrinks faster than the resolution grows, so res 11
-at 30 m reads 72,890 pixels where res 5 at 960 m reads 16.2M.
+at 30 m reads 72,890 pixels where res 5 at 1920 m reads about 4.1M.
 
 That is what gets to res 11. Below it the cells would be finer than the imagery: a res 11
 hexagon holds 2.3 pixels of 30 m NLCD, and res 12 would hold 0.6 and hole out. The ceiling
@@ -277,6 +277,34 @@ def _(anywidget, traitlets):
             return w;
           };
 
+          // The class filter. Options come from the kernel (`class_options`) so the
+          // groupings are written down once, next to the palette they select from,
+          // rather than a second time in JS.
+          const choose = (key, optsKey, label) => {
+            const w = document.createElement("span");
+            w.style.cssText = "display:inline-flex;align-items:center;gap:.35rem";
+            const cap = document.createElement("span");
+            cap.textContent = label;
+            cap.style.cssText = "opacity:.7;white-space:nowrap";
+            const s = document.createElement("select");
+            s.style.cssText = "font:inherit;padding:.05rem .2rem;cursor:pointer";
+            for (const [val, txt] of model.get(optsKey)) {
+              const o = document.createElement("option");
+              o.value = val;
+              o.textContent = txt;
+              s.appendChild(o);
+            }
+            s.value = model.get(key);
+            s.addEventListener("change", () => {
+              model.set(key, s.value);
+              model.save_changes();
+            });
+            model.on("change:" + key, () => { s.value = model.get(key); });
+            w.appendChild(cap);
+            w.appendChild(s);
+            return w;
+          };
+
           // GROUPED, NOT SHORTENED. There are two opacities here and they do different
           // things: one dims the hexagons, one dims the cluster polygons. Trimming the
           // labels to fit one line made them both read as "opacity", which is why the
@@ -290,6 +318,8 @@ def _(anywidget, traitlets):
               "text-transform:uppercase;opacity:.5;padding-left:.2rem";
             return g;
           };
+          box.appendChild(group("classes"));
+          box.appendChild(choose("class_set", "class_options", "show"));
           box.appendChild(group("hexagons"));
           box.appendChild(check("cells", "show"));
           box.appendChild(slider("cell_opacity", "opacity"));
@@ -303,6 +333,12 @@ def _(anywidget, traitlets):
         }
         export default { render };
         """
+        # FOREST, not everything, on purpose. The full palette over a whole state is a
+        # picture of the country; one grouping is a question about it, and the outlines
+        # only read as regions when they are not every class bordering every other.
+        # "all" is in the menu for the picture.
+        class_set = traitlets.Unicode("forest").tag(sync=True)
+        class_options = traitlets.List([]).tag(sync=True)
         cells = traitlets.Bool(True).tag(sync=True)
         # OFF by default now that the outline is dissolved on parent hexagons. The
         # polygon is coarser than the cells and bulges past them, so filling it paints a
@@ -381,7 +417,7 @@ def _(math):
     # all of those runs are a handful of cells. 500 leaves the genuinely large regions.
     MIN_CLUSTER = 50
     CLUSTER_OPACITY = 1.0
-    CLUSTER_WIDTH = 3  # stroke width in screen pixels
+    CLUSTER_WIDTH = 4  # stroke width in screen pixels
     # 1.0 is the class colour exactly. Lower values darken the edge; below about 0.6 every
     # class collapses toward black and the outlines stop telling each other apart.
     CLUSTER_DARKEN = 1.0
@@ -455,6 +491,23 @@ def _(math):
         90: ("Woody wetland", (184, 217, 235)),
         95: ("Herbaceous wetland", (108, 159, 184)),
     }
+    # WHAT THE MAP IS SHOWING. Broad groupings over the 16 NLCD classes, because "all of
+    # them at once" is a picture and "one thing at a time" is a question: forest against
+    # everything that is not forest is legible in a way the full palette is not, and the
+    # dissolved outlines stop being a mosaic of every neighbour and become the shape of
+    # one land cover. It is a DISPLAY filter, applied to the fold that is already in hand:
+    # switching costs a re-derive of the cells and one dissolve, no read and no refold.
+    # None means no filter at all.
+    CLASS_SETS = {
+        "forest": ("Forest", (41, 42, 43)),
+        "developed": ("Developed", (21, 22, 23, 24)),
+        "agriculture": ("Agriculture", (81, 82)),
+        "water": ("Water & wetland", (11, 12, 90, 95)),
+        "open": ("Barren, shrub & grass", (31, 52, 71)),
+        "all": ("Everything", None),
+    }
+    # Lists, not tuples: this crosses to the browser as JSON on a synced trait.
+    CLASS_OPTIONS = [[_k, _v[0]] for _k, _v in CLASS_SETS.items()]
     # One year, pinned. The slider is out until the camera path is proven: a year change
     # is a fresh read of the whole country, and there is no point putting that behind a
     # control while the thing it feeds is still the open question.
@@ -466,6 +519,8 @@ def _(math):
     # runs on. Opening 40 COG headers is the one real cost, 3,979 ms, so it is prefetched.
     YEARS = list(range(1985, 2025))
     return (
+        CLASS_OPTIONS,
+        CLASS_SETS,
         CLUSTER_DARKEN,
         CLUSTER_OPACITY,
         CLUSTER_WIDTH,
@@ -534,6 +589,18 @@ def _(
     for _c, (_lbl, _rgb) in GROUPS.items():
         _lut[_c] = _rgb
     _names = np.array([GROUPS.get(i, ("", None))[0] for i in range(256)], dtype=object)
+
+    def filter_classes(tbl, keep):
+        """Keep only the classes in `keep`, on the RAW fold, before anything is derived.
+
+        Filtering here rather than at the layer is what makes the dissolve agree with the
+        cells: the wash is dissolved from whatever rows this returns, so an outline can
+        only ever describe cells that are actually on screen. `keep` of None is the
+        everything case and costs nothing.
+        """
+        if keep is None or tbl is None or tbl.num_rows == 0:
+            return tbl
+        return tbl.filter(pa.array(np.isin(np.asarray(tbl["mode_cls"]), list(keep))))
 
     def to_layer_table(tbl):
         # combine_chunks because DataFusion returns many chunks and the numpy-derived
@@ -716,6 +783,7 @@ def _(
         )
 
     return (
+        filter_classes,
         patch_stats,
         seed_cluster,
         seed_table,
@@ -727,6 +795,8 @@ def _(
 @app.cell
 def _(
     BitmapTileLayer,
+    CLASS_OPTIONS,
+    CLASS_SETS,
     CLUSTER_DARKEN,
     CLUSTER_OPACITY,
     CLUSTER_WIDTH,
@@ -743,6 +813,7 @@ def _(
     VIEW_H,
     VIEW_W,
     asyncio,
+    filter_classes,
     infer_rows_per_chunk,
     math,
     res_for_zoom,
@@ -829,7 +900,53 @@ def _(
     # WANT is what the USER asked for; the fold code below owns `clusters.visible` on its
     # own schedule (outlines are hidden the moment the cells they describe go away) and has
     # to ask WANT before turning them back on, or a fold would undo the switch.
-    controls = Controls()
+    controls = Controls(class_options=CLASS_OPTIONS)
+
+    def class_entry():
+        """The menu's current entry, falling back to the DEFAULT and never to None.
+
+        A `.get(key, (..., None))` here would be a trapdoor: None is the everything case,
+        so any key the dict did not recognise would quietly draw all sixteen classes and
+        look like the filter had failed rather than like a bad key. Falling back to the
+        trait's own default keeps an unknown key visible as the wrong grouping instead of
+        as no grouping.
+        """
+        return CLASS_SETS.get(
+            controls.class_set, CLASS_SETS[Controls.class_set.default_value]
+        )
+
+    def class_keep():
+        """The classes the menu is asking for, or None for everything."""
+        return class_entry()[1]
+
+    def class_label():
+        return class_entry()[0]
+
+    def count_note(n):
+        keep = class_keep()
+        return f"{n:,} cells" if keep is None else f"{n:,} {class_label().lower()} cells"
+
+    def derive(raw, wash=True):
+        """Raw fold -> (cells table, wash, how many cells survived the filter).
+
+        The one place the class filter is applied, so the cells and the outlines can never
+        disagree about what is on screen. An empty result gets the seed table rather than a
+        zero-row one: lonboard rechunks on every assignment and an empty table has no
+        chunk size to infer, and a hexagon at null island is invisible from anywhere in
+        CONUS anyway.
+
+        `wash=False` is the mid-drag case: the dissolve is the expensive half and a wash
+        for a view that has already moved is wasted, so the caller skips it and
+        ensure_wash picks it up on the next settle.
+        """
+        sel = filter_classes(raw, class_keep())
+        if sel is None or sel.num_rows == 0:
+            return seed_table(), None, 0
+        return (
+            to_layer_table(sel),
+            to_cluster_table(sel, controls.min_cluster, CLUSTER_DARKEN) if wash else None,
+            sel.num_rows,
+        )
     # "clusters": does the user want them. "built": does the layer currently hold polygons
     # dissolved from the cells that are on screen right now. Visible needs both.
     WANT = {"clusters": True, "built": False}
@@ -866,17 +983,28 @@ def _(
             clusters.opacity = val
         elif name == "min_cluster":
             rewash()
+        elif name == "class_set":
+            refilter()
         else:
             # Fill and outline are the two halves of the cluster layer. With both off there
             # is nothing left to draw, so the layer itself comes off and stays off until one
             # of them is asked for again.
             setattr(clusters, "filled" if name == "cluster_fill" else "stroked", val)
             WANT["clusters"] = controls.cluster_fill or controls.cluster_line
+            # ASKING FOR THEM IS ALSO ASKING FOR THEM TO EXIST. This is why "fill does
+            # nothing": every path that skips the dissolve leaves WANT["built"] False, and
+            # ensure_wash only ran on a camera settle, so a click with no wash in hand set
+            # filled=True on a layer that was invisible and stayed invisible until you
+            # happened to move the map. With both halves off, ensure_wash refused for the
+            # same reason, so turning one back on could never recover on its own.
+            if WANT["clusters"]:
+                ensure_wash()
             clusters.visible = WANT["clusters"] and WANT["built"]
 
     controls.observe(
         _on_controls,
         names=[
+            "class_set",
             "cells",
             "cluster_fill",
             "cluster_line",
@@ -991,11 +1119,16 @@ def _(
         # read, so it lands complete and instantly instead of arriving a second later.
         hit = HOLD["cache"].get(res)
         if not force and hit and _covers(hit[0], seen):
+            # The RAW fold outlives a filter change; the cells and the wash derived from it
+            # do not, and refilter drops them everywhere but the level on screen. Coming
+            # back to one of those levels re-derives instead of re-reading.
+            if hit[1] is None:
+                hit[1], hit[2], hit[4] = derive(hit[3])
             _show(
                 hit[1],
                 res,
                 hit[0],
-                f"<b>res {res}</b> · {hit[1].num_rows:,} cells · cached"
+                f"<b>res {res}</b> · {count_note(hit[4])} · cached"
                 f" · zoom {vs.zoom:.1f} · {HOLD['source']}",
                 keep_wash=hit[2] is not None,
             )
@@ -1027,10 +1160,12 @@ def _(
             HOLD["res"], HOLD["box"] = res, want
             status.value = f"<b>res {res}</b> · nothing here · zoom {vs.zoom:.1f}"
             return
-        tbl = to_layer_table(raw)
-        # box, cells, wash, raw fold. The raw one is kept so the wash threshold can be
-        # changed without reading or refolding anything.
-        HOLD["cache"][res] = [want, tbl, None, raw]
+        # box, cells, wash, raw fold, cells shown. The raw one is kept so the wash
+        # threshold and the class filter can both be changed without reading or refolding
+        # anything; the count is kept because the layer may be holding the seed table when
+        # the filter matched nothing, and 1 is not the answer.
+        tbl, ctbl, n_shown = derive(raw, wash=HOLD["pending"] is None)
+        HOLD["cache"][res] = [want, tbl, ctbl, raw, n_shown]
         # THE CELLS AND THE OUTLINES GO OUT TOGETHER, and the wash is built BEFORE either
         # is sent. The old order pushed the cells out first and let the outlines follow,
         # which made sense when the wash cost ~1 s of h3ronpy; in DuckDB it is ~215 ms, and
@@ -1041,16 +1176,11 @@ def _(
         #
         # The skip survives: if the camera has already moved, this wash is for a view that
         # is gone, and ensure_wash picks it up on the next settle.
-        ctbl = None
-        if HOLD["pending"] is None:
-            ctbl = to_cluster_table(raw, controls.min_cluster, CLUSTER_DARKEN)
-            HOLD["cache"][res][2] = ctbl
-
         _show(
             tbl,
             res,
             want,
-            f"<b>res {res}</b> · {tbl.num_rows:,} cells · {m_px:.0f} m"
+            f"<b>res {res}</b> · {count_note(n_shown)} · {m_px:.0f} m"
             f" · {'tiles cached' if read_px == 0 else f'{read_px / 1e6:.2f}M px fetched'}"
             f" · zoom {vs.zoom:.1f} · {HOLD['source']}"
             + (f" · <b style='color:#E69F00'>{HOLD['jumps']} jumps</b>" if HOLD["jumps"] else ""),
@@ -1089,7 +1219,9 @@ def _(
             return
         if not quiet:
             status.value = f"<b>dissolving…</b> min cluster {controls.min_cluster}"
-        ctbl = to_cluster_table(ent[3], controls.min_cluster, CLUSTER_DARKEN)
+        ctbl = to_cluster_table(
+            filter_classes(ent[3], class_keep()), controls.min_cluster, CLUSTER_DARKEN
+        )
         ent[2] = ctbl
         if ctbl is None:
             clusters.visible = False
@@ -1107,6 +1239,39 @@ def _(
             status.value = (
                 f"<b>min cluster {controls.min_cluster}</b> · {ctbl.num_rows:,} polygons"
             )
+
+    def refilter():
+        """Re-derive the CURRENT fold for the class menu. No read, no refold.
+
+        Same bargain as rewash: the raw fold is in hand, so changing what is shown costs
+        one filter and one dissolve. Every OTHER cached level has its cells and its wash
+        dropped but keeps its raw fold, so zooming back to it re-derives (milliseconds)
+        rather than re-reading (a round trip to the bucket) and can never paint the
+        previous filter's cells.
+        """
+        for _r, _e in HOLD["cache"].items():
+            if _r != HOLD["res"]:
+                _e[1], _e[2] = None, None
+        ent = HOLD["cache"].get(HOLD["res"])
+        if not ent or ent[3] is None:
+            return
+        status.value = f"<b>{class_label().lower()}…</b>"
+        tbl, ctbl, n = derive(ent[3])
+        ent[1], ent[2], ent[4] = tbl, ctbl, n
+        _show(
+            tbl,
+            HOLD["res"],
+            HOLD["box"],
+            f"<b>{class_label()}</b> · "
+            + (f"{count_note(n)}" if n else "none of it in this view")
+            + f" · res {HOLD['res']} · {HOLD['source']}",
+            keep_wash=ctbl is not None,
+        )
+        if ctbl is None:
+            clusters.visible = False
+            WANT["built"] = True
+            return
+        put_clusters(ctbl)
 
     def put_clusters(ctbl):
         """Put a dissolved wash on the cluster layer. The only place that does."""
@@ -1617,7 +1782,7 @@ def _(GROUPS, controls, deck, mo, status):
             # line the legend already owns.
             mo.md(
                 "<div style='font-size:.8rem;opacity:.75'>Fullscreen: use marimo's "
-                "button, not the button in lonboard, to use the"
+                "button, not the button in lonboard, to use the "
                 "legend and layer controls.</div>"
             ),
             status,
@@ -1625,8 +1790,15 @@ def _(GROUPS, controls, deck, mo, status):
             mo.md(
                 "<div style='display:flex;flex-wrap:wrap;font-size:.8rem;line-height:1.7'>"
                 + "".join(_sw)
+                # TWO LINES, AND THE BREAK IS PLACED, NOT LEFT TO THE WRAP. The console
+                # has to fit the window with nothing to scroll, so this text owns exactly
+                # two lines: one about colour, one about the box. `<br>` rather than a
+                # blank line, which would start a second paragraph and add its margin to
+                # a height that has none to give.
                 + "</div>\n\nColour is the majority class in the cell; hover for its "
-                "**purity**. **Draw a box** (box button, bottom right) for 40 years of "
+                "**purity**. The **classes** menu picks which are drawn; it opens on "
+                "forest.<br>"
+                "**Draw a box** (box button, bottom right) for 40 years of "
                 "analytics below."
             ),
             controls,
