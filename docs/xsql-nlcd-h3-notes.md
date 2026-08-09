@@ -175,6 +175,30 @@ timers -- the debounce is an await on the kernel's own loop.
 
 ## Open
 
+- **TODO: find more use for the multipolygons.** The dissolve already produces real
+  geometry, one polygon per contiguous run of like cells, and right now it is spent
+  entirely on drawing: a fill and an outline. That is the least it could be. The polygons
+  carry area, perimeter, holes, neighbours and containment, none of which the hexagons can
+  answer on their own, and they are built for free as a side effect of a fold that has
+  already happened. Directions, none of them picked:
+  - **Measure them.** Area per class per view, patch-size distributions, the largest
+    contiguous run on screen. Landscape ecology reads this way already (patch area, edge
+    density, contagion), and the numbers fall out of geometry that exists.
+  - **Fragmentation as the thing rendered.** Perimeter over area, or run count per unit
+    area, is a different map from land cover: how broken up a class is, rather than what
+    class is present. Same fold, different question.
+  - **Query targets.** A dissolved polygon is a natural AOI. Click a forest run and it
+    becomes the boundary for the next read: elevation inside it, imagery clipped to it, a
+    join against Overture footprints that fall in it.
+  - **Holes are information.** A hole in a crop polygon is a town, a lake, a woodlot.
+    `cells_to_wkb_polygons(link_cells=True)` already returns interior rings and nothing
+    downstream looks at them.
+  - **Across years.** The year is pinned at 2024 with the slider deliberately out. Two
+    years of the same AOI dissolved and overlaid is change as geometry: what a run gained,
+    lost, or split into, rather than a per-cell diff.
+  - **Export.** They are proper WKB polygons and could leave the notebook as GeoParquet or
+    FlatGeobuf, which makes the fold a data product rather than a picture.
+
 - **A glitch on zoom remains, unresolved.** Reported repeatedly: wrong resolution and
   incomplete coverage, transiently. The blanking and the cache reduce it but do not remove
   it. Not diagnosed.
