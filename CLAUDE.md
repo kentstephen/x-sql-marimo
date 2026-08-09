@@ -5,7 +5,7 @@ Guidance for Claude Code working in this repository. Inherits the global rules i
 
 ## Repository layout
 
-Two notebooks are the repo, side by side on purpose:
+Three notebooks are the repo:
 
 - `xsql-nlcd-zoom.py` folds and dissolves entirely in DataFusion + h3ronpy.
 - `xsql-duckdb-nlcd-h3.py` keeps the DataFusion fold and moves the dissolve to DuckDB's
@@ -13,10 +13,15 @@ Two notebooks are the repo, side by side on purpose:
   462 ms in DuckDB, and the dissolve is 75 ms in DuckDB against 928 ms in h3ronpy. The
   reason is which H3 lives underneath: duckdb-h3 wraps Uber's C library, h3ronpy wraps
   h3o. Keeping both means the comparison stays runnable rather than a claim in a commit.
+- `xsql-nlcd-imagery.py` is the DuckDB notebook with the hexagons switched OFF: only the
+  dissolved boundary is drawn, as thin lines over an Esri World Imagery tile layer. The
+  point is that the map becomes checkable rather than trustable, since the line either
+  follows a real edge on the ground or it does not. It also reads NLCD one overview finer
+  from res 7 up, because the boundary is decided by the cells where the class vote is
+  closest and those were thinnest on evidence.
 
-Two more run but are parked, not maintained, and not recommended:
-`xsql-duckdb-terrain-h3.py` and `xsql-nlcd-sentinel2.py`. See "Parked experiments" below
-before touching or rebuilding either.
+One more runs but is parked, not maintained, and not recommended:
+`xsql-duckdb-terrain-h3.py`. See "Parked experiments" below.
 
 Everything else that was built along the way lives in `archive/` (earlier notebooks, the
 Overture and NAIP helpers, the lonboard patch script) and is kept for reference, not
@@ -82,27 +87,44 @@ ctx.register_udf(h3_cell)
 Confirm the exact h3ronpy import path against the installed version before relying on
 it (the module layout has moved between releases).
 
-## Parked experiments (read before rebuilding either)
+## Imagery, and why it is a tile layer
 
-Two notebooks here run and are **not recommended**. Both were abandoned because the map
-they produce is not worth looking at, not because the data or the SQL failed.
+`xsql-nlcd-imagery.py` draws its imagery with a **`BitmapTileLayer`** pointed at Esri World
+Imagery. That is a retreat, and the reasons are worth knowing before anyone "improves" it.
 
-- `xsql-duckdb-terrain-h3.py` — NLCD class joined to Mapterhorn terrain on the H3 cell id,
-  hexagons extruded by elevation. The join works and the numbers are right. Height is a
-  weak encoding for a categorical map, and the extrusion buries the dissolved outlines,
-  which are the good part of this repo.
-- `xsql-nlcd-sentinel2.py` — dissolved NLCD boundaries as lines over Earth Genome's
-  Sentinel-2 mosaic. Better idea than the extrusion, and the data side is fully solved.
-  The render side never became stable.
+It first read Earth Genome's Sentinel-2 mosaics off source.coop, which had a real argument
+behind it: same year as the land cover, so a disagreement between the line and the ground
+could only be classification error. **The data side of that was fully solved** and is
+written up in `docs/imagery-and-terrain-notes.md`. The render side never became stable
+through two separate architectures. A `BitmapTileLayer` is the one imagery path here that
+always worked, because it is what already draws the place labels.
 
-**`docs/imagery-and-terrain-notes.md` has the full account** and most of it cost a session
-each. The load-bearing ones:
+- **URL is `{z}/{y}/{x}`.** Esri puts row before column, the opposite of the Carto labels
+  URL two layers above it in the same cell. Swapping them serves imagery from the wrong
+  place rather than 404ing, so it looks like a projection bug.
+- **The cost, and it is not small:** Esri World Imagery is a mosaic of many sources and
+  dates that vary by location, so the same-vintage rule is gone. A boundary can disagree
+  with the photograph because the ground genuinely changed, and nothing on screen tells
+  you which. Fine for judging whether a forest edge is roughly right. Not evidence about
+  a particular year. If that distinction ever matters, the Sentinel-2 data path in the
+  notes is the way back.
 
-- Earth Genome's S2 COGs are **EPSG:3857 already cut to the WebMercatorQuad grid**, so
-  level choice is a table lookup and the window is integer arithmetic. No warp anywhere.
-  Catalog is `stac.earthgenome.org`, not a bucket listing. Use `TCI` (uint8, fill 0,0,0),
-  never B04/B03/B02. The STAC `datetime` filter does not constrain these items; match the
-  year on the item id.
+**Fill is an alpha, not a flag.** `filled` decides whether deck builds a fill sublayer at
+all, and flipping it after init does not reliably make one appear. That is the real "the
+fill button does nothing" bug, and re-pushing the table does not fix it either. Keep the
+layer permanently `filled=True` and switch `get_fill_color` between the class colours and
+a transparent constant.
+
+## Parked experiment (read before rebuilding it)
+
+`xsql-duckdb-terrain-h3.py` joins NLCD to Mapterhorn terrain on the H3 cell id and extrudes
+the hexagons. The join works and the numbers are right. It was abandoned on looks: height
+is a weak encoding for a categorical map, and the extrusion buries the dissolved outlines,
+which are the good part of this repo. Full account and the Mapterhorn/PMTiles findings are
+in `docs/imagery-and-terrain-notes.md`.
+
+Other things from that work that cost a session each and apply anywhere in this repo:
+
 - **A `BitmapLayer` with `image=""` aborts deck's entire update pass**, because deck
   initialises all layers in one pass and a throw anywhere kills the batch. The symptom is
   a cascade of assertions naming perfectly healthy layers. An assertion naming a layer is
@@ -115,6 +137,9 @@ each. The load-bearing ones:
 - `line_width_units` defaults to **metres**; set it to `"pixels"` or width is
   `max(1 metre, line_width_min_pixels)` and can never go below the floor.
 - `VIEW_W` is a guess and `VIEW_H` is not. Bitmaps expose that; hexagons hide it.
+- Sliders that commit on `input` send one comm message per drag pixel. Fine for a few
+  floats; not for anything that re-dissolves. And 12 stops across a 4.5rem track is ~6 px
+  per stop, inside the slop of a trackpad drag.
 
 **Directed edges were measured as a replacement for the polygon dissolve and lost**
 (17.3 ms / 0.110 MB against 30.2 ms / 0.412 MB even with a despeckle in front). `ST_Dump`

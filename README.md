@@ -58,3 +58,34 @@ implementation, so that work never reaches it.
   90 patches to 121.
 
 Forty years of a drawn box costs about 300 ms of reads, for the same reason as above: the box is small and the overview matches the resolution.
+
+## Is the map right?
+
+```bash
+uv run marimo edit xsql-nlcd-imagery.py --sandbox
+```
+
+The same fold and the same dissolve, with the **hexagons switched off**. Only the
+dissolved class boundary is drawn, as thin lines over satellite imagery.
+
+That one change turns the map from something you have to trust into something you can
+check. A choropleth of a classification can only be believed; a line over a photograph
+either follows a real edge on the ground or it does not. NLCD says forest stops here.
+Here is the ground.
+
+Turn the hexagons back on and it is obvious why the boundary is hexagon-edged: at res 11
+a cell is 25 m against 30 m NLCD, so the crenellation is not decoration laid over the
+data, it is the resolution *of* the data. A pixel-drawn boundary would be a staircase for
+the same reason.
+
+Land cover is read one overview finer here than in the notebook above, from res 7 up. The
+thing on screen is the boundary *between* classes, which is decided by the cells where the
+class vote is closest, and those were the ones thinnest on evidence.
+
+Click any region for its class and roughly how many cells it holds. That count is derived
+from area rather than counted, because after the dissolve there are no cells left to count.
+
+Imagery is Esri World Imagery, whose dates vary by location, so this is not a same-year
+comparison: a disagreement can mean the ground changed rather than the map being wrong.
+`docs/imagery-and-terrain-notes.md` has the Sentinel-2 path that would fix that, and the
+reasons it is not what ships.

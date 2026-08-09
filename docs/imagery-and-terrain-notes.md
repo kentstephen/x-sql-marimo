@@ -1,37 +1,46 @@
-# Two experiments that did not earn their place
+# Imagery and terrain: what was tried, and what survived
 
-Both notebooks below run. Neither is recommended, and the reason in both cases is the
-same: the map they produce is not worth looking at. The findings are worth keeping
-because most of them cost a session each, and because the next person to have one of
-these ideas should read the measurements before rebuilding them.
-
-- `xsql-duckdb-terrain-h3.py` — NLCD class + Mapterhorn terrain, extruded hexagons.
-- `xsql-nlcd-sentinel2.py` — NLCD dissolved boundaries as lines over Sentinel-2.
+Two attempts to put a second raster under the NLCD boundaries. One shipped in a reduced
+form, one is parked. The findings are kept because most of them cost a session each, and
+because the next person to have either idea should read the measurements first.
 
 ## Verdict first
 
-**Extruded terrain (`xsql-duckdb-terrain-h3.py`): abandoned on looks.** The join works,
-the numbers are right, the extrusion is real. It reads as a novelty. Height is a weak
-encoding for a categorical map, the relief is subtle at any exaggeration that does not
-also look silly, and the extruded hexagons bury the dissolved outlines that are the good
-part of this repo. Do not revisit without a different reason than "the data supports it".
+**Extruded terrain (`xsql-duckdb-terrain-h3.py`): parked, on looks.** NLCD class joined to
+Mapterhorn terrain on the H3 cell id, hexagons extruded by elevation. The join works, the
+numbers are right, the extrusion is real. It reads as a novelty. Height is a weak encoding
+for a categorical map, the relief is subtle at any exaggeration that does not also look
+silly, and the extruded hexagons bury the dissolved outlines that are the good part of this
+repo. Do not revisit without a better reason than "the data supports it".
 
-**Sentinel-2 underlay (`xsql-nlcd-sentinel2.py`): abandoned, half-working.** The idea is
-sound and better than the extrusion: thin vector lines over a photograph is a combination
-that has always looked good, and it makes the map self-verifying, because the boundary
-either follows a real edge on the ground or it does not. The data side is fully solved
-and documented below. The RENDER side never became stable, and the honest summary is that
-neither available path is good:
+**Imagery underlay (`xsql-nlcd-imagery.py`): shipped, but not with the imagery it wanted.**
+The idea is sound and much better than the extrusion: thin vector lines over a photograph
+is a combination that has always looked good, and it makes the map self-verifying, because
+the boundary either follows a real edge on the ground or it does not.
+
+It was built on Earth Genome's Sentinel-2 mosaics, which had a real argument behind them:
+same year as the land cover, so a disagreement could only be classification error. **That
+data side is fully solved and is written up below.** The RENDER side never became stable
+through two architectures:
 
 - `RasterLayer.from_geotiff` is the right architecture (browser-side range reads per
   visible tile, no server, no pixels through the kernel) and did not survive here.
 - A Python-side `BitmapLayer` works but pushes ~950 KB of base64 per view through the
   comm channel, which will never feel smooth on a live camera.
 
-If this is ever picked up again, start by deciding whether the imagery needs to follow
-the camera at all. A frozen single scene sidesteps the entire problem.
+**What shipped instead is a `BitmapTileLayer` on Esri World Imagery**, which is the one
+imagery path in this notebook that always worked, because it is what already draws the
+place labels. The cost is the same-vintage rule: Esri is a mosaic of many sources and
+dates varying by location, so a boundary can disagree with the photograph because the
+ground genuinely changed, and nothing on screen distinguishes that from classification
+error. Good enough to judge whether a forest edge is roughly right; not evidence about a
+particular year.
 
-## Sentinel-2 / Earth Genome: the data side (all of this is solved)
+**Everything below is the way back**, if same-vintage imagery ever matters enough to spend
+another session on the render side. Start by deciding whether the imagery has to follow the
+camera at all: a frozen single scene sidesteps the whole problem.
+
+## Sentinel-2 / Earth Genome: the data side (solved, and unused)
 
 **Catalog is a STAC API, not a bucket listing.** `https://stac.earthgenome.org/search`,
 collection `sentinel2-yearly-mosaics`, POST a bbox, get items whose `TCI` href points at
