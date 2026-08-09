@@ -175,6 +175,73 @@ timers -- the debounce is an await on the kernel's own loop.
 
 ## Open
 
+## TODO: analytics
+
+Nothing here is started. Written down so the framing survives, not as a plan.
+
+### What the polygons are actually for
+
+**Hexagons are a sample grid. Polygons are objects.** A cell knows what class it is; it
+does not know what it is part of. That line decides which questions need the dissolve and
+which do not, and it is worth checking against before building anything:
+
+- **Cells answer these, cheaper and better.** How much of each class is on screen. Purity.
+  Anything joined on cell id at any resolution, including another dataset folded to the
+  same grid. Year-on-year change as a per-cell diff. If the analytic is area or
+  composition, the polygons add NOTHING and are decoration.
+- **Only objects answer these.** How many separate forests, rather than how much forest.
+  The size distribution of those patches. Whether a class is one block or ten thousand
+  scraps, which is invisible in a class total: two views can have identical composition and
+  completely different structure. What borders what, and over how much edge. What is
+  enclosed by what. Whether two areas are connected, which is the union-find already
+  running in `to_cluster_table` and thrown away after it is used to drop speckle.
+
+### The caveat that would quietly corrupt half of it
+
+**The polygon boundaries are hex staircases, not real edges.** Area is trustworthy: it is
+the cell count. **Perimeter is not.** The zigzag inflates it by a factor that depends on
+resolution, so perimeter-to-area ratios are comparable WITHIN a resolution and misleading
+ACROSS one. Any fragmentation metric either normalises for this or stays inside one res.
+Anything that reports a perimeter in metres without saying this is lying politely.
+
+### The ladder, cheapest first
+
+1. ~~A stats line for the current view.~~ **DONE, and it became the drawn box instead.**
+   `selected_bounds` (lonboard's own draw control) captures a box AND the H3 resolution the
+   map was on when it was drawn, and the cell below folds that AOI across all 40 years:
+   area per class per year in SQL over a (year, y, x) cube, and patch counts from
+   `patch_stats` on the same H3 cells. Measured on a 0.6 x 0.4 degree box at res 8, 51,546
+   px/year: **300 ms** to read all 40 years warm, ~3.7 s cold while the COG headers are
+   still opening, which is why they are prefetched at startup. Per-year cost is the thing
+   to remember: the box is small and the overview matches the res, so 40 years of it is
+   cheaper than one whole-country view.
+
+   It works, in the sense that it says something composition alone cannot. Kentucky,
+   1985 to 2024: Pasture/Hay loses 2.9 points of area while going from 90 patches to 121,
+   and Cultivated crops gains 2.0 points while going from 23 to 52. Deciduous forest holds
+   both. That is the argument for the dissolve, in one table.
+2. **Hover or click a cluster.** Its class, area in km², its rank by size, its hole count.
+   The polygons are already there; `pickable=False` only to keep hovers off the cells.
+3. **A distribution, rendered.** Patch sizes as a small chart under the map. This is where
+   speckle-versus-structure becomes visible rather than a number.
+4. **Fragmentation as the fill colour.** Recolour clusters by patch density or size instead
+   of class, so the map answers "how broken up is this" rather than "what is here". Same
+   fold, different question. A lightness ramp suits it and stays colourblind-safe.
+5. **Two years overlaid.** The expensive one: a second read of everything. Change as
+   geometry (what a run gained, lost, or split into) rather than as a cell diff. The year is
+   pinned at 2024 with the slider deliberately out, so this is a decision, not an omission.
+
+### Also open, unranked
+
+- **Query targets.** A dissolved run is a natural AOI: click a forest and it becomes the
+  boundary for the next read. Elevation inside it, imagery clipped to it, an Overture join
+  against the footprints that fall in it.
+- **Holes are information.** A hole in a crop polygon is a town, a lake, a woodlot.
+  `cells_to_wkb_polygons(link_cells=True)` already returns interior rings and nothing
+  downstream looks at them.
+- **Export.** They are proper WKB polygons and could leave as GeoParquet or FlatGeobuf,
+  which makes the fold a data product rather than a picture.
+
 - **A glitch on zoom remains, unresolved.** Reported repeatedly: wrong resolution and
   incomplete coverage, transiently. The blanking and the cache reduce it but do not remove
   it. Not diagnosed.
