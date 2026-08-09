@@ -83,9 +83,50 @@ uv run marimo export html <notebook>.py -o /tmp/out.html
 
 Core deps (see `pyproject.toml`): `marimo`, `datafusion`, `h3ronpy`, `pyarrow`,
 `xarray-sql`, plus the streaming/render stack to add: `obstore`, `async-geotiff`,
-`lonboard`. Keep each notebook's PEP 723 header in sync with `pyproject.toml` so
+`lonboard`. `duckdb` (with `INSTALL spatial`) is there for exactly one job: reading the
+S1M footprint GeoPackage, where `ST_Read` parses the geometry blobs and `ST_Transform`
+takes Albers to degrees. It is not a second query engine for the fold; that stays
+DataFusion. Keep each notebook's PEP 723 header in sync with `pyproject.toml` so
 `--sandbox` stays self-contained. Pin the deck.gl-raster / lonboard versions; they
 move fast.
+
+### Required for every SurfaceLayer notebook
+
+```bash
+uv run python tools/patch_lonboard_surface.py   # re-run after ANY install
+```
+
+Without it the textured mesh comes back covered in pale quadrilateral facets. lonboard's
+`SurfaceLayer` sends no `NORMAL`, and deck's `SimpleMeshLayer` responds to that with
+`flatShading: !hasNormals` rather than by skipping lighting: one derived normal per
+triangle, lit by the default material. On a colour ramp it passes for texture; on a NAIP
+photograph it is a herringbone of translucent facets over the imagery, and **no notebook
+parameter can reach it**. The script injects `material: false` into the shipped JS bundle,
+so `uv sync`, a lonboard upgrade and `--sandbox` all revert it. Hard-reload the browser
+after running it; the widget JS is cached client side and a kernel restart is not enough.
+Full account in `docs/xsql-naip-drape-notes.md`.
+
+Layer `parameters` must use luma v9 names: `depthCompare` and `depthWriteEnabled`, not the
+WebGL-1 `depthTest`, which deck reads as nothing and silently leaves depth disabled.
+
+## Overture Maps (`overture_core.py`)
+
+Shared helpers for streaming Overture GeoParquet out of `overturemaps-us-west-2` with
+obstore. `THEMES` names every theme/type pair, so asking for several at once is a list.
+
+Two things that are not obvious and cost a session each:
+
+- **`GeoParquetDataset.open` refuses the buildings theme.** The geometry column is Polygon
+  in some parts and MultiPolygon in others, and a dataset wants one type. Read per file
+  (`load_parts`), or take WKB and concatenate (`load_wkb`).
+- **The file index is the whole performance story.** A theme is ~512 files of ~500 MB with
+  no catalog; `file_index()` reads their GeoParquet footers once (~100 s) and caches the
+  bboxes in `.cache/`, after which an AOI reads only the overlapping file (~1.4 s). The
+  alternative, a DuckDB `read_parquet` with a bbox predicate, is ~35 s on every query.
+
+`OVERTURE_RELEASE` is pinned and Overture deletes old releases (`2026-01-21.0` is already
+gone). `releases()` lists what is live. Building `height` is present on roughly 55-75% of
+footprints depending on the city; `num_floors * 3 m` is the only other source.
 
 ## Reference repos (reuse, do not rebuild)
 
