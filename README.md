@@ -18,8 +18,8 @@ leave the bucket until the viewport asks for them.
 
 Each fold reads only the padded viewport, from the overview matching the H3 resolution it
 is about to build. So the **finest views are the cheapest**: the viewport shrinks faster
-than the resolution grows. Measured, band by band, res 5 at 960 m reads 16.2M pixels;
-res 11 at 30 m reads 72,890.
+than the resolution grows. Band by band, res 5 at 1920 m reads about 4.1M pixels; res 11
+at 30 m reads 72,890.
 
 Res 11 is the floor, and it belongs to the data rather than the code: a res 11 hexagon
 holds 2.3 pixels of 30 m NLCD, and res 12 would hold 0.6 and hole out.
