@@ -14,7 +14,7 @@
 #     "anywidget>=0.9",
 #     "numpy",
 #     "pyproj>=3.7",
-#     "matplotlib",
+#     "matplotlib==3.11.1",
 # ]
 # ///
 """Annual NLCD land cover in H3, finer as you zoom in, folded for the viewport.
