@@ -277,6 +277,89 @@ Anything that reports a perimeter in metres without saying this is lying politel
    geometry (what a run gained, lost, or split into) rather than as a cell diff. The year is
    pinned at 2024 with the slider deliberately out, so this is a decision, not an omission.
 
+### A class selector in the console, defaulting to forest
+
+**The UI, which is the small part.** A dropdown in the `Controls` widget alongside the
+existing checkboxes and sliders, choosing which land cover class the map is about. It opens
+on **forest** (41 deciduous, 42 evergreen, 43 mixed) rather than on everything. One more
+synced traitlet plus a `select()` helper next to the `check()` / `slider()` / `steps()`
+helpers already in the widget's JS, and a `WHERE` in the fold.
+
+Forest is the right default because it is usually the largest thing on screen: deciduous
+alone was 39.7% of the measured southeast viewport in the colour section above. The map
+therefore shows something immediately rather than opening on an empty filter.
+
+**Why it is worth more than a filter.** Everything gets sharper when only one class is in
+play:
+
+- The dissolve stops being "runs of whatever class" and becomes forest patches, directly.
+  `WASH_SQL` needs no change; it groups by class already.
+- `MIN_CLUSTER` can be tuned for one class instead of compromised across sixteen.
+- It is the precondition for the join below, which is the actual point.
+
+### Joining NDVI to a filtered class (the reason for the selector)
+
+**Source.** The Earth Genome seamless cloud free Sentinel-2 mosaic. Two properties settle
+the design, and both come from the data rather than from preference:
+
+- It is **pre-composited and seamless**, which is what makes it fit the camera driven read
+  at all. Per scene Sentinel-2 would mean a search plus a cloud composite per viewport, and
+  that breaks the one read per camera move model this notebook is built on.
+- **Only NDVI is seamless. The other bands have seams.** So read the NDVI band and never
+  derive NDVI from red and NIR. Two independent reasons point the same way: the seams are
+  visible, and deriving from an overview gives NDVI of averaged bands rather than the
+  average of NDVI, which is a different number (largest exactly at edges). The cost is that
+  this source yields exactly one index. No NDWI, NBR or EVI, since those need the seamed
+  bands.
+
+**The join is on H3 cell id, and that is the whole trick.** NLCD is Albers 5070, the mosaic
+is not, and it does not matter: fold both to the same resolution and the cell id absorbs the
+reprojection. No resampling, no warp, no shared grid to agree on. This is the argument for a
+second dataset generally, and it is stronger than "another map".
+
+**Resolutions do not match, so the join picks the coarser.** Sentinel-2 10 m floors at H3
+res 12 (100 m² per pixel against a 307 m² hexagon, about 3 px/hex; res 13 is 0.44 and holes
+out, the same wall res 11 hits on 30 m NLCD). NLCD floors at res 11. **Join at res 11.**
+
+**Palette, and this one is a trap.** The conventional NDVI ramp is brown to green, which is
+the red/green axis this project is not allowed to use, and every tutorial uses it. Viridis
+or cividis, per `CLAUDE.md`. NDVI is the one layer here where the standard choice is the
+wrong choice.
+
+Water is legitimately negative NDVI rather than nodata. Bin it, do not mask it.
+
+**Two questions this answers, neither of which either dataset answers alone:**
+
+1. **Forest stress.** Cells that are anomalously low NDVI *for their own class*. Never pool
+   41 and 42: deciduous and evergreen have completely different NDVI seasonality, so an
+   anomaly only means anything measured within its own class. Dissolving the anomaly flag
+   then gives stress patches as objects, with a count and a size distribution. That is the
+   case where the dissolve earns its keep on continuous data, which raw elevation never gave
+   us.
+2. **Urban greening.** Filter to developed and ask whether cities have gained or lost green
+   over the Sentinel-2 era.
+
+**Three things that would quietly corrupt the urban version:**
+
+- **Fixed cohort, not per year class.** Take the cells that were developed in the first
+  year and track *those same cells* forward. Using each year's own NLCD mixes greening with
+  urban expansion: a cell that converted from cropland to developed in 2020 would read as an
+  urban NDVI change when it is really a land cover change. The fixed cohort is also cheaper,
+  since the cell set resolves once and every later year is an NDVI read against a fixed hex
+  list.
+- **Split the developed subclasses.** 21 open space is mostly lawn and park and is naturally
+  high NDVI; 23 and 24 are high intensity, where a gain means street trees. Pooling them
+  averages two different phenomena. The class column is already there, so this is free.
+- **Interannual weather dominates the signal.** A wet spring against a dry one moves regional
+  NDVI further than a decade of planting does, and composite date windows may differ year to
+  year on top of that. A raw urban NDVI series is a rainfall chart. The fix costs nothing
+  because the control cells are already in the fold: track urban NDVI **relative to**
+  non urban cells of the same class in the same view and the same year. City rises while the
+  countryside is flat is greening; both rise together is weather.
+
+**Scope note.** Sentinel-2 starts 2015, so this lives in roughly 2017 to 2024. It does not
+span the 40 year axis the NLCD box fold gets, and any chart showing both has to say so.
+
 ### Also open, unranked
 
 - **Query targets.** A dissolved run is a natural AOI: click a forest and it becomes the
