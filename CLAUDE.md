@@ -5,7 +5,7 @@ Guidance for Claude Code working in this repository. Inherits the global rules i
 
 ## Repository layout
 
-Three notebooks are the repo:
+Four notebooks are the repo:
 
 - `xsql-nlcd-zoom.py` folds and dissolves entirely in DataFusion + h3ronpy.
 - `xsql-duckdb-nlcd-h3.py` keeps the DataFusion fold and moves the dissolve to DuckDB's
@@ -19,6 +19,15 @@ Three notebooks are the repo:
   follows a real edge on the ground or it does not. It also reads NLCD one overview finer
   from res 7 up, because the boundary is decided by the cells where the class vote is
   closest and those were thinnest on evidence.
+- `xsql-deforest-divisions.py` folds a global deforestation COG to H3 and joins the cells
+  onto Overture divisions for a zoomable choropleth plus a drawn-box ranking. Divisions
+  come from Overture's own PMTiles build of the pinned release
+  (`overturemaps-extras-us-west-2/tiles/<release>/divisions.pmtiles`), NOT the GeoParquet:
+  the GeoParquet layout makes geometry (99% of the bytes) unprunable, measured at ~190 MB
+  per viewport against ~0.8 MB from tiles. The PMTiles reader is hand-rolled (ported from
+  the parked terrain notebook), the MVT decode too; tile-clipped pieces are dissolved per
+  `division_id` in DuckDB before drawing or the stroke shows tile seams. Full record in
+  `docs/deforest-divisions-notes.md`.
 
 One more runs but is parked, not maintained, and not recommended:
 `xsql-duckdb-terrain-h3.py`. See "Parked experiments" below.
@@ -121,7 +130,8 @@ a transparent constant.
 the hexagons. The join works and the numbers are right. It was abandoned on looks: height
 is a weak encoding for a categorical map, and the extrusion buries the dissolved outlines,
 which are the good part of this repo. Full account and the Mapterhorn/PMTiles findings are
-in `docs/imagery-and-terrain-notes.md`.
+in `docs/imagery-and-terrain-notes.md`. Its PMTiles v3 client outlived it: the divisions
+notebook's reader is that code, ported.
 
 Other things from that work that cost a session each and apply anywhere in this repo:
 
@@ -212,6 +222,17 @@ Two things that are not obvious and cost a session each:
 `OVERTURE_RELEASE` is pinned and Overture deletes old releases (`2026-01-21.0` is already
 gone). `releases()` lists what is live. Building `height` is present on roughly 55-75% of
 footprints depending on the city; `num_floors * 3 m` is the only other source.
+
+**Overture also publishes each release as PMTiles**, one archive per theme, in
+`overturemaps-extras-us-west-2` under `tiles/<release>/` (the old
+`overturemaps-tiles-us-west-2-beta` bucket is dead: `AllAccessDisabled`). Anonymous ranged
+GETs, gzipped MVT, z0-12. For any read that is per-viewport rather than per-attribute,
+prefer the tiles: they are the vector twin of a COG overview pyramid, and the GeoParquet's
+missing spatial layout is exactly what they fix. Subtype minzooms are baked in by the
+build (divisions: country z2, region z4, county z8, locality z10, measured not
+documented), properties are flattened (`@name` is the primary name), and geometry arrives
+tile-clipped, so pieces need a per-id dissolve before they are drawn. The divisions
+notebook has the working reader and decoder to copy.
 
 ## Reference repos (reuse, do not rebuild)
 
