@@ -59,9 +59,16 @@ height from the other, and the hexagon carries both.
 
 The colour is still the class. The HEIGHT is the terrain, which means the extrusion is
 a second variable rather than a restatement of the first: forest climbing a ridge, crops
-stopping where the ground tilts. Exaggeration 0 is the flat map this started as, and the
-cluster outlines are dissolved on the ground plane, so turning height up eventually
+stopping where the ground tilts. Relief 0 is the flat map this started as, and the
+cluster outlines are dissolved on the ground plane, so turning relief up eventually
 buries them. That trade is the slider's, not a mode.
+
+The `relief` slider is a MULTIPLE, not a scale. The base under it is fitted to the view:
+all the elevation on screen stands about 1.5 hexagon widths tall at 1, so one setting
+means the same thing over a whole state and over a single hillside, and the caption says
+what that currently works out to as a true vertical exaggeration. What gets extruded is
+height above the lowest cell in view, not height above sea level, so a Colorado view does
+not open with the whole mesh floating 2 km off the basemap.
 
 The Mercator half is the cheap half, which is not obvious. Mapterhorn tile pixels ARE
 lat/lon by construction, so the DEM fold registers its window with lat/lon coordinates
@@ -308,12 +315,21 @@ def _(anywidget, traitlets):
           // trait assignment on a layer that already holds its data, so it can follow the
           // drag; min cluster re-dissolves the wash, so it waits for the handle to drop
           // and the caption tracks the drag in the meantime.
-          const steps = (key, label, stops, width, live) => {
+          //
+          // `noteKey` is a second, kernel-written trait appended to the caption in
+          // parentheses. The relief slider needs it because its own number is a multiple
+          // of a base that moves with the zoom, so the number alone says nothing; the note
+          // carries what that currently is in real terms.
+          const steps = (key, label, stops, width, live, noteKey) => {
             const w = document.createElement("span");
             w.style.cssText = "display:inline-flex;align-items:center;gap:.4rem";
             const cap = document.createElement("span");
             cap.style.cssText = "opacity:.7;white-space:nowrap";
-            const draw = () => { cap.textContent = label + " " + model.get(key); };
+            const note = () => {
+              const n = noteKey ? model.get(noteKey) : "";
+              return n ? "  (" + n + ")" : "";
+            };
+            const draw = () => { cap.textContent = label + " " + model.get(key) + note(); };
             const s = document.createElement("input");
             s.type = "range";
             s.min = "0"; s.max = String(stops.length - 1); s.step = "1";
@@ -326,7 +342,7 @@ def _(anywidget, traitlets):
               model.save_changes();
             };
             s.addEventListener("input", () => {
-              cap.textContent = label + " " + stops[parseInt(s.value, 10)];
+              cap.textContent = label + " " + stops[parseInt(s.value, 10)] + note();
               if (live) push();
             });
             s.addEventListener("change", push);
@@ -334,17 +350,22 @@ def _(anywidget, traitlets):
               s.value = String(nearest(stops, model.get(key)));
               draw();
             });
+            // The note changes on every zoom, not only when the slider moves, because the
+            // resolution and the relief in view both feed it.
+            if (noteKey) model.on("change:" + noteKey, draw);
             draw();
             w.appendChild(cap);
             w.appendChild(s);
             return w;
           };
           const CLUSTER_STOPS = [1, 2, 3, 5, 8, 12, 20, 30, 50, 75, 100, 150, 200, 300];
-          // Vertical exaggeration, as a MULTIPLE of a per-resolution base scale, not as a
-          // raw elevation_scale. The base is set in the kernel from the hexagon's own edge
-          // length, because the same 1000 m of relief is invisible against 8.5 km hexagons
-          // at res 5 and a tower against 25 m ones at res 11. 0 is the flat map.
-          const EXAG_STOPS = [0, 0.25, 0.5, 1, 1.5, 2, 3, 5];
+          // Vertical exaggeration, as a MULTIPLE of a fitted base scale, not as a raw
+          // elevation_scale. The base is set in the kernel so that ALL the relief in view
+          // stands about 1.5 hexagon widths tall, which is why 1 means the same thing over
+          // a whole state and over one hillside. 0 is the flat map, and the top of the
+          // range is deliberately absurd: past about 4 it is no longer a terrain model,
+          // but it is the setting that shows you a 30 m difference exists at all.
+          const EXAG_STOPS = [0, 0.25, 0.5, 1, 1.5, 2, 3, 4, 6, 8, 12];
 
           // The class filter. Options come from the kernel (`class_options`) so the
           // groupings are written down once, next to the palette they select from,
@@ -390,7 +411,9 @@ def _(anywidget, traitlets):
           box.appendChild(group("classes"));
           box.appendChild(choose("class_set", "class_options", "show"));
           box.appendChild(group("terrain"));
-          box.appendChild(steps("exaggeration", "height", EXAG_STOPS, "5rem", true));
+          box.appendChild(
+            steps("exaggeration", "relief", EXAG_STOPS, "7rem", true, "exag_note")
+          );
           box.appendChild(group("hexagons"));
           box.appendChild(check("cells", "show"));
           box.appendChild(slider("cell_opacity", "opacity"));
@@ -411,11 +434,16 @@ def _(anywidget, traitlets):
         class_set = traitlets.Unicode("forest").tag(sync=True)
         class_options = traitlets.List([]).tag(sync=True)
         cells = traitlets.Bool(True).tag(sync=True)
-        # 1.0, not 0. At the opening pitch the extrusion is visible without hiding
-        # anything: a top-down camera sees a hexagon's top face at the same footprint as
-        # its flat self, so the cluster outlines underneath survive until you tilt. Tilting
-        # is what trades them for relief, and that is the slider's decision to offer.
-        exaggeration = traitlets.Float(1.0).tag(sync=True)
+        # Not 0. At the opening pitch the extrusion costs nothing: a top-down camera sees a
+        # hexagon's top face at the same footprint as its flat self, so the cluster
+        # outlines underneath survive until you tilt. Tilting is what trades them for
+        # relief, and that is the slider's decision to offer. 2, not 1, so the first tilt
+        # shows terrain rather than a suggestion of it.
+        exaggeration = traitlets.Float(2.0).tag(sync=True)
+        # Kernel -> panel only. What the current slider position works out to as a true
+        # vertical exaggeration, given the resolution and the relief in view. Both of
+        # those move on every zoom, so the caption is the only honest place to say it.
+        exag_note = traitlets.Unicode("").tag(sync=True)
         # OFF by default now that the outline is dissolved on parent hexagons. The
         # polygon is coarser than the cells and bulges past them, so filling it paints a
         # class over cells that are not that class. As an outline it reads as "a region is
@@ -504,13 +532,33 @@ def _(math):
     # would stop resolving well before the terrain did.
     DEM_ZOOM_FOR_RES = {5: 4, 6: 5, 7: 7, 8: 8, 9: 9, 10: 11, 11: 12}
 
-    # Average H3 edge length in metres. Used ONLY to size the extrusion: 1000 m of
-    # elevation should read as about half a hexagon's width whatever the resolution, or
-    # the same terrain is invisible at res 5 and a skyscraper at res 11.
+    # Average H3 edge length in metres. Used ONLY to size the extrusion, and it is the
+    # right yardstick for one reason: res_for_zoom keeps a hexagon at a roughly constant
+    # PIXEL size, so a target expressed in edge lengths is really a target in screen
+    # pixels, at every zoom.
     EDGE_M = {5: 8544.4, 6: 3229.5, 7: 1220.6, 8: 461.4, 9: 174.4, 10: 65.9, 11: 24.9}
 
-    def elev_base_scale(res):
-        return EDGE_M[res] / 2000.0
+    # How tall the whole relief in view should stand at exaggeration 1, in hexagon edge
+    # lengths. 1.5 edges is around 25 px on screen: unmistakably 3D at a tilt, and still
+    # short enough that a peak does not hide the valley behind it.
+    TARGET_EDGES = 1.5
+
+    # A view that is genuinely flat has no relief to fit, and dividing by it would send
+    # the scale to infinity. Below this many metres of spread, stop fitting and treat the
+    # view as flat-ish by clamping the divisor.
+    MIN_RELIEF_M = 25.0
+
+    def elev_base_scale(res, relief_m):
+        """Metres of drawn height per metre of elevation, before the slider.
+
+        FITTED TO THE VIEW, not to a constant. This used to be EDGE_M/2000, meaning
+        "1000 m of relief reads as half a hexagon", which is wrong in the one direction
+        that matters: a res-11 viewport is about 2 km across and holds maybe 40 m of
+        relief, so the fixed rule drew it half a metre tall and the map looked flat no
+        matter where the slider was. Fitting to the relief actually on screen makes one
+        slider position mean the same thing from a whole-state view down to a hillside.
+        """
+        return EDGE_M[res] * TARGET_EDGES / max(relief_m, MIN_RELIEF_M)
 
     # The map's pixel size, assumed. It only sets how much of the world the viewport box
     # covers, and PAD is deliberately loose, so being wrong by a few hundred pixels costs
@@ -691,6 +739,7 @@ def _():
         "to_albers": None,  # lon/lat box -> the raster's own CRS, set by the read cell
         "extent": None,  # the raster's Albers bounds, to clamp against
         "res": None,  # H3 resolution currently on screen
+        "relief": 0.0,  # metres between the 2nd and 98th percentile cell in view
         "box": None,  # padded Albers box the current hexes cover
         "cache": {},  # res -> (box, table): a zoom back out to a level already folded
         "busy": False,  # a fold is running
@@ -708,6 +757,7 @@ def _(
     ArroArray,
     ArroTable,
     GROUPS,
+    HOLD,
     con,
     coordinates_to_cells,
     from_wkb,
@@ -741,6 +791,31 @@ def _(
         # real type.
         tbl = tbl.combine_chunks()
         cls = np.asarray(tbl["mode_cls"])
+
+        # HEIGHT IS RELIEF, NOT ELEVATION. `elev` is metres above sea level and stays that
+        # way, because that is the number worth reading in a tooltip. It is the wrong
+        # number to extrude: a Colorado view sits 2,000 m up before any of it varies, so
+        # the whole mesh rises off the basemap and the exaggeration multiplies the offset
+        # along with the shape. Extruding the height above the LOWEST cell in view keeps
+        # the hexagons on the ground and puts the entire scale into the part that differs.
+        #
+        # The floor is the 2nd percentile, not the minimum, and it is taken over cells
+        # with real elevation only: the DEM join COALESCEs a miss to 0.0, so one unmatched
+        # cell would otherwise define sea level for a mountain range.
+        elev = np.asarray(tbl["elev"], dtype=np.float64)
+        real = elev[np.isfinite(elev) & (elev != 0.0)]
+        if real.size:
+            floor, ceil = np.percentile(real, [2.0, 98.0])
+        else:
+            floor, ceil = 0.0, 0.0
+        relief = np.clip(elev - floor, 0.0, None)
+        # A cell with no elevation draws flat rather than at some invented height, and a
+        # NaN would go further than that: it reaches the vertex buffer and takes the whole
+        # hexagon off screen rather than failing anywhere you could see it.
+        relief[~np.isfinite(relief) | (elev == 0.0)] = 0.0
+        # Read by apply_elevation to size the scale. Written here because this is the one
+        # place that sees every cell that is about to be drawn.
+        HOLD["relief"] = float(max(ceil - floor, 0.0))
         return ArroTable.from_arrow(
             pa.table(
                 {
@@ -752,6 +827,7 @@ def _(
                     "purity": tbl["purity"],
                     "pixels": tbl["px_total"],
                     "elev": tbl["elev"],
+                    "relief_m": pa.array(relief),
                 }
             )
         )
@@ -911,6 +987,7 @@ def _(
                     "purity": pa.array([0.0]),
                     "pixels": pa.array([0], type=pa.int64()),
                     "elev": pa.array([0.0]),
+                    "relief_m": pa.array([0.0]),
                 }
             )
         )
@@ -969,7 +1046,9 @@ def _(
         get_hexagon=_seed["hex"],
         get_fill_color=_seed["color"],
         # get_line_color=_seed["color"],
-        get_elevation=_seed["elev"],
+        # relief_m, not elev: height above the lowest cell in view, so the mesh sits on the
+        # basemap instead of floating at the local sea-level offset. See to_layer_table.
+        get_elevation=_seed["relief_m"],
         # Both set for real by apply_elevation() as soon as a resolution is known; the
         # scale is meaningless until then, because it is derived from the hexagon size.
         extruded=False,
@@ -1120,19 +1199,33 @@ def _(
     WANT = {"clusters": True, "built": False}
 
     def apply_elevation():
-        """Push the height slider onto the layer, scaled for the resolution on screen.
+        """Push the relief slider onto the layer, fitted to what is on screen.
 
-        elevation_scale is NOT the slider. The slider is a multiple of a base derived from
-        the hexagon's own edge length, so that 1000 m of relief reads as about half a
-        hexagon width at every resolution. Without that, one setting is a flat smear at
-        res 5 and a forest of towers at res 11, and the slider has to be re-aimed on every
-        zoom. HOLD["res"] is None before the first fold, in which case there is no hexagon
-        size to scale against yet and the opening draw will call this again.
+        elevation_scale is NOT the slider. The slider is a multiple of a base that fits
+        the relief in view to a fixed number of hexagon widths (see elev_base_scale), so
+        "1" means the same thing over a whole state and over one hillside, and the slider
+        never has to be re-aimed after a zoom. HOLD["res"] is None before the first fold,
+        in which case there is nothing to fit to yet and the opening draw calls this again.
+
+        The note is the whole point of the caption. The slider's own number is a multiple
+        of a moving base, which on its own tells you nothing; the note says what that
+        currently works out to as a true vertical exaggeration, which is the number a
+        reader of the map can actually check.
         """
         ex = float(controls.exaggeration)
         res = HOLD["res"]
         h3_layer.extruded = ex > 0
-        h3_layer.elevation_scale = 0.0 if res is None else elev_base_scale(res) * ex
+        if res is None:
+            h3_layer.elevation_scale = 0.0
+            controls.exag_note = ""
+            return
+        scale = elev_base_scale(res, HOLD["relief"]) * ex
+        h3_layer.elevation_scale = scale
+        controls.exag_note = (
+            "flat"
+            if scale <= 0
+            else f"{scale:.0f}x vertical" if scale >= 1 else f"{scale:.2f}x vertical"
+        )
 
     def apply_controls():
         """Push every control onto the layers, once, at build time.
@@ -1277,7 +1370,7 @@ def _(
             h3_layer.table = tbl
             h3_layer.get_hexagon = tbl["hex"]
             h3_layer.get_fill_color = tbl["color"]
-            h3_layer.get_elevation = tbl["elev"]
+            h3_layer.get_elevation = tbl["relief_m"]
             # In the SAME message as the table it belongs to. A resolution change moves the
             # hexagon size and the scale that compensates for it together, and if those
             # arrive as two messages one frame renders the new cells at the old
