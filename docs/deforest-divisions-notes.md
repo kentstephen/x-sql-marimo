@@ -272,3 +272,31 @@ smearing neighbours together or dropping the weighting, that contrast would coll
    whole update pass with it and producing a cascade of assertions naming innocent layers.
    Fixed to a 0.01-degree square. Worth remembering as another instance of the rule already
    in CLAUDE.md: an assertion naming a layer is weak evidence that the layer is at fault.
+
+## Where this might go next: drop Overture, bring NLCD back
+
+Stephen's idea at the end of the session, deliberately not acted on. Recording it because
+the argument for it is strong and not obvious.
+
+**Nearly every open problem above comes from the polygon side.** The `ST_Dump` workaround
+for MultiPolygon, the `center` vs `overlap` decision, the "too small to measure" case, the
+row-group pruning that collapses at world zoom, and the dead fill checkbox are all
+Overture. A raster-to-raster join on the H3 cell id has none of them: both sides fold to
+cells and the join is the SAME integer equi-join in DataFusion, minus the polyfill
+entirely. Open items 1, 2 and 4 all disappear; only the zero-cell question (3) survives.
+
+Two readings, and they are not the same notebook:
+
+- **NLCD as a second layer joined to deforestation on the cell id.** "What land cover is
+  being lost." No boundaries at all. The catch is coverage: the deforest layer is global
+  and NLCD is CONUS, so the answer only exists for one country, and the USA is close to the
+  least interesting place on earth for a 2002-2022 deforestation layer (see the Iowa
+  numbers above: 0.011-0.296%). Worth checking whether the interesting CONUS signal is the
+  Pacific Northwest and the southeast timber belt before committing.
+- **NLCD as the raster, with this notebook's machinery underneath it.** Keeps the sparse
+  tile reader, the log ramp, the zoom ladder and the DataFusion join; drops the global data.
+
+**The piece most worth carrying over either way is the sparse-tile check**, and it is the
+piece that looks most like boilerplate. Any COG that stores no ocean will otherwise fail
+with `Invalid range requested, start: 0 end: 0`, which names neither the tile nor the
+sparseness.
