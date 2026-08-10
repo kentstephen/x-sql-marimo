@@ -60,9 +60,11 @@ LEVEL_FOR_RES). There the mode is the thing on screen and 12-22 px/hex settles i
 the thing on screen is the boundary BETWEEN modes, which is decided by the cells where the
 class vote is closest, and those were the ones thinnest on evidence.
 
-Both the outlines and the imagery are pickable. Click a region for its class and roughly
-how many cells it holds; that count is derived from area rather than counted, because
-after the dissolve there are no cells left to count.
+Both the outlines and the imagery are pickable. Click a region for its class, its ground
+area in acres, and roughly how many cells it holds; that count is derived from area rather
+than counted, because after the dissolve there are no cells left to count. The acreage is
+the polygon's own geodesic area (ST_Area_Spheroid), so it is a measurement of the drawn
+boundary, not a cell count multiplied by a nominal hexagon size.
 
 Data: Kyle Barron's mirror of USGS Annual NLCD on source.coop, public and unsigned.
 Imagery: Esri World Imagery, (c) Esri, Maxar, Earthstar Geographics.
@@ -792,6 +794,14 @@ def _(
     # MultiPolygon per class, and its parts are exactly the connected runs, so dumping them
     # recovers the same grouping the union-find used to compute.
     #
+    # ACREAGE IS THE ONE REAL-WORLD NUMBER ON THE MAP, and it does NOT come from the
+    # ST_Area above: that one is square degrees, which is only ever compared against
+    # another square-degree number in the same view. Ground area is ST_Area_Spheroid,
+    # and it takes coordinates as (latitude, longitude), the opposite of everything else
+    # here, so the geometry is flipped on the way in. Without the flip a CONUS longitude
+    # is read as a latitude of -105, which is off the globe, and the function returns NaN
+    # rather than an error: a silently empty column, not a crash. 4046.8564224 m2 = 1 acre.
+    #
     # The size test is in AREA, not cells, because after the dissolve there are no cells
     # left to count. cell_area is calibrated per class from the data in hand (total area
     # over total cells), so it needs no hexagon-area constant and no latitude correction:
@@ -813,7 +823,9 @@ def _(
             FROM parts
         )
         SELECT cls, ST_AsWKB(geom) AS wkb,
-               CAST(area / cell_area AS BIGINT) AS n_cells
+               CAST(area / cell_area AS BIGINT) AS n_cells,
+               ROUND(ST_Area_Spheroid(ST_FlipCoordinates(geom)) / 4046.8564224, 1)
+                 AS acres
         FROM sized
         WHERE area >= ? * cell_area
         ORDER BY cls
@@ -860,8 +872,9 @@ def _(
                 ),
                 ArroArray.from_arrow(pa.array([_names[c] for c in cls])),
                 ArroArray.from_arrow(pa.array(n_cells, pa.int64())),
+                ArroArray.from_arrow(out["acres"].combine_chunks()),
             ],
-            names=["geometry", "color", "class", "cells"],
+            names=["geometry", "color", "class", "cells", "acres"],
         )
 
     def cluster_runs(hx, cs):
