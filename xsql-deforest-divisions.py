@@ -57,6 +57,17 @@ magnitude (p1 7.3e-8, p50 2.1e-3, p99.9 0.45), so a linear 0-1 ramp paints a bla
 Zero takes its own dark swatch and the rest is log10 over 1e-4 to 0.5, which is p25 to
 p99.9. See the ramp cell for why zero is separated by luminance and not by hue.
 
+DRAW A BOX AND THE JOIN BECOMES A NUMBER. The ▢ button at the lower right of the map ranks
+every division inside the box you draw by its mean share deforested. It reads one H3
+resolution finer than the screen does, sizes that resolution from the BOX rather than the
+current zoom, and falls back county -> region -> country, because Overture has counties for
+only 171 of 219 countries. This is the one output here that is a figure rather than a colour.
+
+THE CAMERA ANSWERS FROM MEMORY FIRST. `view_state` fires on every frame of a drag, and any
+frame that can be served from what is already folded (a pan inside the current box, a zoom
+back to a resolution already visited) is answered synchronously in the comm handler. Only a
+view that genuinely needs bytes goes through the debounce. See `_instant`.
+
 Data: Vizzuality / LandGriffon, CC-BY 4.0, on source.coop. Boundaries: Overture Maps.
 Run:  uv run marimo edit xsql-deforest-divisions.py --sandbox
 """
@@ -84,6 +95,7 @@ def _():
     import numpy as np
     import pyarrow as pa
     import pyarrow.compute as pc
+    import pyarrow.parquet as pq
     import xarray as xr
     from arro3.core import Array as ArroArray, Table as ArroTable
     from async_geotiff import GeoTIFF, Window
@@ -126,6 +138,7 @@ def _():
         pa,
         pathlib,
         pc,
+        pq,
         to_wkb,
         traitlets,
         udf,
@@ -216,9 +229,32 @@ def _(anywidget, traitlets):
         """
         show_cells = traitlets.Bool(True).tag(sync=True)
         show_divisions = traitlets.Bool(True).tag(sync=True)
-        division_fill = traitlets.Bool(False).tag(sync=True)
+        # ON BY DEFAULT. The join onto Overture is the whole point of this notebook and the
+        # choropleth is what it produces, so shipping it behind an unticked box meant the
+        # result was invisible unless you went looking for it.
+        division_fill = traitlets.Bool(True).tag(sync=True)
 
-    return Controls, Status
+    class Panel(anywidget.AnyWidget):
+        """A block of HTML the kernel can rewrite, for the drawn-box ranking.
+
+        Status is a one-line strip and this is a table, but the reason for both is the same:
+        marimo output only updates by re-running the cell that made it, and the cell that
+        made this one owns the Map.
+        """
+
+        _esm = """
+        function render({ model, el }) {
+          const box = document.createElement("div");
+          const draw = () => { box.innerHTML = model.get("value"); };
+          draw();
+          model.on("change:value", draw);
+          el.appendChild(box);
+        }
+        export default { render };
+        """
+        value = traitlets.Unicode("").tag(sync=True)
+
+    return Controls, Panel, Status
 
 
 @app.cell
@@ -289,6 +325,12 @@ def _(math):
     # in places rather than merely sparse.
     DIV_ZOOM = 4.5
 
+    # TODO: a fourth band, `locality`, above roughly zoom 9.5. Overture has 57,072
+    # localities in a single division_area file against 11,375 counties, so the row-group
+    # pruning has to be doing real work before it is affordable, which it is by that zoom.
+    # The open question is not cost but meaning: a locality boundary is a settlement, so
+    # most of a drawn box would fall outside every polygon and the ranking would describe
+    # the towns rather than the ground. Decide that before adding the band.
     def division_for_zoom(z):
         if z < DIV_ZOOM:
             return None
@@ -311,7 +353,17 @@ def _(math):
     # larger query and nothing else.
     VIEW_W, VIEW_H = 1400, 620
     PAD = 1.25
-    SETTLE = 0.25  # seconds of camera quiet before a fold starts
+
+    # SETTLE ONLY GUARDS A READ. Every camera event that can be answered from memory (a pan
+    # inside the box already folded, a zoom back to a resolution already visited) is now
+    # answered synchronously in the comm handler, so this delay is never spent on a view the
+    # notebook already knows the answer to. It exists purely so a two-second drag issues one
+    # object-store read at the end instead of a hundred along the way.
+    SETTLE = 0.15
+
+    # The fill alpha for a division choropleth. Not 255: the hexagons stay legible underneath
+    # and the boundary layer reads as a wash over them rather than a lid on them.
+    FILL_ALPHA = 165
 
     # Opens on the tropics, because that is where the data is: the Amazon, the Congo basin
     # and insular southeast Asia are the three places a 2002-2022 deforestation layer has
@@ -322,8 +374,10 @@ def _(math):
         DIVISION_LABEL,
         DIVISION_PREFIX,
         FETCH_AT_ONCE,
+        FILL_ALPHA,
         HOME,
         LEVEL_FOR_RES,
+        MAX_RES,
         OVERTURE_BUCKET,
         PAD,
         SETTLE,
@@ -380,6 +434,20 @@ def _(matplotlib, np):
         out[~live] = ZERO_RGB
         return out
 
+    def ramp_rgba(v, alpha):
+        """`ramp` with a constant alpha appended, as uint8 RGBA.
+
+        The division fill needs four channels and the hexagons need three, and they must
+        agree colour for colour: a division and the cells inside it are the same number
+        drawn twice, so any drift between the two ramps would read as a disagreement in the
+        data.
+        """
+        rgb = ramp(v)
+        out = np.empty(rgb.shape[:-1] + (4,), dtype=np.uint8)
+        out[..., :3] = rgb
+        out[..., 3] = alpha
+        return out
+
     # 1e-4 is the ramp floor, so anything under it is "below 0.01%", not zero.
     STOPS = [
         (0.0, "none"),
@@ -391,7 +459,7 @@ def _(matplotlib, np):
         (2.5e-1, "25%"),
         (5e-1, "50%+"),
     ]
-    return STOPS, ramp
+    return STOPS, ramp, ramp_rgba
 
 
 @app.cell
@@ -403,20 +471,35 @@ def _():
     HOLD = {
         "fold": None,  # the SQL fold, set by the read cell
         "zonal": None,  # cells -> division means, set by the read cell
+        "rank": None,  # drawn box -> divisions ranked, set by the read cell
         "res": None,  # H3 resolution currently on screen
         "box": None,  # padded degree box the current cells cover
         "div": None,  # division subtype currently on screen
+        # The box the DIVISIONS cover, tracked apart from the cells' box because they are
+        # fetched second and a camera move can land between the two. Without it, a pan that
+        # interrupts a fold leaves `div` set while the boundaries on screen belong to the
+        # previous place, and the instant path then matches and never refetches them.
+        "divbox": None,
         "cache": {},  # res -> [box, layer table, raw fold]
+        "divpair": None,  # (fill-on table, fill-off table) currently on the division layer
+        # The status line in two halves, so a camera move that reads nothing can still
+        # refresh the zoom readout without throwing away what the last read said. Zooming IN
+        # always lands inside the box the last read covered, so without this the numbers
+        # would freeze exactly when the map feels least responsive.
+        "head": "",  # what the cells are
+        "tail": "",  # what the divisions are
+        "vs": None,  # the last camera acted on, for the echo check
         "busy": False,
         "pending": None,
         "loop": None,
         "task": None,
+        "seltask": None,  # the drawn-box ranking, which runs on its own
     }
     return (HOLD,)
 
 
 @app.cell
-def _(ArroArray, ArroTable, coordinates_to_cells, np, pa, ramp):
+def _(ArroArray, ArroTable, FILL_ALPHA, coordinates_to_cells, np, pa, ramp, ramp_rgba):
     def cells_to_layer(tbl):
         """Folded cells -> the arro3 table the H3HexagonLayer draws.
 
@@ -444,29 +527,45 @@ def _(ArroArray, ArroTable, coordinates_to_cells, np, pa, ramp):
         )
 
     def divisions_to_layer(tbl, from_wkb, multipolygon):
-        """Division zonal means -> the arro3 table the PolygonLayer draws.
+        """Division zonal means -> the TWO tables the PolygonLayer swaps between.
+
+        Two tables, identical except for the alpha in `color`, and that is the fix for the
+        dead "boundary fill" checkbox. `filled` is left permanently True (flipping it does
+        not reliably build the fill sublayer, per CLAUDE.md), but the previous attempt then
+        swapped `get_fill_color` between a TABLE COLUMN and the constant `[0, 0, 0, 0]`, and
+        that swap is what never took: deck was being handed two different KINDS of accessor
+        for one prop, and the layer only ever picked up whichever it saw first. Here both
+        states are the same column of the same schema, and the toggle re-pushes the table,
+        which is the one update path this layer has always honoured.
 
         Geometry comes straight off the Arrow column via from_wkb: to_pylist() here would
-        materialise every polygon as a Python bytes object on the way past.
+        materialise every polygon as a Python bytes object on the way past, and it is built
+        once and shared by both tables.
         """
         tbl = tbl.combine_chunks()
         portion = np.asarray(tbl["portion"], dtype="float64")
-        geom = from_wkb(
-            tbl["wkb"].combine_chunks(), to_type=multipolygon("xy", crs="EPSG:4326")
+        geom = ArroArray.from_arrow(
+            from_wkb(
+                tbl["wkb"].combine_chunks(), to_type=multipolygon("xy", crs="EPSG:4326")
+            )
         )
-        return ArroTable.from_arrays(
-            [
-                ArroArray.from_arrow(geom),
-                ArroArray.from_arrow(
-                    pa.FixedSizeListArray.from_arrays(pa.array(ramp(portion).ravel()), 3)
-                ),
-                ArroArray.from_arrow(tbl["name"].combine_chunks()),
-                ArroArray.from_arrow(tbl["country"].combine_chunks()),
-                ArroArray.from_arrow(pa.array(np.round(portion * 100, 4))),
-                ArroArray.from_arrow(tbl["n_cells"].combine_chunks()),
-            ],
-            names=["geometry", "color", "name", "country", "deforested %", "cells"],
-        )
+        rest = [
+            ArroArray.from_arrow(tbl["name"].combine_chunks()),
+            ArroArray.from_arrow(tbl["country"].combine_chunks()),
+            ArroArray.from_arrow(pa.array(np.round(portion * 100, 4))),
+            ArroArray.from_arrow(tbl["n_cells"].combine_chunks()),
+        ]
+        names = ["geometry", "color", "name", "country", "deforested %", "cells"]
+
+        def build(alpha):
+            col = ArroArray.from_arrow(
+                pa.FixedSizeListArray.from_arrays(
+                    pa.array(ramp_rgba(portion, alpha).ravel()), 4
+                )
+            )
+            return ArroTable.from_arrays([geom, col, *rest], names=names)
+
+        return build(FILL_ALPHA), build(0)
 
     def seed_cells():
         """One hexagon at null island so the Map has a valid table at build time.
@@ -523,9 +622,13 @@ def _(ArroArray, ArroTable, coordinates_to_cells, np, pa, ramp):
         return ArroTable.from_arrays(
             [
                 ArroArray.from_arrow(geom),
+                # Four channels, matching what divisions_to_layer produces. A seed whose
+                # colour column is three wide would make the first real push a change of
+                # accessor WIDTH as well as of data, which is the class of swap that left
+                # the fill unpainted before.
                 ArroArray.from_arrow(
                     pa.FixedSizeListArray.from_arrays(
-                        pa.array(np.array([0, 0, 0], dtype=np.uint8)), 3
+                        pa.array(np.array([0, 0, 0, 0], dtype=np.uint8)), 4
                     )
                 ),
                 ArroArray.from_arrow(pa.array([""])),
@@ -551,6 +654,7 @@ async def _(
     pa,
     pathlib,
     pc,
+    pq,
     to_wkb,
 ):
     # DIVISIONS ARE STREAMED, NOT CACHED TO DISK. obstore opens the GeoParquet directly and
@@ -586,10 +690,74 @@ async def _(
 
     DIV_INDEX = await _build_index()
 
-    # In-memory only, and keyed by the exact request. A pan inside the same box re-uses what
-    # is already here; a kernel restart starts clean. This is memoisation of a read that
-    # already happened, not a build step.
-    _div_memo = {}
+    # WHERE THE TIME ACTUALLY GOES, MEASURED, BECAUSE THE OBVIOUS FIXES DO NOT WORK.
+    #
+    # One viewport at zoom 5.6 over Rondonia hit 3 of the 8 files and took 18.4 s read
+    # serially. Two things that look like they would fix that, and do not:
+    #
+    #   - COLUMN PROJECTION. Useless: `geometry` is 99.0% of the compressed bytes of a row
+    #     group (22.38 MB of 22.6 MB). Dropping `sources`, `names.rules` and the rest saves
+    #     nothing, and `read_async` has no projection argument anyway.
+    #   - PRUNING ON `subtype`. The row groups are not clustered by it. Their min/max pairs
+    #     are ('county','region'), ('country','region'), ('locality','region'), so asking for
+    #     'county' keeps nearly every group. This is the same finding as the note that
+    #     subtype is not partitioned, now checked at the statistics level too.
+    #
+    # So the bytes are irreducible for a given box, and the three things that DO help are all
+    # about not paying for them twice:
+    #
+    #   1. READ THE FILES CONCURRENTLY. 18.4 s serial becomes the slowest single file. The
+    #      previous loop awaited them one at a time for no reason.
+    #   2. KEEP THE OPEN FILE HANDLES. `open_async` is a footer read, ~0.8 s each, and it was
+    #      being paid again on every fetch of every file.
+    #   3. KEEP THE RESULT ON DISK. A box read once is read once ever, across kernel restarts.
+    #      This is the part that decides whether the notebook feels fast, because exploring
+    #      revisits the same ground constantly.
+    #
+    # CACHED BY COVERAGE, NOT BY EXACT BOX. The original memo keyed on the rounded request
+    # bbox, so a pan of a few pixels was a cache miss and a fresh 18 s read. A read is grown
+    # past what was asked for and kept, and any later box inside it is a lookup.
+    #
+    # DIV_PAD is on top of the viewport padding, so a cached read covers about 1.75 viewport
+    # widths. Larger was tried and is the wrong trade while a cold read costs seconds: at 2.0
+    # the first look at anywhere reads 6x the viewport's area, and the cost lands exactly when
+    # the user is waiting.
+    _div_mem = {}  # subtype -> [[box, table, key], ...], newest last
+    DIV_PAD = 1.4
+    DIV_KEEP = 8
+
+    # ON-DISK, AND DELIBERATELY NOT A BUILD STEP. Nothing is precomputed and nothing has to
+    # be refreshed: this only ever holds boxes that were genuinely asked for. Deleting
+    # `.cache/divisions/` costs the next visit to each place and nothing else.
+    _DIV_DIR = pathlib.Path(".cache") / "divisions"
+    _DIV_LEDGER = _DIV_DIR / "index.json"
+
+    def _load_ledger():
+        try:
+            return json.loads(_DIV_LEDGER.read_text())
+        except Exception:
+            return []
+
+    _div_disk = _load_ledger()  # [[subtype, box, filename], ...]
+
+    def _grow(b, f=DIV_PAD):
+        w, s, e, n = b
+        cx, cy = (w + e) / 2, (s + n) / 2
+        hw, hh = (e - w) / 2 * f, (n - s) / 2 * f
+        return (
+            max(-180.0, cx - hw),
+            max(-85.0, cy - hh),
+            min(180.0, cx + hw),
+            min(85.0, cy + hh),
+        )
+
+    def _inside(outer, inner):
+        return (
+            outer[0] <= inner[0]
+            and outer[1] <= inner[1]
+            and outer[2] >= inner[2]
+            and outer[3] >= inner[3]
+        )
 
     def _hits(bbox):
         w, s, e, n = bbox
@@ -599,55 +767,107 @@ async def _(
             if b is None or (b[0] < e and b[2] > w and b[1] < n and b[3] > s)
         ]
 
-    async def fetch_divisions(subtype, bbox):
-        """Overture divisions of one subtype overlapping bbox, geometry as WKB.
+    def _remember(subtype, box, table, key):
+        held = _div_mem.setdefault(subtype, [])
+        held.append([box, table, key])
+        del held[:-DIV_KEEP]
+
+    _div_files = {}  # path -> open GeoParquetFile; the footer read is ~0.8 s each
+
+    async def _open(path):
+        f = _div_files.get(path)
+        if f is None:
+            f = _div_files[path] = await GeoParquetFile.open_async(path, store=_div_store)
+        return f
+
+    async def _one_file(path, subtype, box):
+        """One Overture part, filtered to the subtype we want, geometry as WKB.
 
         WKB rather than GeoArrow because the parts genuinely disagree about geometry type
         (Polygon in some files, MultiPolygon in others), which is the same thing that stops
         GeoParquetDataset opening them at all. A binary column has no opinion, so the parts
         concatenate.
         """
-        key = (subtype, tuple(round(v, 3) for v in bbox))
-        if key in _div_memo:
-            return _div_memo[key]
+        f = await _open(path)
+        data = await f.read_async(bbox=box)
+        # A file whose bbox overlaps but whose ROW GROUPS all get pruned away is the normal
+        # case here, since the file bboxes are near-global. The result is a table with no
+        # chunks at all, and pa.chunked_array([]) raises "cannot construct ChunkedArray from
+        # empty vector and omitted type" rather than returning something empty.
+        if data.num_rows == 0:
+            return None
+        # to_wkb must run on the GeoArrow column, BEFORE the PyArrow conversion drops the
+        # extension metadata it reads the geometry type from.
+        wkb = pa.chunked_array(
+            [
+                pa.array(c)
+                for c in pa.chunked_array(to_wkb(data.column("geometry"))).chunks
+            ]
+        ).cast(pa.binary())
+        t = pa.RecordBatchReader.from_stream(data).read_all()
+        # is_land drops the maritime half of division_area. Without it a coastal division's
+        # zonal mean is dragged toward zero by open water that was never at risk of being
+        # deforested.
+        keep = pc.and_(
+            pc.equal(t["subtype"], subtype), pc.fill_null(t["is_land"], False)
+        )
+        t = pa.table(
+            {
+                "id": t["id"],
+                "name": pc.struct_field(t["names"], "primary"),
+                "country": t["country"],
+                "wkb": wkb,
+            }
+        ).filter(keep)
+        return t if t.num_rows else None
 
-        parts = []
-        for path in _hits(bbox):
-            f = await GeoParquetFile.open_async(path, store=_div_store)
-            data = await f.read_async(bbox=bbox)
-            # A file whose bbox overlaps but whose ROW GROUPS do not all get pruned away is
-            # the normal case here, since the file bboxes are near-global. The result is a
-            # table with no chunks at all, and pa.chunked_array([]) raises "cannot
-            # construct ChunkedArray from empty vector and omitted type" rather than
-            # returning something empty.
-            if data.num_rows == 0:
-                continue
-            # to_wkb must run on the GeoArrow column, BEFORE the PyArrow conversion drops
-            # the extension metadata it reads the geometry type from.
-            wkb = pa.chunked_array(
-                [pa.array(c) for c in pa.chunked_array(to_wkb(data.column("geometry"))).chunks]
-            ).cast(pa.binary())
-            t = pa.RecordBatchReader.from_stream(data).read_all()
-            # is_land drops the maritime half of division_area. Without it a coastal
-            # division's zonal mean is dragged toward zero by open water that was never at
-            # risk of being deforested.
-            keep = pc.and_(
-                pc.equal(t["subtype"], subtype), pc.fill_null(t["is_land"], False)
+    async def fetch_divisions(subtype, bbox):
+        """Overture divisions of one subtype covering bbox, geometry as WKB.
+
+        Returns (table or None, key). The key names the cached read rather than the request,
+        so the polyfill can memoise against it: two viewports served by one cached read share
+        one set of filled cells.
+        """
+        for box, tbl, key in _div_mem.get(subtype, []):
+            if _inside(box, bbox):
+                return tbl, key
+
+        for sub, box, fname in _div_disk:
+            if sub == subtype and _inside(box, bbox):
+                key = (subtype, tuple(box))
+                try:
+                    tbl = pq.read_table(_DIV_DIR / fname)
+                except Exception:
+                    continue  # a half-written file from an interrupted kernel
+                tbl = tbl if tbl.num_rows else None
+                _remember(subtype, tuple(box), tbl, key)
+                return tbl, key
+
+        big = tuple(round(v, 4) for v in _grow(bbox))
+        parts = [
+            t
+            for t in await asyncio.gather(
+                *(_one_file(p, subtype, big) for p in _hits(big))
             )
-            t = pa.table(
-                {
-                    "id": t["id"],
-                    "name": pc.struct_field(t["names"], "primary"),
-                    "country": t["country"],
-                    "wkb": wkb,
-                }
-            ).filter(keep)
-            if t.num_rows:
-                parts.append(t)
-
+            if t is not None
+        ]
         out = pa.concat_tables(parts) if parts else None
-        _div_memo[key] = out
-        return out
+        key = (subtype, big)
+
+        fname = f"{subtype}-{abs(hash(key)):016x}.parquet"
+        try:
+            _DIV_DIR.mkdir(parents=True, exist_ok=True)
+            pq.write_table(
+                out if out is not None else pa.table({"id": pa.array([], pa.string())}),
+                _DIV_DIR / fname,
+            )
+            _div_disk.append([subtype, list(big), fname])
+            _DIV_LEDGER.write_text(json.dumps(_div_disk))
+        except Exception:
+            pass  # a read-only or full disk costs speed on the next run, not correctness
+
+        _remember(subtype, big, out, key)
+        return out, key
 
     # THE POLYFILL, AND THE ONE THING THAT MAKES IT AWKWARD.
     #
@@ -681,18 +901,31 @@ async def _(
         SELECT DISTINCT id, hex FROM filled
     """
 
-    def polyfill(divs_table, res):
+    # Memoised on (cached read, resolution). The polyfill is pure: the same divisions at the
+    # same resolution give the same cells forever, and a pan that reuses a cached read now
+    # reuses its cells too. Bounded because each entry is a few hundred thousand ids.
+    _fill_memo = {}
+    FILL_KEEP = 24
+
+    def polyfill(divs_table, key, res):
         """(id, hex) for every division, at one resolution.
 
         `divs` is the name POLYFILL_SQL selects from, and there is no register() call:
         DuckDB's replacement scan resolves it straight out of this frame, Arrow buffers and
         all, even as a local inside a nested function.
         """
+        ck = (key, int(res))
+        if ck in _fill_memo:
+            return _fill_memo[ck]
         divs = divs_table  # noqa: F841 - read by the replacement scan, not by Python
         # to_arrow_table, NOT .arrow(): as of DuckDB 1.5 that hands back a
         # RecordBatchReader, and the failure surfaces much later as
         # "'pyarrow.lib.RecordBatchReader' object has no attribute 'num_rows'".
-        return con.sql(POLYFILL_SQL, params=[int(res)]).to_arrow_table()
+        out = con.sql(POLYFILL_SQL, params=[int(res)]).to_arrow_table()
+        _fill_memo[ck] = out
+        while len(_fill_memo) > FILL_KEEP:
+            _fill_memo.pop(next(iter(_fill_memo)))
+        return out
 
     return fetch_divisions, polyfill
 
@@ -709,6 +942,7 @@ def _(
     Map,
     MaplibreBasemap,
     PAD,
+    Panel,
     PolygonLayer,
     SETTLE,
     STOPS,
@@ -721,6 +955,7 @@ def _(
     from_wkb,
     infer_rows_per_chunk,
     multipolygon,
+    np,
     ramp,
     res_for_zoom,
     seed_cells,
@@ -732,6 +967,7 @@ def _(
     # `view_state`.
     status = Status(value="<b>loading…</b>")
     controls = Controls()
+    ranking = Panel()
 
     _seed = seed_cells()
     cells = H3HexagonLayer(
@@ -746,11 +982,17 @@ def _(
         pickable=True,
     )
 
-    # THE DIVISIONS. Permanently `filled=True` with the fill switched by get_fill_color's
-    # ALPHA, never by the `filled` flag. `filled` decides whether deck builds a fill
-    # sublayer at all, and flipping it after init does not reliably make one appear: that
-    # is the "the fill button does nothing" bug recorded in CLAUDE.md, and re-pushing the
-    # table does not fix it either.
+    # THE DIVISIONS. Permanently `filled=True`, and `get_fill_color` is ALWAYS a column of
+    # the table on the layer, never a constant. Two rules, and the second is the one that
+    # was missing.
+    #
+    # `filled` decides whether deck builds a fill sublayer at all, and flipping it after init
+    # does not reliably make one appear: that is the "the fill button does nothing" bug
+    # recorded in CLAUDE.md. But following only that rule still left the fill dead, because
+    # the toggle swapped `get_fill_color` between a table column and the constant
+    # `[0, 0, 0, 0]`, which is a change of accessor KIND rather than of data. The fix is that
+    # both states are now the same column of the same schema with a different alpha baked in,
+    # and switching between them re-pushes the table. See divisions_to_layer.
     #
     # line_width_units="pixels" explicitly. deck's default is METRES with get_line_width
     # defaulting to 1, so the visible width is max(1 metre in pixels, line_width_min_pixels)
@@ -759,14 +1001,14 @@ def _(
     _dseed = seed_divisions(from_wkb, multipolygon)
     divisions = PolygonLayer(
         table=_dseed,
-        get_fill_color=[0, 0, 0, 0],
+        get_fill_color=_dseed["color"],
         filled=True,
         stroked=True,
         line_width_units="pixels",
         get_line_width=1.0,
         line_width_min_pixels=0,
         line_width_max_pixels=1.5,
-        get_line_color=[210, 214, 220, 190],
+        get_line_color=[232, 236, 242, 205],
         opacity=1.0,
         pickable=True,
         visible=False,
@@ -796,11 +1038,14 @@ def _(
     # A NEW MAP INHERITS NOTHING ABOUT THE OLD ONE'S SCREEN. HOLD lives in a cell that
     # cannot re-run, which is what lets the camera survive; the cost is that a re-run of
     # THIS cell builds fresh layers while HOLD still describes the map that just went away.
-    if HOLD["task"] is not None:
-        HOLD["task"].cancel()
-    HOLD["task"] = None
+    for _t in ("task", "seltask"):
+        if HOLD[_t] is not None:
+            HOLD[_t].cancel()
+        HOLD[_t] = None
     HOLD["busy"], HOLD["pending"] = False, None
     HOLD["res"], HOLD["box"], HOLD["div"] = None, None, None
+    HOLD["divpair"], HOLD["divbox"], HOLD["vs"] = None, None, None
+    HOLD["head"], HOLD["tail"] = "", ""
     HOLD["cache"].clear()
 
     def view_to_bbox(vs):
@@ -841,6 +1086,25 @@ def _(
             and box[3] >= want[3]
         )
 
+    def _same_view(a, b):
+        """The echo check: ignore the event the map emits for a view we set ourselves."""
+        return (
+            a is not None
+            and b is not None
+            and round(a.longitude, 6) == round(b.longitude, 6)
+            and round(a.latitude, 6) == round(b.latitude, 6)
+            and round(a.zoom, 4) == round(b.zoom, 4)
+        )
+
+    def set_status(vs):
+        """Redraw the status line from what is already known, plus this zoom.
+
+        Kept separate from the read because most camera moves read nothing, and the zoom
+        readout still has to move: zooming IN always lands inside the box the last read
+        covered, so without this the line would freeze exactly when the map is busiest.
+        """
+        status.value = f"{HOLD['head']}{HOLD['tail']} · zoom {vs.zoom:.1f}"
+
     def put_cells(tbl):
         cells._rows_per_chunk = max(1, infer_rows_per_chunk(tbl))
         # hold_sync so deck gets one message. Without it the new hexagons are drawn
@@ -851,62 +1115,78 @@ def _(
             cells.get_fill_color = tbl["color"]
             cells.visible = controls.show_cells
 
-    def put_divisions(tbl):
+    def put_divisions(pair):
+        """Push whichever of the two colour variants the fill switch is asking for."""
+        tbl = pair[0] if controls.division_fill else pair[1]
         divisions._rows_per_chunk = max(1, infer_rows_per_chunk(tbl))
         with divisions.hold_sync():
             divisions.table = tbl
-            divisions.get_fill_color = (
-                tbl["color"] if controls.division_fill else [0, 0, 0, 0]
-            )
+            divisions.get_fill_color = tbl["color"]
             divisions.visible = controls.show_divisions
-        HOLD["divtable"] = tbl
+        HOLD["divpair"] = pair
 
     def _on_controls(change):
         name = change["name"]
         if name == "show_cells":
             cells.visible = bool(change["new"])
         elif name == "show_divisions":
-            divisions.visible = bool(change["new"]) and HOLD.get("divtable") is not None
+            divisions.visible = bool(change["new"]) and HOLD["divpair"] is not None
         elif name == "division_fill":
-            tbl = HOLD.get("divtable")
-            if tbl is not None:
-                # An alpha swap, never a `filled` swap. See the layer comment above.
-                divisions.get_fill_color = tbl["color"] if change["new"] else [0, 0, 0, 0]
+            # A whole re-push, not an accessor assignment. See divisions_to_layer.
+            if HOLD["divpair"] is not None:
+                put_divisions(HOLD["divpair"])
 
     controls.observe(_on_controls, names=["show_cells", "show_divisions", "division_fill"])
 
-    async def _draw(vs, force):
-        """Make the screen authoritative for THIS view: cache hit, or read and refold."""
-        res = res_for_zoom(vs.zoom)
-        sub = division_for_zoom(vs.zoom)
+    def _instant(vs):
+        """Everything answerable without a read, done synchronously in the comm handler.
+
+        THIS IS THE ZOOM AND PAN FEEL, and it is where the clunkiness was. `view_state` fires
+        on every frame, and every one of those frames used to be handed to an async task that
+        slept SETTLE seconds BEFORE it would so much as look at the cache. So a pan inside the
+        box already on screen cost a quarter of a second of nothing, and a zoom back out to a
+        resolution already folded cost the same again, even though both are dict lookups.
+        Answering them here means the map keeps up with the mouse and the debounce is only
+        ever spent waiting on bytes that are genuinely missing.
+        """
+        res, sub = res_for_zoom(vs.zoom), division_for_zoom(vs.zoom)
         seen = view_to_bbox(vs)
-        want = _pad(seen)
-
-        # Already correct for this view.
-        if not force and res == HOLD["res"] and sub == HOLD["div"] and _covers(HOLD["box"], seen):
-            return
-
+        div_ok = sub is None or (sub == HOLD["div"] and _covers(HOLD["divbox"], seen))
+        if res == HOLD["res"] and sub == HOLD["div"] and div_ok and _covers(HOLD["box"], seen):
+            set_status(vs)
+            return True
         # A resolution folded before that still covers the screen. This is the whole
-        # zoom-out case: coming back up to a level already visited is a dict lookup rather
-        # than a read, so it lands instantly instead of a second later.
+        # zoom-out case: coming back up to a level already visited lands on the frame it is
+        # asked for rather than a second later.
         hit = HOLD["cache"].get(res)
-        if not force and hit and _covers(hit[0], seen) and sub == HOLD["div"]:
+        if hit and sub == HOLD["div"] and div_ok and _covers(hit[0], seen):
             put_cells(hit[1])
             HOLD["res"], HOLD["box"] = res, hit[0]
-            status.value = (
-                f"<b>res {res}</b> · {hit[1].num_rows:,} cells · cached · zoom {vs.zoom:.1f}"
-            )
+            HOLD["head"] = f"<b>res {res}</b> · {hit[1].num_rows:,} cells · cached"
+            set_status(vs)
+            return True
+        return False
+
+    async def _draw(vs, force):
+        """Make the screen authoritative for THIS view: cache hit, or read and refold."""
+        if not force and _instant(vs):
             return
+
+        res = res_for_zoom(vs.zoom)
+        sub = division_for_zoom(vs.zoom)
+        want = _pad(view_to_bbox(vs))
 
         # THE LAST ANSWER STAYS UP UNTIL THERE IS A NEW ONE. Nothing is cleared here: the
         # read happens under the cells already on screen, and the swap is one trait update
         # when the new fold is complete. A stale-but-plausible map reads as the map; an
         # empty one reads as broken.
-        status.value = f"<b>reading…</b> res {res} · zoom {vs.zoom:.1f}"
+        HOLD["head"] = f"<b>reading…</b> res {res}"
+        set_status(vs)
         raw, fetched, skipped = await HOLD["fold"](res, want)
         if raw is None or raw.num_rows == 0:
             HOLD["res"], HOLD["box"], HOLD["div"] = res, want, sub
-            status.value = f"<b>res {res}</b> · no data here · zoom {vs.zoom:.1f}"
+            HOLD["head"], HOLD["tail"] = f"<b>res {res}</b> · no data here", ""
+            set_status(vs)
             return
 
         tbl = cells_to_layer(raw)
@@ -914,13 +1194,12 @@ def _(
         put_cells(tbl)
         HOLD["res"], HOLD["box"] = res, want
 
-        note = (
+        HOLD["head"] = (
             f"<b>res {res}</b> · {raw.num_rows:,} cells · "
             f"{'tiles cached' if fetched == 0 else f'{fetched} tiles'}"
             f"{f' · {skipped} sparse' if skipped else ''}"
-            f" · zoom {vs.zoom:.1f}"
         )
-        status.value = note
+        set_status(vs)
 
         # THE DIVISIONS, AFTER THE CELLS. The cells are the expensive read and the thing
         # the user is waiting to see; the zonal join depends on them, so it goes out second
@@ -932,35 +1211,33 @@ def _(
             # prunes no row groups, so this is the one view where streaming Overture would
             # mean reading most of 5.5 GB to find 219 rows.
             divisions.visible = False
-            HOLD["divtable"] = None
-            HOLD["div"] = None
-            status.value = note + " · zoom in for boundaries"
+            HOLD["divpair"], HOLD["div"], HOLD["divbox"] = None, None, None
+            HOLD["tail"] = " · zoom in for boundaries"
+            set_status(vs)
             return
         zonal = await HOLD["zonal"](sub, want, res, raw)
-        HOLD["div"] = sub
+        HOLD["div"], HOLD["divbox"] = sub, want
         if zonal is None:
             divisions.visible = False
-            HOLD["divtable"] = None
+            HOLD["divpair"], HOLD["tail"] = None, ""
+            set_status(vs)
             return
-        dtbl, n_div, n_unmeasured = zonal
-        put_divisions(dtbl)
-        status.value = note + (
-            f" · {n_div:,} {DIVISION_LABEL[sub]}"
-            + (
-                f" · <b style='color:#E69F00'>{n_unmeasured} too small to measure</b>"
-                if n_unmeasured
-                else ""
-            )
+        pair, n_div, n_unmeasured = zonal
+        put_divisions(pair)
+        HOLD["tail"] = f" · {n_div:,} {DIVISION_LABEL[sub]}" + (
+            f" · <b style='color:#E69F00'>{n_unmeasured} too small to measure</b>"
+            if n_unmeasured
+            else ""
         )
+        set_status(vs)
 
     async def refresh(vs, force=False):
         """Fold what the camera is looking at, once it has stopped moving.
 
-        `view_state` fires on every frame of a drag and each fold is an object-store read,
-        so this does two things. SETTLE debounces, so a drag reads once at the end rather
-        than at every position it passed through. Coalescing then collapses whatever piled
-        up during a read to the NEWEST view: without it a two-second drag queues a hundred
-        folds of stale viewports and never catches up. No threads and no timers; the
+        Each fold is an object-store read, so SETTLE debounces: a drag reads once at the end
+        rather than at every position it passed through. Coalescing then collapses whatever
+        piled up during a read to the NEWEST view, without which a two-second drag queues a
+        hundred folds of stale viewports and never catches up. No threads and no timers; the
         debounce is an await on the kernel's own loop, so the map keeps rendering.
         """
         if HOLD["fold"] is None:
@@ -971,12 +1248,13 @@ def _(
         HOLD["busy"] = True
         try:
             while True:
-                if not force:
-                    while SETTLE > 0:
-                        await asyncio.sleep(SETTLE)
-                        if HOLD["pending"] is None:
-                            break
+                if not force and SETTLE > 0:
+                    await asyncio.sleep(SETTLE)
+                    if HOLD["pending"] is not None:
+                        # Still moving. Take the newest view and settle again, which is the
+                        # debounce; it ends when a whole SETTLE passes with nothing queued.
                         vs, HOLD["pending"] = HOLD["pending"], None
+                        continue
                 await _draw(vs, force)
                 vs, force = HOLD["pending"], False
                 if vs is None:
@@ -984,36 +1262,136 @@ def _(
                 HOLD["pending"] = None
         except Exception as exc:
             # A failure inside a comm handler is otherwise completely silent.
-            status.value = (
+            HOLD["head"] = (
                 f"<b style='color:#F0E442'>failed:</b> {type(exc).__name__}: {exc}"
             )
+            HOLD["tail"] = ""
+            status.value = HOLD["head"]
             raise
         finally:
             HOLD["busy"], HOLD["pending"] = False, None
 
-    def _on_camera(change):
-        # The observer is sync and the fold is not, so the work goes to the kernel's event
-        # loop. HOLD["task"] keeps a strong reference: asyncio holds only a weak one and a
-        # bare create_task can be collected mid-flight.
-        vs = change["new"]
-        if HOLD["busy"]:
-            HOLD["pending"] = vs
-            return
+    def _spawn(coro):
+        """Run a coroutine on the kernel's loop, keeping a strong reference to the task.
+
+        asyncio holds only a weak one, so a bare create_task can be collected mid-flight.
+        """
         try:
-            HOLD["task"] = asyncio.get_running_loop().create_task(refresh(vs))
+            return asyncio.get_running_loop().create_task(coro)
         except RuntimeError:
             loop = HOLD.get("loop")
-            if loop is not None:
-                HOLD["task"] = asyncio.run_coroutine_threadsafe(refresh(vs), loop)
+            return asyncio.run_coroutine_threadsafe(coro, loop) if loop else None
+
+    def _on_camera(change):
+        vs = change["new"]
+        if _same_view(vs, HOLD["vs"]):
+            return
+        HOLD["vs"] = vs
+        if HOLD["busy"]:
+            # A read is already in flight; let it finish and take this view next, rather
+            # than painting a cache hit the in-flight result would immediately overwrite.
+            HOLD["pending"] = vs
+            return
+        if _instant(vs):
+            return
+        HOLD["task"] = _spawn(refresh(vs))
 
     deck.observe(_on_camera, names="view_state")
 
+    # ---------------------------------------------------------------- the drawn box
+    # Draw a box with the ▢ button at the lower right of the map and the divisions inside it
+    # come back ranked, below. This is the one place the join produces a NUMBER rather than a
+    # colour, and it is deliberately not tied to the camera: the box is an explicit ask, so
+    # it reads one level FINER than the screen and it names the divisions outright.
+    RANK_N = 25
+
+    def rank_html(out):
+        if out is None:
+            return (
+                "<div style='font:12.5px ui-monospace,SFMono-Regular,Menlo,monospace;"
+                "opacity:.75;padding:.5rem 0'>No division in that box caught a cell centre. "
+                "Draw a larger box, or zoom in first.</div>"
+            )
+        sub, res, tbl, n_small = out
+        names = tbl["name"].to_pylist()
+        country = tbl["country"].to_pylist()
+        n_cells = tbl["n_cells"].to_pylist()
+        portion = np.asarray(tbl["portion"], dtype="float64")
+        order = np.argsort(-portion)[:RANK_N]
+        top = float(portion[order[0]]) if len(order) else 1.0
+        rows = []
+        for place, i in enumerate(order, 1):
+            i = int(i)
+            rgb = ",".join(str(int(c)) for c in ramp(np.array([portion[i]]))[0])
+            bar = max(2.0, 100.0 * portion[i] / max(top, 1e-12))
+            label = names[i] or "(unnamed)"
+            rows.append(
+                f"<tr>"
+                f"<td style='text-align:right;opacity:.5;padding:.12rem .5rem .12rem 0'>{place}</td>"
+                f"<td style='padding:.12rem .6rem .12rem 0;white-space:nowrap'>{label}"
+                f"<span style='opacity:.45'> · {country[i] or '??'}</span></td>"
+                f"<td style='text-align:right;padding:.12rem .6rem .12rem 0;"
+                f"font-variant-numeric:tabular-nums'>{portion[i] * 100:.3f}%</td>"
+                f"<td style='width:180px;padding:.12rem .6rem .12rem 0'>"
+                f"<span style='display:block;height:9px;border-radius:2px;"
+                f"width:{bar:.1f}%;background:rgb({rgb})'></span></td>"
+                f"<td style='text-align:right;opacity:.45;"
+                f"font-variant-numeric:tabular-nums'>{n_cells[i]:,} cells</td>"
+                f"</tr>"
+            )
+        head = (
+            f"<b>{len(names):,} {DIVISION_LABEL[sub]} in the box</b>, ranked by mean share "
+            f"deforested 2002-2022, measured at H3 res {res}"
+            + (
+                f" · <span style='color:#E69F00'>{n_small} too small to measure</span>"
+                if n_small
+                else ""
+            )
+            + (
+                f" · showing the top {RANK_N}"
+                if len(names) > RANK_N
+                else ""
+            )
+        )
+        return (
+            "<div style='font:12.5px ui-monospace,SFMono-Regular,Menlo,monospace;"
+            "padding:.5rem 0 .2rem'>"
+            f"<div style='opacity:.8;padding-bottom:.35rem'>{head}</div>"
+            "<table style='border-collapse:collapse'>" + "".join(rows) + "</table></div>"
+        )
+
+    def _on_select(change):
+        b = change["new"]
+        if not b:
+            return  # a fresh Map resets selected_bounds to None
+        box = tuple(float(v) for v in b)
+        ranking.value = (
+            "<div style='font:12.5px ui-monospace,SFMono-Regular,Menlo,monospace;"
+            "opacity:.7;padding:.5rem 0'><b>ranking</b> the divisions in that box…</div>"
+        )
+
+        async def go():
+            try:
+                ranking.value = rank_html(await HOLD["rank"](box))
+            except Exception as exc:
+                ranking.value = (
+                    f"<div style='font:12.5px ui-monospace,monospace;padding:.5rem 0'>"
+                    f"<b style='color:#F0E442'>ranking failed:</b> "
+                    f"{type(exc).__name__}: {exc}</div>"
+                )
+                raise
+
+        HOLD["seltask"] = _spawn(go())
+
+    deck.observe(_on_select, names="selected_bounds")
+
     # The legend, built from the same `ramp` the layers use, so a colour on the map and a
-    # colour in the key cannot drift apart.
+    # colour in the key cannot drift apart. The division fill uses the same ramp at a lower
+    # alpha, so one key serves both.
     _sw = "".join(
         f"<span style='display:inline-flex;align-items:center;gap:.3rem;margin-right:.8rem'>"
         f"<span style='width:14px;height:14px;border-radius:2px;background:rgb("
-        f"{','.join(str(int(c)) for c in ramp(__import__('numpy').array([v]))[0])})"
+        f"{','.join(str(int(c)) for c in ramp(np.array([v]))[0])})"
         f";outline:1px solid rgba(255,255,255,.18)'></span>{lab}</span>"
         for v, lab in STOPS
     )
@@ -1023,7 +1401,7 @@ def _(
         "<b style='margin-right:.7rem'>share of cell deforested 2002-2022</b>"
         f"{_sw}</div>"
     )
-    return controls, deck, legend, refresh, status
+    return controls, deck, legend, ranking, refresh, status
 
 
 @app.cell
@@ -1034,10 +1412,12 @@ async def _(
     HOLD,
     HOME,
     LEVEL_FOR_RES,
+    MAX_RES,
     S3Store,
     SOURCE_BUCKET,
     TILE,
     TILE_BUDGET,
+    VIEW_W,
     Window,
     XarrayContext,
     asyncio,
@@ -1051,6 +1431,7 @@ async def _(
     pa,
     polyfill,
     refresh,
+    res_for_zoom,
     udf,
     xr,
 ):
@@ -1274,38 +1655,79 @@ async def _(
         GROUP BY d.id
     """
 
-    async def zonal(subtype, box, res, cells_tbl):
-        """Divisions in view, each with its area-weighted mean deforestation.
+    def join_divisions(meta, key, res, cells_tbl):
+        """(divisions with a value, divisions with none) for one subtype at one resolution.
 
-        Returns (layer table, divisions drawn, divisions with no number) or None.
+        Synchronous from the register to the result on purpose: `ctx` is one shared context
+        and `div_cells` / `cells` are fixed names in it, so anything that awaited in the
+        middle could have its tables swapped out from under it by the next camera event.
+        With no await between them the event loop cannot interleave and no lock is needed.
         """
-        meta = await fetch_divisions(subtype, box)
-        if meta is None or meta.num_rows == 0:
-            return None
-
-        mapping = polyfill(meta, res)
+        mapping = polyfill(meta, key, res)
         if mapping.num_rows == 0:
-            return None
-
+            return None, meta.num_rows
         _register("div_cells", mapping)
         _register("cells", cells_tbl)
         joined = ctx.sql(ZONAL_SQL).to_arrow_table().combine_chunks()
         if joined.num_rows == 0:
-            return None
-
+            return None, meta.num_rows
         # Divisions that caught no cell centre get NO number rather than a guessed one.
         # Always the same cause: smaller than one cell at this resolution. An inner join
         # drops them, which is what makes the choropleth honest and the count reportable.
-        n_unmeasured = meta.num_rows - joined.num_rows
         out = meta.join(joined, keys="id", join_type="inner")
+        return out, max(0, meta.num_rows - out.num_rows)
+
+    async def zonal(subtype, box, res, cells_tbl):
+        """Divisions in view, each with its area-weighted mean deforestation.
+
+        Returns (the two colour variants of the layer table, divisions drawn, divisions with
+        no number) or None.
+        """
+        meta, key = await fetch_divisions(subtype, box)
+        if meta is None or meta.num_rows == 0:
+            return None
+        out, n_unmeasured = join_divisions(meta, key, res, cells_tbl)
+        if out is None:
+            return None
         return (
             divisions_to_layer(out, from_wkb, multipolygon),
             out.num_rows,
-            max(0, n_unmeasured),
+            n_unmeasured,
         )
+
+    async def rank(box):
+        """Every division inside a drawn box, with its mean, for the ranking below the map.
+
+        Returns (subtype, resolution, table, divisions with no number) or None.
+
+        THREE THINGS THIS DOES NOT SHARE WITH THE CAMERA, AND WHY.
+        1. It reads ONE RESOLUTION FINER than the screen would. A drawn box is an explicit
+           question about a specific place, so it is worth a read the camera would not
+           spend, and the finer the cells the fewer divisions fall through the 'center' rule.
+        2. It derives that resolution from the BOX, not from the current zoom, so a small box
+           drawn on a wide view still gets measured properly.
+        3. It falls back county -> region -> country. Overture has counties for 171 of 219
+           countries, so a box over the other 48 would otherwise come back empty rather than
+           answering at the finest level that exists there.
+        """
+        span = max(box[2] - box[0], 1e-9)
+        z = math.log2(360.0 * VIEW_W / (512 * span))
+        res = min(MAX_RES, res_for_zoom(z) + 1)
+        raw, _fetched, _skipped = await fold(res, box)
+        if raw is None or raw.num_rows == 0:
+            return None
+        for sub in ("county", "region", "country"):
+            meta, key = await fetch_divisions(sub, box)
+            if meta is None or meta.num_rows == 0:
+                continue
+            out, n_small = join_divisions(meta, key, res, raw)
+            if out is not None:
+                return sub, res, out, n_small
+        return None
 
     HOLD["fold"] = fold
     HOLD["zonal"] = zonal
+    HOLD["rank"] = rank
     HOLD["loop"] = asyncio.get_running_loop()
 
     # The opening draw. force=True skips the settle: there is nothing to debounce yet.
@@ -1319,7 +1741,7 @@ async def _(
 
 
 @app.cell
-def _(controls, deck, legend, mo, status):
+def _(controls, deck, legend, mo, ranking, status):
     mo.vstack(
         [
             deck,
@@ -1331,8 +1753,11 @@ def _(controls, deck, legend, mo, status):
                 "(Vizzuality / LandGriffon, CC-BY 4.0). Boundaries: Overture Maps. "
                 "A division's value is the mean over the H3 cells whose CENTRE falls "
                 "inside it, so divisions smaller than one cell at the current resolution "
-                "are drawn unfilled rather than given a number."
+                "are drawn unfilled rather than given a number. "
+                "**Draw a box** with the ▢ button at the lower right of the map to rank "
+                "the divisions inside it."
             ),
+            ranking,
         ]
     )
     return
