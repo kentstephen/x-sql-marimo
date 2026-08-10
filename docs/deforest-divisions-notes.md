@@ -474,3 +474,73 @@ Two readings, and they are not the same notebook:
 piece that looks most like boilerplate. Any COG that stores no ocean will otherwise fail
 with `Invalid range requested, start: 0 end: 0`, which names neither the tile nor the
 sparseness.
+
+## Session 3 (2026-08-10): the GeoParquet path is gone, divisions come from PMTiles
+
+The conclusion of "measured to the floor" above was that no query makes the GeoParquet
+read faster because the layout is the problem. The fix was never client-side: Overture
+publishes the same release as a PMTiles build, and that is the layout problem solved
+upstream. `overturemaps-extras-us-west-2/tiles/2026-07-22.0/divisions.pmtiles`: one
+19.5 GB object, anonymous ranged GETs, Hilbert-ordered gzipped MVT tiles, z0-12. (The
+old `overturemaps-tiles-us-west-2-beta` bucket is dead: `AllAccessDisabled`.)
+
+The reader is the PMTiles v3 client from `xsql-duckdb-terrain-h3.py`, ported nearly
+verbatim; that notebook is parked on looks but its reader was the good part. The MVT
+decode is hand-rolled on the same varint machinery (the one real bug on the way in:
+exterior-ring winding. Tile y points down, so a spec-clockwise exterior is
+counterclockwise in plain axes and the standard shoelace sum is already positive.
+Getting the sign backwards classifies every ring as a hole and decodes every feature
+to nothing). Verified ring-exact and property-exact against mapbox-vector-tile on ten
+tiles including the world tile, Java's coastline and Italy's enclaves.
+
+Measured, same Rondonia-sized viewport as the floor measurements:
+
+    regions, cold          0.74 s   (GeoParquet: 13.8 s with all three fixes in)
+    regions, warm          0 ms     (memo; the disk ledger is deleted, not ported)
+    counties, Iowa view    0.36 s   (137 rows)
+    polyfill res 6         0.09 s   (50,750 cells; Rondonia 6,617 vs ~6,600 expected
+                                     from exact geometry, so the simplified tile
+                                     geometry costs nothing at these resolutions)
+    regions, whole planet  4.2 s    (3,912 rows; not reachable at all before)
+
+Facts about the tileset, measured off the tiles (none of it is documented):
+
+- Subtype minzooms are baked in by Planetiler: country z2, region z4, county z8,
+  locality z10. Everything persists from its floor to z12. `SUB_MINZOOM` in the
+  notebook records this and floors the zoom picker.
+- `division_area` carries `division_id`, `subtype`, `@name` (plain primary name, no
+  JSON parse), `country`, `is_land`. Nothing needed is missing, and `is_land` is
+  always present (measured 431 True / 325 False over seven tiles): the maritime half
+  IS in the tileset and still needs the filter.
+- Join on `division_id`, not `id`: `id` names the area row, several per division.
+  Same lesson as the `division_boundary` experiment.
+
+Two structural notes:
+
+- Tile geometry arrives clipped, so one division is several pieces. Pieces are
+  dissolved per id in DuckDB (`ST_Union_Agg`) before anything downstream sees them,
+  or the stroke draws tile-edge lines across the map. The tile buffer makes the union
+  clean. Clip edges survive only at the outer boundary of the fetched range, a full
+  DIV_PAD beyond the viewport.
+- **The 596-second rank() bug is closed as a side effect.** The zonal join was always
+  an inner join against in-view cells, so the whole-division polyfill never changed
+  the NUMBERS, only the cost; tile-clipped geometry cuts the cost without touching
+  the semantics. The remaining guard is TILE_CAP=256: a continent-sized box asking
+  for counties is refused instantly and rank() falls back to regions, the same
+  promise it already makes where counties do not exist.
+
+Deleted along with the read path: the file-bbox index, the on-disk division cache and
+ledger (existed because a cold read cost 18 s; it now costs under a second), and the
+`geoarrow-rust-io` dependency. `.cache/divisions/` and
+`.cache/overture-index-divisions.json` are orphans and can be deleted.
+
+Integration test: `itest_divisions.py` (scratchpad, session-local) extracts the
+divisions cell from the notebook by AST and drives fetch -> dissolve -> polyfill ->
+cap-refusal against the live archive. Headless export also clean.
+
+Session 2's open item 4 (the Brazil box fell back from counties to regions,
+unexplained) is CLOSED: a county fetch over Rondonia returns exactly one county,
+Itenez, which is in BOLIVIA, across the border. Brazil has no county-subtype
+divisions in Overture at all; its municipalities are not mapped to that subtype. The
+fallback was the notebook behaving correctly on data that is genuinely absent, which
+is the same story as the 48 countries with no counties anywhere.

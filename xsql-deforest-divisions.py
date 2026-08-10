@@ -9,7 +9,6 @@
 #     "pyarrow>=25.0.0",
 #     "arro3-core",
 #     "geoarrow-rust-core",
-#     "geoarrow-rust-io",
 #     "obstore>=0.9.2",
 #     "async-geotiff>=0.4",
 #     "lonboard>=0.16.0",
@@ -29,14 +28,26 @@ is legitimate rather than a lie. No majority vote, no mode, no class fold.
 
 WHAT EACH ENGINE DOES:
 
-  obstore      streams the COG and the Overture GeoParquet, unsigned. Nothing is cached
-               to disk; a viewport reads what it needs and keeps it in memory.
+  obstore      streams the COG and the Overture divisions PMTiles, unsigned. Nothing is
+               cached to disk; a viewport reads what it needs and keeps it in memory.
   DataFusion   the fold (pixels -> H3 cells) AND the join (cells -> divisions). The join
                is an integer equi-join on a UBIGINT cell id plus a group-by, which is what
                a query engine is for.
-  DuckDB h3    the polyfill only: division polygon -> the cells covering it. The one step
-               neither DataFusion nor plain SQL can do.
+  DuckDB       the polyfill (division polygon -> the cells covering it) and the tile-seam
+               dissolve (clipped pieces of one division -> one MultiPolygon). The two
+               geometry steps neither DataFusion nor plain SQL can do.
   lonboard     the render.
+
+WHY PMTILES AND NOT THE GEOPARQUET. Overture lays the division_area files out with no
+spatial order, so the geometry (99.0% of the bytes) cannot be pruned: a Rondonia-sized
+viewport decodes ~190 MB per file to keep 6,337 rows, and no query makes that smaller.
+The same release's divisions.pmtiles is the vector twin of the COG's overview pyramid:
+one 19.5 GB object, addressed by ranged GET, Hilbert-ordered tiles, z0-12. The same
+viewport reads ~0.8 MB. Tiles are gzipped MVT, decoded here with a hand-rolled protobuf
+walk (verified ring-exact against mapbox-vector-tile) because the whole reader is fewer
+lines than the dependency. Tile geometry is quantized to ~2.4 m at z12 and clipped to
+tile edges; the polyfill is 'center'-ruled at res 4-8 (cells 460 m and up), so the cells
+land identically, and the dissolve below removes the clip edges before anything is drawn.
 
 WHY H3 IS NOT JUST A DEMO STEP. The COG is EPSG:4326, so its pixels are not equal area: a
 100 m pixel at the equator covers about twice the ground of one at 60 degrees. Averaging
@@ -81,9 +92,9 @@ app = marimo.App(width="full")
 @app.cell
 def _():
     import asyncio
-    import json
+    import gzip
     import math
-    import pathlib
+    import struct
 
     import anywidget
     import traitlets
@@ -93,15 +104,13 @@ def _():
     matplotlib.use("Agg")  # no GUI backend in a kernel
     import duckdb
     import numpy as np
+    import obstore
     import pyarrow as pa
-    import pyarrow.compute as pc
-    import pyarrow.parquet as pq
     import xarray as xr
     from arro3.core import Array as ArroArray, Table as ArroTable
     from async_geotiff import GeoTIFF, Window
     from datafusion import udf
-    from geoarrow.rust.core import from_wkb, multipolygon, to_wkb
-    from geoarrow.rust.io import GeoParquetFile
+    from geoarrow.rust.core import from_wkb, multipolygon
     from h3ronpy.vector import coordinates_to_cells
     from obstore.store import S3Store
     from xarray_sql import XarrayContext
@@ -114,7 +123,6 @@ def _():
         ArroTable,
         BitmapTileLayer,
         CartoBasemap,
-        GeoParquetFile,
         GeoTIFF,
         H3HexagonLayer,
         Map,
@@ -128,18 +136,16 @@ def _():
         coordinates_to_cells,
         duckdb,
         from_wkb,
+        gzip,
         infer_rows_per_chunk,
-        json,
         math,
         matplotlib,
         mo,
         multipolygon,
         np,
+        obstore,
         pa,
-        pathlib,
-        pc,
-        pq,
-        to_wkb,
+        struct,
         traitlets,
         udf,
         xr,
@@ -306,31 +312,22 @@ def _(math):
 
     # WHICH DIVISION LEVEL IS DRAWN AT WHICH ZOOM, AND WHY THERE IS NONE AT THE TOP.
     #
-    # Below DIV_ZOOM there are no boundaries at all: the hexagons carry the map alone. That
-    # is a performance decision as much as a design one, and it is the one place where
-    # streaming Overture per viewport genuinely does not work.
-    #
-    # `read_async(bbox=...)` prunes ROW GROUPS, and that is the only pruning available
-    # here: the file-level index is useless for divisions because 7 of the 8 files have a
-    # bbox wider than 130 degrees, so nearly every viewport hits nearly every file. Row
-    # group pruning is excellent when the box is small and buys exactly nothing when the
-    # box is the world. So a world view of countries means reading most of 5.5 GB to find
-    # 219 rows, and `subtype` is not partitioned, so there is no cheaper way to ask.
-    #
-    # Zooming in inverts that completely, which is the same inversion the raster read runs
-    # on: the tighter the view, the less there is to read. Boundaries arrive when the view
-    # is tight enough for them to be both cheap and meaningful.
+    # Below DIV_ZOOM there are no boundaries at all: the hexagons carry the map alone.
+    # Under GeoParquet that was forced (a world view of countries meant reading most of
+    # 5.5 GB to find 219 rows); under PMTiles a world of countries is 16 tiles at z2 and
+    # the constraint is gone. The band is kept as a design choice: at the opening zoom
+    # the map is about where deforestation IS, and country outlines over it answer a
+    # question nobody has asked yet. Lower DIV_ZOOM if that reading changes.
     #
     # Overture has counties for 171 of 219 countries, so the county band is genuinely empty
     # in places rather than merely sparse.
     DIV_ZOOM = 4.5
 
-    # TODO: a fourth band, `locality`, above roughly zoom 9.5. Overture has 57,072
-    # localities in a single division_area file against 11,375 counties, so the row-group
-    # pruning has to be doing real work before it is affordable, which it is by that zoom.
-    # The open question is not cost but meaning: a locality boundary is a settlement, so
-    # most of a drawn box would fall outside every polygon and the ranking would describe
-    # the towns rather than the ground. Decide that before adding the band.
+    # TODO: a fourth band, `locality`, above roughly zoom 9.5. The tileset carries
+    # localities from z10, so under PMTiles the cost question is already answered; what
+    # remains is the meaning question. A locality boundary is a settlement, so most of a
+    # drawn box would fall outside every polygon and the ranking would describe the towns
+    # rather than the ground. Decide that before adding the band.
     def division_for_zoom(z):
         if z < DIV_ZOOM:
             return None
@@ -341,11 +338,17 @@ def _(math):
     DIVISION_LABEL = {"country": "countries", "region": "regions", "county": "counties"}
 
     # ------------------------------------------------------------------ boundaries
-    OVERTURE_BUCKET = "overturemaps-us-west-2"
+    # Overture's own PMTiles build of the same release the GeoParquet path used to read.
+    # One object, anonymous ranged GETs, MVT tiles z0-12.
     OVERTURE_RELEASE = "2026-07-22.0"
-    DIVISION_PREFIX = (
-        f"release/{OVERTURE_RELEASE}/theme=divisions/type=division_area"
-    )
+    PM_BUCKET = "overturemaps-extras-us-west-2"
+    PM_PATH = f"tiles/{OVERTURE_RELEASE}/divisions.pmtiles"
+
+    # The tile zoom at which each subtype FIRST appears in this tileset. Measured off the
+    # tiles themselves (probe: Rondonia, Iowa, Congo, z2-z10), not documented anywhere:
+    # Planetiler's minzoom rules are baked into the build. Every subtype persists from its
+    # floor up to z12, so these are floors for the zoom picker, not bands.
+    SUB_MINZOOM = {"country": 2, "region": 4, "county": 8}
 
     # ------------------------------------------------------------------ view
     # The map's pixel size, assumed. It only sets how much of the world the viewport box
@@ -372,16 +375,17 @@ def _(math):
     return (
         COG,
         DIVISION_LABEL,
-        DIVISION_PREFIX,
         FETCH_AT_ONCE,
         FILL_ALPHA,
         HOME,
         LEVEL_FOR_RES,
         MAX_RES,
-        OVERTURE_BUCKET,
         PAD,
+        PM_BUCKET,
+        PM_PATH,
         SETTLE,
         SOURCE_BUCKET,
+        SUB_MINZOOM,
         TILE,
         TILE_BUDGET,
         VIEW_H,
@@ -644,101 +648,401 @@ def _(ArroArray, ArroTable, FILL_ALPHA, coordinates_to_cells, np, pa, ramp, ramp
 
 @app.cell
 async def _(
-    DIVISION_PREFIX,
-    GeoParquetFile,
-    OVERTURE_BUCKET,
+    PM_BUCKET,
+    PM_PATH,
     S3Store,
+    SUB_MINZOOM,
     asyncio,
     con,
-    json,
+    gzip,
+    math,
+    np,
+    obstore,
     pa,
-    pathlib,
-    pc,
-    pq,
-    to_wkb,
+    struct,
 ):
-    # DIVISIONS ARE STREAMED, NOT CACHED TO DISK. obstore opens the GeoParquet directly and
-    # `read_async(bbox=...)` pushes the viewport down to row groups, so a zoomed-in view
-    # reads a slice rather than a file.
+    # DIVISIONS COME OUT OF ONE PMTILES OBJECT, BY RANGED GET. The GeoParquet path this
+    # replaces was measured to the floor first (see the notes doc): geometry is 99.0% of a
+    # row group's bytes, `subtype` statistics prune nothing, and client concurrency was
+    # not the bottleneck, so a Rondonia-sized viewport cost ~190 MB of decode per file and
+    # no query could make it smaller. The tileset is the same release with the layout
+    # problem solved upstream: Hilbert-ordered MVT tiles in one archive, so a viewport is
+    # a handful of contiguous ranges. The same viewport reads ~0.8 MB.
     #
-    # WHAT THE FILE INDEX DOES AND DOES NOT BUY HERE. It is 8 footer reads, seconds not the
-    # 100 s the buildings index costs, but it prunes almost nothing: 7 of the 8 files have a
-    # bbox wider than 130 degrees, so nearly every viewport hits nearly every file. The real
-    # pruning is inside read_async, on row groups. The index is kept because skipping even
-    # one 600 MB file is worth having and it costs nothing to consult.
-    _div_store = S3Store(OVERTURE_BUCKET, region="us-west-2", skip_signature=True)
-    _index_cache = pathlib.Path(".cache") / f"overture-index-divisions.json"
+    # The reader is the one from xsql-duckdb-terrain-h3.py (Mapterhorn), ported. That
+    # notebook is parked on looks; its PMTiles v3 client is the good part. Opening costs
+    # two reads (127-byte header, root directory), then one leaf directory per region
+    # touched, parsed once and cached.
+    _pm_store = S3Store(PM_BUCKET, region="us-west-2", skip_signature=True)
 
-    async def _build_index():
-        if _index_cache.exists():
-            return json.loads(_index_cache.read_text())
-        objects = _div_store.list_with_delimiter(DIVISION_PREFIX)["objects"]
-        sem = asyncio.Semaphore(16)
+    async def _pm_range(a, b):
+        """Inclusive byte range [a, b]. obstore's `end` is exclusive."""
+        return bytes(
+            memoryview(
+                await obstore.get_range_async(_pm_store, PM_PATH, start=a, end=b + 1)
+            )
+        )
 
-        async def one(obj):
-            async with sem:
-                f = await GeoParquetFile.open_async(obj["path"], store=_div_store)
-                try:
-                    return obj["path"], list(f.file_bbox())
-                except Exception:
-                    return obj["path"], None  # no covering bbox: always read it
+    def _varint(buf, i):
+        r = s = 0
+        while True:
+            c = buf[i]
+            i += 1
+            r |= (c & 0x7F) << s
+            if not c & 0x80:
+                return r, i
+            s += 7
 
-        idx = list(await asyncio.gather(*[one(o) for o in objects]))
-        _index_cache.parent.mkdir(parents=True, exist_ok=True)
-        _index_cache.write_text(json.dumps(idx))
-        return idx
+    def _parse_dir(buf):
+        """A PMTiles v3 directory: four varint columns, tile ids delta-encoded.
 
-    DIV_INDEX = await _build_index()
+        Entries are (tile_id, offset, length, run_length). run_length 0 marks a pointer
+        to a LEAF directory rather than to a tile. A zero OFFSET means "immediately after
+        the previous entry", so offsets are reconstructed in order, not read.
+        """
+        n, i = _varint(buf, 0)
+        ids, last = [0] * n, 0
+        for k in range(n):
+            v, i = _varint(buf, i)
+            last += v
+            ids[k] = last
+        runs = [0] * n
+        for k in range(n):
+            runs[k], i = _varint(buf, i)
+        lens = [0] * n
+        for k in range(n):
+            lens[k], i = _varint(buf, i)
+        offs = [0] * n
+        for k in range(n):
+            v, i = _varint(buf, i)
+            offs[k] = (offs[k - 1] + lens[k - 1]) if v == 0 and k > 0 else v - 1
+        return list(zip(ids, offs, lens, runs))
 
-    # WHERE THE TIME ACTUALLY GOES, MEASURED, BECAUSE THE OBVIOUS FIXES DO NOT WORK.
-    #
-    # One viewport at zoom 5.6 over Rondonia hit 3 of the 8 files and took 18.4 s read
-    # serially. Two things that look like they would fix that, and do not:
-    #
-    #   - COLUMN PROJECTION. Useless: `geometry` is 99.0% of the compressed bytes of a row
-    #     group (22.38 MB of 22.6 MB). Dropping `sources`, `names.rules` and the rest saves
-    #     nothing, and `read_async` has no projection argument anyway.
-    #   - PRUNING ON `subtype`. The row groups are not clustered by it. Their min/max pairs
-    #     are ('county','region'), ('country','region'), ('locality','region'), so asking for
-    #     'county' keeps nearly every group. This is the same finding as the note that
-    #     subtype is not partitioned, now checked at the statistics level too.
-    #
-    # So the bytes are irreducible for a given box, and the three things that DO help are all
-    # about not paying for them twice:
-    #
-    #   1. READ THE FILES CONCURRENTLY. 18.4 s serial becomes the slowest single file. The
-    #      previous loop awaited them one at a time for no reason.
-    #   2. KEEP THE OPEN FILE HANDLES. `open_async` is a footer read, ~0.8 s each, and it was
-    #      being paid again on every fetch of every file.
-    #   3. KEEP THE RESULT ON DISK. A box read once is read once ever, across kernel restarts.
-    #      This is the part that decides whether the notebook feels fast, because exploring
-    #      revisits the same ground constantly.
-    #
-    # CACHED BY COVERAGE, NOT BY EXACT BOX. The original memo keyed on the rounded request
-    # bbox, so a pan of a few pixels was a cache miss and a fresh 18 s read. A read is grown
-    # past what was asked for and kept, and any later box inside it is a lookup.
-    #
-    # DIV_PAD is on top of the viewport padding, so a cached read covers about 1.75 viewport
-    # widths. Larger was tried and is the wrong trade while a cold read costs seconds: at 2.0
-    # the first look at anywhere reads 6x the viewport's area, and the cost lands exactly when
-    # the user is waiting.
-    _div_mem = {}  # subtype -> [[box, table, key], ...], newest last
+    def _tile_id(z, x, y):
+        """z/x/y -> PMTiles v3 tile id: Hilbert order within a level, levels stacked.
+
+        Hilbert rather than row-major so tiles near each other on the GROUND are near
+        each other in the FILE, which is what makes a viewport a few contiguous ranges.
+        """
+        acc = sum((1 << t) * (1 << t) for t in range(z))
+        n = 1 << z
+        d, s = 0, n >> 1
+        while s > 0:
+            rx = 1 if x & s else 0
+            ry = 1 if y & s else 0
+            d += s * s * ((3 * rx) ^ ry)
+            if ry == 0:
+                if rx == 1:
+                    x, y = s - 1 - x, s - 1 - y
+                x, y = y, x
+            s >>= 1
+        return acc + d
+
+    def _find(entries, tid):
+        """Binary search, falling back to the run that COVERS tid.
+
+        The fallback is not an optimisation: directories are run-length encoded, so a
+        tile usually has no entry of its own and is covered by an earlier one.
+        """
+        lo, hi = 0, len(entries) - 1
+        while lo <= hi:
+            m = (lo + hi) // 2
+            if tid < entries[m][0]:
+                hi = m - 1
+            elif tid > entries[m][0]:
+                lo = m + 1
+            else:
+                return entries[m]
+        if hi >= 0 and (entries[hi][3] == 0 or tid - entries[hi][0] < entries[hi][3]):
+            return entries[hi]
+        return None
+
+    _hdr = await _pm_range(0, 126)
+    assert _hdr[:7] == b"PMTiles" and _hdr[7] == 3, "not a PMTiles v3 archive"
+    _rd_off, _rd_len, _, _, _ld_off, _, _td_off, _ = struct.unpack("<8Q", _hdr[8:72])
+    PM_MAXZ = _hdr[101]
+    assert max(SUB_MINZOOM.values()) <= PM_MAXZ, "SUB_MINZOOM above the pyramid"
+    _root = _parse_dir(gzip.decompress(await _pm_range(_rd_off, _rd_off + _rd_len - 1)))
+    _leaf = {}
+
+    # ------------------------------------------------------------- the MVT decode
+    # Hand-rolled rather than a dependency, deliberately: an MVT is three nested protobuf
+    # messages whose only wire types are varint and length-delimited, and the varint
+    # machinery already exists two functions up. Verified ring-exact and property-exact
+    # against mapbox-vector-tile on ten real tiles (the world tile, Java's coastline,
+    # Italy's enclaves) before being trusted with anything.
+    def _fields(buf):
+        """Iterate (field_number, wire_type, value) over one protobuf message."""
+        i, n = 0, len(buf)
+        while i < n:
+            key, i = _varint(buf, i)
+            f, w = key >> 3, key & 0x7
+            if w == 0:
+                v, i = _varint(buf, i)
+            elif w == 2:
+                ln, i = _varint(buf, i)
+                v = buf[i : i + ln]
+                i += ln
+            elif w == 5:
+                v = buf[i : i + 4]
+                i += 4
+            elif w == 1:
+                v = buf[i : i + 8]
+                i += 8
+            else:
+                raise ValueError(f"wire type {w}")
+            yield f, w, v
+
+    def _value(buf):
+        """An MVT Value message: exactly one of its fields is set."""
+        for f, _w, v in _fields(buf):
+            if f == 1:
+                return v.decode("utf-8")
+            if f == 2:
+                return struct.unpack("<f", v)[0]
+            if f == 3:
+                return struct.unpack("<d", v)[0]
+            if f in (4, 5):
+                return v
+            if f == 6:
+                return (v >> 1) ^ -(v & 1)
+            if f == 7:
+                return bool(v)
+        return None
+
+    def _mvt_rings(geom):
+        """Packed geometry commands -> rings of (x, y) tile coords, closed."""
+        rings, ring = [], None
+        x = y = 0
+        i, n = 0, len(geom)
+        while i < n:
+            cmd, i = _varint(geom, i)
+            op, count = cmd & 0x7, cmd >> 3
+            if op == 1:  # MoveTo: starts a ring
+                for _ in range(count):
+                    dx, i = _varint(geom, i)
+                    dy, i = _varint(geom, i)
+                    x += (dx >> 1) ^ -(dx & 1)
+                    y += (dy >> 1) ^ -(dy & 1)
+                    ring = [(x, y)]
+                    rings.append(ring)
+            elif op == 2:  # LineTo
+                for _ in range(count):
+                    dx, i = _varint(geom, i)
+                    dy, i = _varint(geom, i)
+                    x += (dx >> 1) ^ -(dx & 1)
+                    y += (dy >> 1) ^ -(dy & 1)
+                    ring.append((x, y))
+            elif op == 7:  # ClosePath: repeat the first point
+                ring.append(ring[0])
+            else:
+                raise ValueError(f"geometry op {op}")
+        return rings
+
+    def _area2(ring):
+        """Twice the signed shoelace area: >0 marks an exterior ring.
+
+        The spec says exteriors wind clockwise ON SCREEN, and tile y points down, so a
+        clockwise-on-screen ring is counterclockwise in plain (x, y) axes and the
+        standard shoelace sum comes out positive with no sign flip. Getting the sign
+        backwards classifies every ring as a hole and decodes every feature to nothing.
+        """
+        a = 0
+        for (x0, y0), (x1, y1) in zip(ring, ring[1:]):
+            a += x0 * y1 - x1 * y0
+        return a
+
+    def _division_areas(tile_buf):
+        """The division_area layer: ([(properties, [(exterior, holes), ...]), ...], extent)."""
+        for f, _w, v in _fields(tile_buf):
+            if f != 3:  # Tile.layers
+                continue
+            name, extent = None, 4096
+            keys, values, feats = [], [], []
+            for lf, _lw, lv in _fields(v):
+                if lf == 1:
+                    name = lv.decode("utf-8")
+                elif lf == 2:
+                    feats.append(lv)
+                elif lf == 3:
+                    keys.append(lv.decode("utf-8"))
+                elif lf == 4:
+                    values.append(_value(lv))
+                elif lf == 5:
+                    extent = lv
+            if name != "division_area":
+                continue
+            out = []
+            for fv in feats:
+                tags, gtype, geom = [], 0, b""
+                for ff, _fw, fvv in _fields(fv):
+                    if ff == 2:
+                        i = 0
+                        while i < len(fvv):
+                            t, i = _varint(fvv, i)
+                            tags.append(t)
+                    elif ff == 3:
+                        gtype = fvv
+                    elif ff == 4:
+                        geom = fvv
+                if gtype != 3:  # not a polygon feature
+                    continue
+                props = {
+                    keys[tags[i]]: values[tags[i + 1]] for i in range(0, len(tags), 2)
+                }
+                polys, cur = [], None
+                for ring in _mvt_rings(geom):
+                    if _area2(ring) > 0:
+                        cur = (ring, [])
+                        polys.append(cur)
+                    elif cur is not None:
+                        cur[1].append(ring)
+                out.append((props, polys))
+            return out, extent
+        return [], 4096
+
+    def _feature_wkb(polys, z, x, y, extent):
+        """Tile-integer rings -> a lon/lat MultiPolygon WKB.
+
+        Web Mercator is closed form in both directions, so a tile coordinate knows its
+        own lon/lat exactly: x is linear in longitude and y is the inverse Gudermannian
+        of latitude. The (x, y) row layout of the ring array is already WKB point order,
+        so each ring serialises as a length prefix plus the raw float64 bytes.
+        """
+        n = 1 << z
+        parts = []
+        for ext, holes in polys:
+            rings = []
+            for r in (ext, *holes):
+                a = np.asarray(r, dtype=np.float64)
+                pts = np.empty_like(a)
+                pts[:, 0] = (x + a[:, 0] / extent) / n * 360.0 - 180.0
+                pts[:, 1] = np.degrees(
+                    np.arctan(np.sinh(np.pi * (1.0 - 2.0 * (y + a[:, 1] / extent) / n)))
+                )
+                rings.append(struct.pack("<I", len(a)) + pts.tobytes())
+            parts.append(struct.pack("<BII", 1, 3, len(rings)) + b"".join(rings))
+        return struct.pack("<BII", 1, 6, len(parts)) + b"".join(parts)
+
+    # Decoded per tile and kept, same bargain as the raster tile cache: a pan re-reads
+    # the strip it has not seen and nothing else, and a zoom back to a band already
+    # visited is free. Entries are a few dozen small dicts each, so the cap is a count.
+    _tiles = {}  # (z, x, y) -> [piece, ...]; insertion order is LRU order
+    TILE_KEEP = 2048
+    _sem = asyncio.Semaphore(32)
+
+    async def _tile_pieces(z, x, y):
+        """One tile, walked to through the directories, decoded, filtered to land.
+
+        A piece is one division's presence in one tile: division id, name, country,
+        subtype, and the clipped geometry as WKB. The maritime half of division_area is
+        dropped here (is_land is always present in this tileset: measured True 431 /
+        False 325 over seven tiles, never missing) for the same reason the GeoParquet
+        path dropped it: open water was never at risk of being deforested, and it drags
+        a coastal division's zonal mean toward zero.
+        """
+        k = (z, x, y)
+        if k in _tiles:
+            _tiles[k] = _tiles.pop(k)  # touch: young end of the LRU
+            return _tiles[k]
+        tid, ents = _tile_id(z, x, y), _root
+        blob = None
+        for _ in range(4):  # root + up to three leaf levels
+            e = _find(ents, tid)
+            if e is None:
+                break
+            if e[3] == 0:
+                lk = (e[1], e[2])
+                if lk not in _leaf:
+                    _leaf[lk] = _parse_dir(
+                        gzip.decompress(
+                            await _pm_range(_ld_off + e[1], _ld_off + e[1] + e[2] - 1)
+                        )
+                    )
+                ents = _leaf[lk]
+                continue
+            async with _sem:
+                blob = await _pm_range(_td_off + e[1], _td_off + e[1] + e[2] - 1)
+            break
+        pieces = []
+        if blob is not None:
+            if blob[:2] == b"\x1f\x8b":  # tile_compression says gzip; trust the bytes
+                blob = gzip.decompress(blob)
+            feats, extent = _division_areas(blob)
+            for props, polys in feats:
+                if props.get("is_land") is not True or not polys:
+                    continue
+                pieces.append(
+                    {
+                        "sub": props.get("subtype"),
+                        # division_id, not id: `id` names this AREA row and a division
+                        # can own several, `division_id` names the DIVISION, which is
+                        # the thing being coloured and ranked. Same lesson as the
+                        # division_boundary experiment, where joining on the wrong one
+                        # silently returned zero rows.
+                        "id": props.get("division_id") or props.get("id"),
+                        "name": props.get("@name"),
+                        "country": props.get("country"),
+                        "wkb": _feature_wkb(polys, z, x, y, extent),
+                    }
+                )
+        _tiles[k] = pieces
+        while len(_tiles) > TILE_KEEP:
+            _tiles.pop(next(iter(_tiles)))
+        return pieces
+
+    # ------------------------------------------------------------- which tiles
+    def _tz_for(subtype, box):
+        """Tile zoom for a box: ~4 tiles across, floored at the subtype's minzoom.
+
+        The floor matters at the top of a band (counties do not exist below z8) and the
+        box-derived term everywhere else; both are capped by the pyramid. Finer than
+        needed would be more requests for geometry the polyfill cannot see, coarser
+        would quantize below the cells: at z8 a tile unit is ~38 m against 460 m cells.
+        """
+        span = max(box[2] - box[0], 1e-9)
+        z = int(math.log2(max(4.0 * 360.0 / span, 1.0)))
+        return max(SUB_MINZOOM[subtype], min(PM_MAXZ, z))
+
+    def _mtile(lon, lat, z):
+        """lon/lat -> tile x, y at z, clamped to the grid."""
+        n = 1 << z
+        xx = min(n - 1, max(0, int((lon + 180.0) / 360.0 * n)))
+        la = min(85.05, max(-85.05, lat))
+        yy = (
+            1.0
+            - math.log(math.tan(math.radians(la)) + 1.0 / math.cos(math.radians(la)))
+            / math.pi
+        ) / 2.0
+        return xx, min(n - 1, max(0, int(yy * n)))
+
+    def _range_box(z, x0, y0, x1, y1):
+        """The lon/lat box a tile range actually covers: the coverage the memo checks."""
+        n = 1 << z
+
+        def lat(yy):
+            return math.degrees(math.atan(math.sinh(math.pi * (1.0 - 2.0 * yy / n))))
+
+        return (
+            x0 / n * 360.0 - 180.0,
+            lat(y1 + 1),
+            (x1 + 1) / n * 360.0 - 180.0,
+            lat(y0),
+        )
+
+    # A drawn box has no zoom band protecting it, so a continent-sized box can ask for
+    # county tiles by the thousand (the old path's version of this was a 596-second
+    # polyfill). Refusing over the cap makes rank() fall back to the next coarser
+    # subtype, the same promise it already makes where counties do not exist at all.
+    TILE_CAP = 256
+
+    # CACHED BY COVERAGE, NOT BY EXACT BOX, same as before: the box is grown, snapped to
+    # the tile grid, and any later box inside that coverage is a lookup. The disk ledger
+    # the GeoParquet path carried is gone: it existed because a cold read cost 18 s, and
+    # a cold read is now under a second.
+    _div_mem = {}  # subtype -> [[coverage box, table, key], ...], newest last
     DIV_PAD = 1.4
     DIV_KEEP = 8
-
-    # ON-DISK, AND DELIBERATELY NOT A BUILD STEP. Nothing is precomputed and nothing has to
-    # be refreshed: this only ever holds boxes that were genuinely asked for. Deleting
-    # `.cache/divisions/` costs the next visit to each place and nothing else.
-    _DIV_DIR = pathlib.Path(".cache") / "divisions"
-    _DIV_LEDGER = _DIV_DIR / "index.json"
-
-    def _load_ledger():
-        try:
-            return json.loads(_DIV_LEDGER.read_text())
-        except Exception:
-            return []
-
-    _div_disk = _load_ledger()  # [[subtype, box, filename], ...]
 
     def _grow(b, f=DIV_PAD):
         w, s, e, n = b
@@ -759,124 +1063,85 @@ async def _(
             and outer[3] >= inner[3]
         )
 
-    def _hits(bbox):
-        w, s, e, n = bbox
-        return [
-            p
-            for p, b in DIV_INDEX
-            if b is None or (b[0] < e and b[2] > w and b[1] < n and b[3] > s)
-        ]
-
     def _remember(subtype, box, table, key):
         held = _div_mem.setdefault(subtype, [])
         held.append([box, table, key])
         del held[:-DIV_KEEP]
 
-    _div_files = {}  # path -> open GeoParquetFile; the footer read is ~0.8 s each
+    # THE SEAM DISSOLVE. Tile geometry arrives clipped, so one division is several
+    # pieces, and the pieces' clip edges are straight lines the stroke would draw across
+    # the map. Union-ing the pieces per division removes every interior edge, and the
+    # tile buffer (pieces overlap slightly past each tile edge) is what makes the union
+    # clean rather than a float-tolerance lottery. Clip edges survive only at the OUTER
+    # boundary of the fetched range, which sits a full DIV_PAD beyond the viewport, so a
+    # camera inside the coverage box never has one on screen.
+    DISSOLVE_SQL = """
+        SELECT id,
+               any_value(name)    AS name,
+               any_value(country) AS country,
+               CAST(ST_AsWKB(ST_Union_Agg(ST_GeomFromWKB(wkb))) AS BLOB) AS wkb
+        FROM pieces
+        GROUP BY id
+    """
 
-    async def _open(path):
-        f = _div_files.get(path)
-        if f is None:
-            f = _div_files[path] = await GeoParquetFile.open_async(path, store=_div_store)
-        return f
-
-    async def _one_file(path, subtype, box):
-        """One Overture part, filtered to the subtype we want, geometry as WKB.
-
-        WKB rather than GeoArrow because the parts genuinely disagree about geometry type
-        (Polygon in some files, MultiPolygon in others), which is the same thing that stops
-        GeoParquetDataset opening them at all. A binary column has no opinion, so the parts
-        concatenate.
-        """
-        f = await _open(path)
-        data = await f.read_async(bbox=box)
-        # A file whose bbox overlaps but whose ROW GROUPS all get pruned away is the normal
-        # case here, since the file bboxes are near-global. The result is a table with no
-        # chunks at all, and pa.chunked_array([]) raises "cannot construct ChunkedArray from
-        # empty vector and omitted type" rather than returning something empty.
-        if data.num_rows == 0:
-            return None
-        # to_wkb must run on the GeoArrow column, BEFORE the PyArrow conversion drops the
-        # extension metadata it reads the geometry type from.
-        wkb = pa.chunked_array(
-            [
-                pa.array(c)
-                for c in pa.chunked_array(to_wkb(data.column("geometry"))).chunks
-            ]
-        ).cast(pa.binary())
-        t = pa.RecordBatchReader.from_stream(data).read_all()
-        # is_land drops the maritime half of division_area. Without it a coastal division's
-        # zonal mean is dragged toward zero by open water that was never at risk of being
-        # deforested.
-        keep = pc.and_(
-            pc.equal(t["subtype"], subtype), pc.fill_null(t["is_land"], False)
-        )
-        t = pa.table(
-            {
-                "id": t["id"],
-                "name": pc.struct_field(t["names"], "primary"),
-                "country": t["country"],
-                "wkb": wkb,
-            }
-        ).filter(keep)
-        return t if t.num_rows else None
+    def _dissolve(pieces_tbl):
+        pieces = pieces_tbl  # noqa: F841 - read by DuckDB's replacement scan
+        return con.sql(DISSOLVE_SQL).to_arrow_table()
 
     async def fetch_divisions(subtype, bbox):
         """Overture divisions of one subtype covering bbox, geometry as WKB.
 
-        Returns (table or None, key). The key names the cached read rather than the request,
-        so the polyfill can memoise against it: two viewports served by one cached read share
-        one set of filled cells.
+        Returns (table or None, key). The key names the tile range rather than the
+        request, so the polyfill can memoise against it: two viewports served by one
+        coverage share one set of filled cells.
         """
         for box, tbl, key in _div_mem.get(subtype, []):
             if _inside(box, bbox):
                 return tbl, key
 
-        for sub, box, fname in _div_disk:
-            if sub == subtype and _inside(box, bbox):
-                key = (subtype, tuple(box))
-                try:
-                    tbl = pq.read_table(_DIV_DIR / fname)
-                except Exception:
-                    continue  # a half-written file from an interrupted kernel
-                tbl = tbl if tbl.num_rows else None
-                _remember(subtype, tuple(box), tbl, key)
-                return tbl, key
+        big = _grow(bbox)
+        tz = _tz_for(subtype, big)
+        x0, y0 = _mtile(big[0], big[3], tz)
+        x1, y1 = _mtile(big[2], big[1], tz)
+        key = (subtype, tz, x0, y0, x1, y1)
+        if (x1 - x0 + 1) * (y1 - y0 + 1) > TILE_CAP:
+            # NOT remembered: a smaller box inside this coverage deserves a finer zoom
+            # and a real answer, so a refusal must never be served from the memo.
+            return None, key
 
-        big = tuple(round(v, 4) for v in _grow(bbox))
-        parts = [
-            t
-            for t in await asyncio.gather(
-                *(_one_file(p, subtype, big) for p in _hits(big))
+        parts = await asyncio.gather(
+            *(
+                _tile_pieces(tz, xx, yy)
+                for yy in range(y0, y1 + 1)
+                for xx in range(x0, x1 + 1)
             )
-            if t is not None
-        ]
-        out = pa.concat_tables(parts) if parts else None
-        key = (subtype, big)
+        )
+        rows = [p for tp in parts for p in tp if p["sub"] == subtype]
+        cov = _range_box(tz, x0, y0, x1, y1)
+        if not rows:
+            _remember(subtype, cov, None, key)
+            return None, key
 
-        fname = f"{subtype}-{abs(hash(key)):016x}.parquet"
-        try:
-            _DIV_DIR.mkdir(parents=True, exist_ok=True)
-            pq.write_table(
-                out if out is not None else pa.table({"id": pa.array([], pa.string())}),
-                _DIV_DIR / fname,
-            )
-            _div_disk.append([subtype, list(big), fname])
-            _DIV_LEDGER.write_text(json.dumps(_div_disk))
-        except Exception:
-            pass  # a read-only or full disk costs speed on the next run, not correctness
-
-        _remember(subtype, big, out, key)
+        pieces = pa.table(
+            {
+                "id": pa.array([r["id"] for r in rows]),
+                "name": pa.array([r["name"] for r in rows]),
+                "country": pa.array([r["country"] for r in rows]),
+                "wkb": pa.array([r["wkb"] for r in rows], pa.binary()),
+            }
+        )
+        out = _dissolve(pieces)
+        _remember(subtype, cov, out, key)
         return out, key
 
     # THE POLYFILL, AND THE ONE THING THAT MAKES IT AWKWARD.
     #
     # h3_polygon_wkb_to_cells_experimental takes a POLYGON and raises
     #   Invalid WKB: expected polygon at 5
-    # on a MultiPolygon, which is 148 of 219 countries, 1,193 regions and 3,661 counties. So
-    # each division is split with ST_Dump, every part filled, and the parts flattened back
-    # into one distinct cell set per division. Cheap, but not optional, and the error names
-    # the WKB rather than the geometry type, so it reads like corruption.
+    # on a MultiPolygon, which every dissolved division is. So each division is split
+    # with ST_Dump, every part filled, and the parts flattened back into one distinct
+    # cell set per division. Cheap, but not optional, and the error names the WKB rather
+    # than the geometry type, so it reads like corruption.
     #
     # CONTAINMENT IS 'center', AND THAT IS THE DIFFERENCE BETWEEN A ZONAL MEAN AND A SMEAR.
     # 'overlap' includes every cell that so much as touches the division, so a county a few
@@ -1207,9 +1472,8 @@ def _(
         if HOLD["pending"] is not None:
             return  # the camera has already moved; this view is gone
         if sub is None:
-            # Zoomed too far out for boundaries. See division_for_zoom: a world bbox
-            # prunes no row groups, so this is the one view where streaming Overture would
-            # mean reading most of 5.5 GB to find 219 rows.
+            # Zoomed too far out for boundaries, by design rather than by cost now: see
+            # division_for_zoom for why the top band stays hexagons-only under PMTiles.
             divisions.visible = False
             HOLD["divpair"], HOLD["div"], HOLD["divbox"] = None, None, None
             HOLD["tail"] = " · zoom in for boundaries"
