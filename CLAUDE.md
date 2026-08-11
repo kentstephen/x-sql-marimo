@@ -5,8 +5,8 @@ Guidance for Claude Code working in this repository. Inherits the global rules i
 
 ## Repository layout
 
-**Three notebooks are the repo.** Everything else is in `archive/`, kept for reference and
-not maintained.
+**Three interactive notebooks are the repo**, plus one static one-shot. Everything else
+is in `archive/`, kept for reference and not maintained.
 
 `xsql-firerisk-buildings.py` folds CarbonPlan's 30 m CONUS wildfire-risk **Zarr v3
 pyramid** to H3 and joins the cells onto **Overture building footprints**, so the map says
@@ -92,8 +92,18 @@ the constants cell is the seam a year slider would use). Four things to know:
     under marimo's anywidget bridge; the only trait types proven in these notebooks are
     Unicode (kernel -> browser) and Bool (browser -> kernel), so the ruler uses one of
     those. The on-screen diagnostics for all this (a px readout in the status line, a
-    dim browser-side "ruler" line) are commented out next to `set_status` and in
-    `Status._esm`, ready to re-enable.
+    dim browser-side "ruler" line) live next to `set_status` and in `Status._esm`; they
+    are currently ENABLED, because the fullscreen defect has been seen again since the
+    ruler landed and is not yet closed. Comment them back out once it is.
+
+`xsql-hfp-conus.py` is the one-shot: the HFP fold with everything interactive cut away
+(no camera, no divisions, no widgets, no cache), run once over a fixed `BOX` at res 7
+from L2 and drawn as one static H3HexagonLayer. It exists for screenshots and as the
+smallest runnable statement of the fold. `BOX` is the only knob and it scales hard: the
+default lower-48 box is ~120M pixels, ~2 GB of RAM, 1.85M cells; the commented
+North-America box is ~760M pixels, 15-20 GB of RAM, 4.88M cells (both measured). The
+fold cell is a straightened-out copy of the interactive notebook's read cell, so fixes
+to the sparse-tile check, the Mollweide pair or the fold SQL carry across by hand.
 
 None of the notebooks import anything from `archive/`: their only dependencies are the
 third-party ones in their PEP 723 headers.

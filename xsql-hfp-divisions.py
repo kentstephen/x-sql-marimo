@@ -223,7 +223,7 @@ def _(anywidget, traitlets):
           el.appendChild(line);
           // The diagnostic line, off by default. Everything still measures and syncs;
           // this only decides whether the browser-side reading is SHOWN.
-          // el.appendChild(probe);
+          el.appendChild(probe);
 
           let watched = null;
           const ro = new ResizeObserver(() => kick());
@@ -473,10 +473,11 @@ def _(math):
     # toggled off; the RGB underneath is the same ramp either way.
     LINE_ALPHA = 205
 
-    # Opens on the Europe-Africa-India band, because that is where the index shows its
-    # whole range in one view: the Sahara and the Congo basin near 0, the Nile valley,
-    # Europe and the Ganges plain pushing 30+.
-    HOME = {"longitude": 20.0, "latitude": 18.0, "zoom": 2.4}
+    # Opens on the Europe-Africa-India band, where the index shows its whole range: the
+    # Sahara near 0, the Nile valley, Europe pushing 30+. Zoom 4, not the old 2.4 world
+    # view: the ladder is unchanged (res 5 holds at 4 and everything below), this only
+    # opens closer in.
+    HOME = {"longitude": 20.0, "latitude": 18.0, "zoom": 4.0}
     return (
         COG,
         DIVISION_LABEL,
@@ -1539,7 +1540,10 @@ def _(
         uncomment el.appendChild(probe) in Status._esm (the browser's half, no kernel
         involved). The two disagreeing names the broken leg.
         """
-        status.value = f"{HOLD['head']}{HOLD['tail']} · zoom {vs.zoom:.1f}"
+        status.value = (
+            f"{HOLD['head']}{HOLD['tail']} · zoom {vs.zoom:.1f}"
+            f" · {HOLD['wh'][0]:.0f}x{HOLD['wh'][1]:.0f}px"
+        )
 
     def put_cells(tbl):
         cells._rows_per_chunk = max(1, infer_rows_per_chunk(tbl))

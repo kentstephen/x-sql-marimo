@@ -1,7 +1,8 @@
 # x-sql-marimo
 
-Fold a raster to H3 in SQL, then join it to something that has edges. Two notebooks do
-that with two different pairs, and nothing is read until the camera asks for it.
+Fold a raster to H3 in SQL, then join it to something that has edges. Three notebooks do
+that with three different pairs, and nothing is read until the camera asks for it. A
+fourth is the fold alone, run once over a fixed box for a static map.
 
 ```bash
 # where forest was lost 2002-2022, by administrative division, worldwide
@@ -9,17 +10,24 @@ uv run marimo edit xsql-deforest-divisions.py --sandbox
 
 # which buildings stand on high wildfire-risk ground, CONUS
 uv run marimo edit xsql-firerisk-buildings.py --sandbox
+
+# the human footprint index, by administrative division, worldwide
+uv run marimo edit xsql-hfp-divisions.py --sandbox
+
+# one static fold of the footprint over the lower 48, no camera machinery
+uv run marimo edit xsql-hfp-conus.py --sandbox
 ```
 
-Both stream their raster straight out of object storage with
+All of them stream their raster straight out of object storage with
 [obstore](https://developmentseed.org/obstore/), fold it into [H3](https://h3geo.org/) cells
 in SQL, join those cells to Overture geometry on the cell id, and draw the result with
 [lonboard](https://developmentseed.org/lonboard/). No tile server, no STAC API, no pixels
 leave the bucket until the viewport asks for them.
 
 The first is written up in full below, because it is where the machinery was worked out.
-[The second](#the-second-notebook-which-structures-are-on-dangerous-ground) reuses it and
-only the differences are worth reading.
+[The second](#the-second-notebook-which-structures-are-on-dangerous-ground) and
+[the third](#the-third-notebook-how-hard-people-press-on-the-ground) reuse it and only
+the differences are worth reading.
 
 ## Deforestation by Overture division
 
@@ -254,16 +262,62 @@ changes a single row count.
 `docs/firerisk-buildings-notes.md` has the rest, including why res 11 is the floor and what
 the Icechunk store would buy.
 
+## The third notebook: how hard people press on the ground
+
+```bash
+uv run marimo edit xsql-hfp-divisions.py --sandbox
+```
+
+The deforestation notebook's machinery pointed at Vizzuality's
+[Global 100 m Terrestrial Human Footprint](https://source.coop/vizzuality/hfp-100)
+(HFP-100 v1.2, CC-BY 4.0, same Source Cooperative account). The value is the **human
+footprint index**, 0-50: the summed pressure of built land, cropland, pasture,
+population, night lights, roads, railways and navigable rivers on each hectare. Years
+2017-2021 are published; `YEAR` in the constants cell is the seam a year slider would
+use. The diff against the deforestation notebook is the raster side only:
+
+- **The COG is World Mollweide, not EPSG:4326**, so the "no reprojection" simplification
+  is gone. Both directions are closed-form spherical formulas in the fold cell: forward
+  (viewport box to pixel window) is a Newton solve on the parametric angle, inverse
+  (pixel centres to lat/lng for the fold) is three arcsins. No pyproj.
+- **Zero cells are kept and sit inside the ramp**: 36.7% of land scores exactly 0 and
+  that is untouched ground, the bottom of a continuum, not dropped ocean. Ocean is NaN
+  here, so zero and no-data are distinguishable, which the deforestation COG never
+  offered.
+- **The zoom ladder is one step finer** (res 5-9, with res 9 reading the full-resolution
+  level), and the viewport size is **measured, not assumed**: a widget rulers the deck
+  canvas with a ResizeObserver and syncs it to the kernel, which is what keeps fullscreen
+  from folding a laptop-sized band across a cinema-sized screen.
+
+## The fourth notebook: the fold alone, once
+
+```bash
+uv run marimo edit xsql-hfp-conus.py --sandbox
+```
+
+`xsql-hfp-conus.py` is the HFP fold with everything interactive cut away: no camera, no
+divisions, no widgets, no cache. One bounding box, one read of one overview level, one
+fold to res 7, one static lonboard map. It exists for screenshots and as the smallest
+runnable statement of the fold.
+
+**A caution before widening the box.** `BOX` is the only knob and it scales hard. The
+default lower-48 box is a ~120M pixel window: about 2 GB of RAM through the fold, 1.85M
+cells, under 10 seconds on a fast connection. The commented North-America box next to it
+(Aleutians to Greenland) is ~760M pixels: it works, measured at 4.88M cells in 21.5
+seconds, but it peaks around 15-20 GB of RAM and hands lonboard a table 2.5x larger than
+anything else in this repo draws. Treat that one as a poster run for a big machine, not
+a default, and expect the browser to take its time on first paint.
+
 ## Everything else
 
 `archive/` holds what was built on the way to these and is kept for reference, not maintained:
 the Annual NLCD zoom notebooks and their DataFusion-vs-DuckDB benchmark, the NLCD boundary
 over satellite imagery, the parked NLCD x terrain extrusion, and the NAIP, 3DEP and
-Overture GeoParquet helpers. Neither maintained notebook imports any of it; their only
-dependencies are the third-party ones in their PEP 723 headers.
+Overture GeoParquet helpers. None of the maintained notebooks imports any of it; their
+only dependencies are the third-party ones in their PEP 723 headers.
 
 They still run. `archive/pyproject.toml` is the union of every archived notebook's header,
-pinned, so the root project can stay in sync with the one notebook that is maintained:
+pinned, so the root project can stay in sync with the notebooks that are maintained:
 
 ```bash
 uv run --project archive marimo edit archive/xsql-nlcd-imagery.py
