@@ -368,6 +368,10 @@ def _(math):
     # and the boundary layer reads as a wash over them rather than a lid on them.
     FILL_ALPHA = 165
 
+    # The stroke alpha. Higher than the fill so the boundary still reads when the fill is
+    # toggled off; the RGB underneath is the same ramp either way.
+    LINE_ALPHA = 205
+
     # Opens on the tropics, because that is where the data is: the Amazon, the Congo basin
     # and insular southeast Asia are the three places a 2002-2022 deforestation layer has
     # anything dramatic to say, and all three are in view from here.
@@ -379,6 +383,7 @@ def _(math):
         FILL_ALPHA,
         HOME,
         LEVEL_FOR_RES,
+        LINE_ALPHA,
         MAX_RES,
         PAD,
         PM_BUCKET,
@@ -503,7 +508,17 @@ def _():
 
 
 @app.cell
-def _(ArroArray, ArroTable, FILL_ALPHA, coordinates_to_cells, np, pa, ramp, ramp_rgba):
+def _(
+    ArroArray,
+    ArroTable,
+    FILL_ALPHA,
+    LINE_ALPHA,
+    coordinates_to_cells,
+    np,
+    pa,
+    ramp,
+    ramp_rgba,
+):
     def cells_to_layer(tbl):
         """Folded cells -> the arro3 table the H3HexagonLayer draws.
 
@@ -555,11 +570,31 @@ def _(ArroArray, ArroTable, FILL_ALPHA, coordinates_to_cells, np, pa, ramp, ramp
         )
         rest = [
             ArroArray.from_arrow(tbl["name"].combine_chunks()),
+            ArroArray.from_arrow(tbl["region"].combine_chunks()),
             ArroArray.from_arrow(tbl["country"].combine_chunks()),
             ArroArray.from_arrow(pa.array(np.round(portion * 100, 4))),
             ArroArray.from_arrow(tbl["n_cells"].combine_chunks()),
         ]
-        names = ["geometry", "color", "name", "country", "deforested %", "cells"]
+        names = [
+            "geometry",
+            "color",
+            "line",
+            "name",
+            "region",
+            "country",
+            "deforested %",
+            "cells",
+        ]
+
+        # The stroke takes the same ramp as the fill, but from its OWN column: the fill
+        # toggle works by swapping to a table whose `color` alpha is zero, and a line fed
+        # from that column would vanish with it. One line column, shared by both variants,
+        # at the stroke's own alpha.
+        line = ArroArray.from_arrow(
+            pa.FixedSizeListArray.from_arrays(
+                pa.array(ramp_rgba(portion, LINE_ALPHA).ravel()), 4
+            )
+        )
 
         def build(alpha):
             col = ArroArray.from_arrow(
@@ -567,7 +602,7 @@ def _(ArroArray, ArroTable, FILL_ALPHA, coordinates_to_cells, np, pa, ramp, ramp
                     pa.array(ramp_rgba(portion, alpha).ravel()), 4
                 )
             )
-            return ArroTable.from_arrays([geom, col, *rest], names=names)
+            return ArroTable.from_arrays([geom, col, line, *rest], names=names)
 
         return build(FILL_ALPHA), build(0)
 
@@ -635,12 +670,27 @@ def _(ArroArray, ArroTable, FILL_ALPHA, coordinates_to_cells, np, pa, ramp, ramp
                         pa.array(np.array([0, 0, 0, 0], dtype=np.uint8)), 4
                     )
                 ),
+                ArroArray.from_arrow(
+                    pa.FixedSizeListArray.from_arrays(
+                        pa.array(np.array([0, 0, 0, 0], dtype=np.uint8)), 4
+                    )
+                ),
+                ArroArray.from_arrow(pa.array([""])),
                 ArroArray.from_arrow(pa.array([""])),
                 ArroArray.from_arrow(pa.array([""])),
                 ArroArray.from_arrow(pa.array([0.0])),
                 ArroArray.from_arrow(pa.array([0], type=pa.int64())),
             ],
-            names=["geometry", "color", "name", "country", "deforested %", "cells"],
+            names=[
+                "geometry",
+                "color",
+                "line",
+                "name",
+                "region",
+                "country",
+                "deforested %",
+                "cells",
+            ],
         )
 
     return cells_to_layer, divisions_to_layer, seed_cells, seed_divisions
@@ -983,6 +1033,9 @@ async def _(
                         "id": props.get("division_id") or props.get("id"),
                         "name": props.get("@name"),
                         "country": props.get("country"),
+                        # ISO 3166-2 (e.g. "US-KS") on county and region features;
+                        # absent on countries, which have nothing above them.
+                        "region": props.get("region"),
                         "wkb": _feature_wkb(polys, z, x, y, extent),
                     }
                 )
@@ -1079,6 +1132,7 @@ async def _(
         SELECT id,
                any_value(name)    AS name,
                any_value(country) AS country,
+               any_value(region)  AS region,
                CAST(ST_AsWKB(ST_Union_Agg(ST_GeomFromWKB(wkb))) AS BLOB) AS wkb
         FROM pieces
         GROUP BY id
@@ -1127,6 +1181,11 @@ async def _(
                 "id": pa.array([r["id"] for r in rows]),
                 "name": pa.array([r["name"] for r in rows]),
                 "country": pa.array([r["country"] for r in rows]),
+                # The country prefix is dropped ("US-KS" -> "KS") because country is
+                # already its own column everywhere this is shown.
+                "region": pa.array(
+                    [(r["region"] or "").split("-", 1)[-1] for r in rows]
+                ),
                 "wkb": pa.array([r["wkb"] for r in rows], pa.binary()),
             }
         )
@@ -1273,7 +1332,7 @@ def _(
         get_line_width=1.0,
         line_width_min_pixels=0,
         line_width_max_pixels=1.5,
-        get_line_color=[232, 236, 242, 205],
+        get_line_color=_dseed["line"],
         opacity=1.0,
         pickable=True,
         visible=False,
@@ -1387,7 +1446,11 @@ def _(
         with divisions.hold_sync():
             divisions.table = tbl
             divisions.get_fill_color = tbl["color"]
+            divisions.get_line_color = tbl["line"]
             divisions.visible = controls.show_divisions
+            # Picking ignores alpha: the zero-alpha fill still swallows every hover, so
+            # with the fill off the layer must stop picking or the cells under it go dead.
+            divisions.pickable = bool(controls.division_fill)
         HOLD["divpair"] = pair
 
     def _on_controls(change):
@@ -1579,6 +1642,7 @@ def _(
         sub, res, tbl, n_small = out
         names = tbl["name"].to_pylist()
         country = tbl["country"].to_pylist()
+        region = tbl["region"].to_pylist()
         n_cells = tbl["n_cells"].to_pylist()
         portion = np.asarray(tbl["portion"], dtype="float64")
         order = np.argsort(-portion)[:RANK_N]
@@ -1589,11 +1653,12 @@ def _(
             rgb = ",".join(str(int(c)) for c in ramp(np.array([portion[i]]))[0])
             bar = max(2.0, 100.0 * portion[i] / max(top, 1e-12))
             label = names[i] or "(unnamed)"
+            where = ", ".join(filter(None, [region[i], country[i] or "??"]))
             rows.append(
                 f"<tr>"
                 f"<td style='text-align:right;opacity:.5;padding:.12rem .5rem .12rem 0'>{place}</td>"
                 f"<td style='padding:.12rem .6rem .12rem 0;white-space:nowrap'>{label}"
-                f"<span style='opacity:.45'> · {country[i] or '??'}</span></td>"
+                f"<span style='opacity:.45'> · {where}</span></td>"
                 f"<td style='text-align:right;padding:.12rem .6rem .12rem 0;"
                 f"font-variant-numeric:tabular-nums'>{portion[i] * 100:.3f}%</td>"
                 f"<td style='width:180px;padding:.12rem .6rem .12rem 0'>"
