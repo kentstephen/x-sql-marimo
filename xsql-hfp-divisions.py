@@ -76,11 +76,14 @@ COLOUR. The land distribution is heavily bottom-loaded (p50 1.0, p75 5.5, p99 23
 log1p over 0-40: zero sits at the dark end of cividis as the bottom of a continuum, not a
 dropped case. See the ramp cell.
 
-DRAW A BOX AND THE JOIN BECOMES A NUMBER. The ▢ button at the lower right of the map ranks
-every division inside the box you draw by its mean footprint. It reads one H3
-resolution finer than the screen does, sizes that resolution from the BOX rather than the
-current zoom, and falls back county -> region -> country, because Overture has counties for
-only 171 of 219 countries. This is the one output here that is a figure rather than a colour.
+PRESS THE BUTTON AND THE JOIN BECOMES A NUMBER. "rank what's in view", in the controls
+under the map, ranks every division in the current view by its mean footprint. It reads
+one H3 resolution finer than the screen does, sizes that resolution from the view box
+rather than the current zoom, and falls back county -> region -> country, because
+Overture has counties for only 171 of 219 countries. This is the one output here that is
+a figure rather than a colour. It replaced lonboard's draw-box tool, which asked the
+user to describe a region twice (camera, then rectangle); the toolbar for that tool is
+hidden from the Controls widget, since lonboard 0.16 has no Python-side switch for it.
 
 THE CAMERA ANSWERS FROM MEMORY FIRST. `view_state` fires on every frame of a drag, and any
 frame that can be served from what is already folded (a pan inside the current box, a zoom
@@ -315,7 +318,47 @@ def _(anywidget, traitlets):
           check("show_cells", "hexagons");
           check("show_divisions", "boundaries");
           check("division_fill", "boundary fill");
+
+          // The ranking trigger, HERE rather than lonboard's draw-box tool. A Bool
+          // toggle, not a counter: Bool is a trait type proven to cross marimo's
+          // anywidget bridge browser -> kernel, and the kernel observer fires on any
+          // change, so flipping the value is a click.
+          const btn = document.createElement("button");
+          btn.textContent = "rank what's in view";
+          btn.style.cssText =
+            "font:12px ui-sans-serif,system-ui,sans-serif;cursor:pointer;" +
+            "padding:.15rem .6rem;border-radius:4px;border:1px solid " +
+            "rgba(127,127,127,.45);background:transparent;color:inherit";
+          btn.onclick = () => {
+            model.set("rank_view", !model.get("rank_view"));
+            model.save_changes();
+          };
+          box.appendChild(btn);
           el.appendChild(box);
+
+          // HIDE LONBOARD'S DRAW-BOX TOOL. Its toolbar is rendered unconditionally in
+          // the bundled JS (lonboard 0.16): the Map's `controls` trait governs only
+          // fullscreen/navigation/scale, so there is no Python-side switch. The button
+          // lives in lonboard's shadow root, hence the same recurse-into-shadowRoots
+          // walk the Status ruler uses; an interval rather than a one-shot because the
+          // map mounts after this widget and can be rebuilt by a cell re-run.
+          const hideBbox = (root) => {
+            let hid = false;
+            root.querySelectorAll("button[aria-label]").forEach((b) => {
+              const a = b.getAttribute("aria-label");
+              if (a === "Select BBox" || a === "Cancel drawing" ||
+                  a === "Clear bounding box") {
+                const holder = b.closest("div[style*='absolute']") || b;
+                holder.style.display = "none";
+                hid = true;
+              }
+            });
+            root.querySelectorAll("*").forEach((n) => {
+              if (n.shadowRoot) hid = hideBbox(n.shadowRoot) || hid;
+            });
+            return hid;
+          };
+          setInterval(() => hideBbox(document), 1000);
         }
         export default { render };
         """
@@ -325,6 +368,8 @@ def _(anywidget, traitlets):
         # choropleth is what it produces, so shipping it behind an unticked box meant the
         # result was invisible unless you went looking for it.
         division_fill = traitlets.Bool(True).tag(sync=True)
+        # The ranking trigger. Value is meaningless; a CHANGE is a click.
+        rank_view = traitlets.Bool(False).tag(sync=True)
 
     class Panel(anywidget.AnyWidget):
         """A block of HTML the kernel can rewrite, for the drawn-box ranking.
@@ -423,19 +468,26 @@ def _(math):
     # in places rather than merely sparse.
     DIV_ZOOM = 4.5
 
-    # TODO: a fourth band, `locality`, above roughly zoom 9.5. The tileset carries
-    # localities from z10, so under PMTiles the cost question is already answered; what
-    # remains is the meaning question. A locality boundary is a settlement, so most of a
-    # drawn box would fall outside every polygon and the ranking would describe the towns
-    # rather than the ground. Decide that before adding the band.
+    # The locality band, the old TODO, is IN: fully zoomed in, the finest divisions the
+    # tileset has. The meaning caveat stands and is accepted: a locality boundary is a
+    # settlement, so unincorporated ground between towns has no polygon and the
+    # choropleth is honestly patchy there. The ranking describes the towns in view at
+    # that depth, which at that depth is what a viewer is looking at.
     def division_for_zoom(z):
         if z < DIV_ZOOM:
             return None
         if z < 7.0:
             return "region"
-        return "county"
+        if z < 9.5:
+            return "county"
+        return "locality"
 
-    DIVISION_LABEL = {"country": "countries", "region": "regions", "county": "counties"}
+    DIVISION_LABEL = {
+        "country": "countries",
+        "region": "regions",
+        "county": "counties",
+        "locality": "localities",
+    }
 
     # ------------------------------------------------------------------ boundaries
     # Overture's own PMTiles build of the same release the GeoParquet path used to read.
@@ -448,7 +500,7 @@ def _(math):
     # tiles themselves (probe: Rondonia, Iowa, Congo, z2-z10), not documented anywhere:
     # Planetiler's minzoom rules are baked into the build. Every subtype persists from its
     # floor up to z12, so these are floors for the zoom picker, not bands.
-    SUB_MINZOOM = {"country": 2, "region": 4, "county": 8}
+    SUB_MINZOOM = {"country": 2, "region": 4, "county": 8, "locality": 10}
 
     # ------------------------------------------------------------------ view
     # The map's pixel size BEFORE the browser reports the real one. The Status widget
@@ -580,7 +632,7 @@ def _():
         "wh": (1400.0, 620.0),  # the real canvas size, measured by Status; this is the seed
         "fold": None,  # the SQL fold, set by the read cell
         "zonal": None,  # cells -> division means, set by the read cell
-        "rank": None,  # drawn box -> divisions ranked, set by the read cell
+        "rank": None,  # view box -> divisions ranked, set by the read cell
         "res": None,  # H3 resolution currently on screen
         "box": None,  # padded degree box the current cells cover
         "div": None,  # division subtype currently on screen
@@ -1773,19 +1825,19 @@ def _(
 
     deck.observe(_on_camera, names="view_state")
 
-    # ---------------------------------------------------------------- the drawn box
-    # Draw a box with the ▢ button at the lower right of the map and the divisions inside it
-    # come back ranked, below. This is the one place the join produces a NUMBER rather than a
-    # colour, and it is deliberately not tied to the camera: the box is an explicit ask, so
-    # it reads one level FINER than the screen and it names the divisions outright.
+    # ---------------------------------------------------------------- the ranking
+    # Press "rank what's in view" in the controls and the divisions on screen come back
+    # ranked, below. This is the one place the join produces a NUMBER rather than a
+    # colour. The box is the view itself, but the READ is still an explicit ask: it goes
+    # one level FINER than the screen and it names the divisions outright.
     RANK_N = 25
 
     def rank_html(out):
         if out is None:
             return (
                 "<div style='font:12.5px ui-monospace,SFMono-Regular,Menlo,monospace;"
-                "opacity:.75;padding:.5rem 0'>No division in that box caught a cell centre. "
-                "Draw a larger box, or zoom in first.</div>"
+                "opacity:.75;padding:.5rem 0'>No division in view caught a cell centre. "
+                "Zoom out for larger divisions, or in for finer cells.</div>"
             )
         sub, res, tbl, n_small = out
         names = tbl["name"].to_pylist()
@@ -1817,7 +1869,7 @@ def _(
                 f"</tr>"
             )
         head = (
-            f"<b>{len(names):,} {DIVISION_LABEL[sub]} in the box</b>, ranked by mean "
+            f"<b>{len(names):,} {DIVISION_LABEL[sub]} in view</b>, ranked by mean "
             f"human footprint (0-50), measured at H3 res {res}"
             + (
                 f" · <span style='color:#E69F00'>{n_small} too small to measure</span>"
@@ -1837,14 +1889,24 @@ def _(
             "<table style='border-collapse:collapse'>" + "".join(rows) + "</table></div>"
         )
 
-    def _on_select(change):
-        b = change["new"]
-        if not b:
-            return  # a fresh Map resets selected_bounds to None
-        box = tuple(float(v) for v in b)
+    def _on_rank_view(change):
+        """The ranking, for WHAT IS ON SCREEN. Replaces lonboard's draw-box tool.
+
+        The drawn box asked the user to describe a region twice: once with the camera
+        and again with a rectangle. The button keeps the camera as the only statement
+        of intent: the ranked box is exactly the view, through the same view_to_bbox
+        the fold uses. The Bool's value carries nothing; any change is a click.
+        """
+        vs = HOLD["vs"]
+        if vs is None:
+            # No camera event yet: the map still shows HOME, so rank that.
+            from types import SimpleNamespace
+
+            vs = SimpleNamespace(**HOME)
+        box = view_to_bbox(vs)
         ranking.value = (
             "<div style='font:12.5px ui-monospace,SFMono-Regular,Menlo,monospace;"
-            "opacity:.7;padding:.5rem 0'><b>ranking</b> the divisions in that box…</div>"
+            "opacity:.7;padding:.5rem 0'><b>ranking</b> the divisions in view…</div>"
         )
 
         async def go():
@@ -1860,7 +1922,7 @@ def _(
 
         HOLD["seltask"] = _spawn(go())
 
-    deck.observe(_on_select, names="selected_bounds")
+    controls.observe(_on_rank_view, names="rank_view")
 
     # The legend, built from the same `ramp` the layers use, so a colour on the map and a
     # colour in the key cannot drift apart. The division fill uses the same ramp at a lower
@@ -2205,19 +2267,21 @@ async def _(
         )
 
     async def rank(box):
-        """Every division inside a drawn box, with its mean, for the ranking below the map.
+        """Every division inside the ranked box, with its mean, for the panel below the map.
 
         Returns (subtype, resolution, table, divisions with no number) or None.
 
         THREE THINGS THIS DOES NOT SHARE WITH THE CAMERA, AND WHY.
-        1. It reads ONE RESOLUTION FINER than the screen would. A drawn box is an explicit
+        1. It reads ONE RESOLUTION FINER than the screen would. The button is an explicit
            question about a specific place, so it is worth a read the camera would not
            spend, and the finer the cells the fewer divisions fall through the 'center' rule.
-        2. It derives that resolution from the BOX, not from the current zoom, so a small box
-           drawn on a wide view still gets measured properly.
-        3. It falls back county -> region -> country. Overture has counties for 171 of 219
-           countries, so a box over the other 48 would otherwise come back empty rather than
-           answering at the finest level that exists there.
+        2. It derives that resolution from the BOX, not from the camera's zoom trait, so
+           the two cannot drift.
+        3. It falls back locality -> county -> region -> country, starting wherever the
+           box's own zoom starts the display band. Overture has counties for 171 of 219
+           countries and localities only where settlements are, so a box anywhere else
+           would otherwise come back empty rather than answering at the finest level
+           that exists there.
         """
         span = max(box[2] - box[0], 1e-9)
         z = math.log2(360.0 * HOLD["wh"][0] / (512 * span))
@@ -2225,7 +2289,10 @@ async def _(
         raw, _fetched, _skipped = await fold(res, box)
         if raw is None or raw.num_rows == 0:
             return None
-        for sub in ("county", "region", "country"):
+        ladder = ("locality", "county", "region", "country")
+        if z < 9.5:  # match the display band: no locality answer for a wide box
+            ladder = ladder[1:]
+        for sub in ladder:
             meta, key = await fetch_divisions(sub, box)
             if meta is None or meta.num_rows == 0:
                 continue
@@ -2265,8 +2332,8 @@ def _(controls, deck, legend, mo, ranking, status):
                 "A division's value is the mean over the H3 cells whose CENTRE falls "
                 "inside it, so divisions smaller than one cell at the current resolution "
                 "are drawn unfilled rather than given a number. "
-                "**Draw a box** with the ▢ button at the lower right of the map to rank "
-                "the divisions inside it."
+                "**Press \"rank what's in view\"** in the controls above to rank the "
+                "divisions on screen."
             ),
             ranking,
         ]

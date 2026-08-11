@@ -128,6 +128,39 @@ If both readouts agree with the true size and the bands persist, the size is fin
 and the refold did not fire: suspect the 25 px jitter gate or `HOLD["vs"]` being
 None when `_on_wh` ran. Comment the diagnostics back out when this closes.
 
+## The ranking moved off the draw-box tool, and localities are in
+
+Two changes in one session, both about what the finest view shows.
+
+**The locality band** (the old TODO) is enabled: `division_for_zoom` runs region to
+zoom 7, county to 9.5, locality above that, with `SUB_MINZOOM["locality"] = 10` (the
+tileset's own floor). The meaning caveat from the TODO stands and is accepted: a
+locality polygon is a settlement, so unincorporated ground between towns has no
+polygon and the choropleth is honestly patchy at that depth. The subtype plumbing
+(`fetch_divisions`, `_tz_for`, the decode's `p["sub"] == subtype` filter) was already
+generic, so the band cost a ladder entry and a minzoom.
+
+**The ranking is now a button, "rank what's in view", in the Controls widget**, and
+lonboard's draw-box tool is gone from the map. The drawn box asked the user to
+describe a region twice, once with the camera and again with a rectangle; the button
+keeps the camera as the only statement of intent and ranks `view_to_bbox(HOLD["vs"])`
+through the unchanged `rank()` path. Two mechanics worth recording:
+
+- The trigger crosses the anywidget bridge as a **Bool whose change is the click**
+  (value meaningless), per the proven-trait-types rule: Unicode down, Bool up.
+- **lonboard 0.16 has no Python-side switch for the bbox toolbar.** The Map's
+  `controls` trait governs only fullscreen/navigation/scale; the draw-box button is
+  rendered unconditionally in the bundled JS (confirmed by reading `static/index.js`).
+  The Controls widget hides it by `aria-label` ("Select BBox" / "Cancel drawing" /
+  "Clear bounding box") with the same recurse-into-shadowRoots walk the ruler uses,
+  on a 1 s interval because the map mounts after the widget and a cell re-run
+  rebuilds it.
+
+The ranking ladder became locality -> county -> region -> country, but the locality
+rung only participates when the ranked box's own derived zoom is in the locality
+display band (>= 9.5). A wide box skips it, so a country-sized ask never comes back
+as a list of towns.
+
 ## The one-shot: xsql-hfp-conus.py
 
 The fold with everything interactive cut away: no camera, no divisions, no widgets,

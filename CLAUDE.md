@@ -47,7 +47,7 @@ the parked terrain notebook), the MVT decode too; tile-clipped pieces are dissol
 Global 100 m Terrestrial Human Footprint (HFP-100 v1.2, CC-BY 4.0, same source.coop
 account, `vizzuality/hfp-100/hfp_<year>_100m_v1-2_cog.tif`, years 2017-2021; `YEAR` in
 the constants cell is the seam a year slider would use). Full record in
-`docs/hfp-divisions-notes.md`. Four things to know:
+`docs/hfp-divisions-notes.md`. Five things to know:
 
 - **The COG is World Mollweide (ESRI:54009), not EPSG:4326.** The "no reprojection"
   simplification the deforestation notebook leans on does not hold. Both directions are
@@ -97,6 +97,17 @@ the constants cell is the seam a year slider would use). Full record in
     dim browser-side "ruler" line) live next to `set_status` and in `Status._esm`; they
     are currently ENABLED, because the fullscreen defect has been seen again since the
     ruler landed and is not yet closed. Comment them back out once it is.
+- **The ranking is a button, not lonboard's draw-box tool.** "rank what's in view" in
+  the Controls widget ranks the current view (`view_to_bbox`), so the camera is the only
+  statement of intent. The trigger crosses the bridge as a Bool whose CHANGE is the
+  click, per the proven-trait-types rule above. lonboard 0.16 renders its bbox-select
+  toolbar unconditionally (the Map's `controls` trait governs only
+  fullscreen/navigation/scale), so the Controls widget hides it with the same
+  recurse-into-shadowRoots walk the ruler uses, on a 1 s interval because the map
+  mounts later and can be rebuilt. The division display runs
+  region -> county -> **locality** (locality above zoom 9.5, tile floor z10), and the
+  ranking ladder starts at locality only when the box's own zoom is in that band, so a
+  wide box never gets a towns-only answer.
 
 `xsql-hfp-conus.py` is the one-shot: the HFP fold with everything interactive cut away
 (no camera, no divisions, no widgets, no cache), run once over a fixed `BOX` at res 7
