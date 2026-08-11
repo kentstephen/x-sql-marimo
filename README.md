@@ -1,82 +1,204 @@
 # x-sql-marimo
 
-Fly across the USA and watch 40 years of land cover under you, as H3 hexagons that get
-finer as you zoom in. Nothing is read until the camera asks for it.
+Fly across the planet and watch where forest was lost between 2002 and 2022, as H3
+hexagons that get finer as you zoom, joined onto real administrative boundaries. Nothing
+is read until the camera asks for it.
 
 ```bash
-uv run marimo edit xsql-duckdb-nlcd-h3.py --sandbox
+uv run marimo edit xsql-deforest-divisions.py --sandbox
 ```
 
-Annual NLCD is streamed straight out of object storage with
+One 5.7 GB global COG is streamed straight out of object storage with
 [obstore](https://developmentseed.org/obstore/) and
 [async-geotiff](https://developmentseed.org/async-geotiff/), folded into
-[H3](https://h3geo.org/) cells in SQL, and drawn with
-[lonboard](https://developmentseed.org/lonboard/). No tile server, no STAC API, no pixels
-leave the bucket until the viewport asks for them.
+[H3](https://h3geo.org/) cells in SQL, joined to Overture division polygons on the cell
+id, and drawn with [lonboard](https://developmentseed.org/lonboard/). No tile server, no
+STAC API, no pixels leave the bucket until the viewport asks for them.
+
+## The data
+
+**[vizzuality/lg-land-carbon-data](https://source.coop/vizzuality/lg-land-carbon-data)**
+on Source Cooperative: "Land, carbon and biodiversity data for supply chain impact
+calculation", built by [Vizzuality](https://www.vizzuality.com/) for LandGriffon,
+CC-BY 4.0.
+
+```
+s3://us-west-2.opendata.source.coop/vizzuality/lg-land-carbon-data/deforest_100m_cog.tif
+```
+
+EPSG:4326, whole globe, 200,376 x 400,752 float32, 512 px tiles, 10 average-resampled
+overviews. The value in a pixel is the **portion of that pixel deforested 2002-2022**, 0
+to 1, and that single fact decides most of the design. A portion is intensive, so `mean()`
+is valid at any scale, the averaged overview pyramid is legitimate rather than a lie, and
+there is no majority vote or mode anywhere in the fold.
+
+The same repository holds nine other layers (carbon, cropland expansion, biodiversity
+intactness, forest landscape integrity) at the same shape and CRS, so any of them is a
+one-line swap.
+
+Boundaries are [Overture Maps](https://overturemaps.org/) divisions, read from the pinned
+release's own PMTiles build.
+
+## Why H3 is not just a demo step
+
+The COG is in degrees, so **its pixels are not equal area**: a 100 m pixel at the equator
+covers about twice the ground of one at 60 degrees. Average pixels directly over a country
+spanning many latitudes and you overweight its poleward end. H3 cells are near-equal-area,
+so folding to H3 and then averaging *cells* equally is an area-weighted mean almost for
+free.
+
+Two weightings, each fixing a different bias:
+
+- **within a cell**, weight by valid pixel count, so a coastal cell that is 90% NaN ocean
+  does not count as a whole one.
+- **within a division**, weight cells equally. This is the area correction, and weighting
+  by pixel count here would put back exactly the latitude bias the fold removed.
+
+Getting this wrong is invisible on screen, which is the dangerous part.
+
+## Each engine doing the half it wins
+
+| step | engine | why |
+|---|---|---|
+| stream the COG and the PMTiles | obstore | unsigned, concurrent, ranged |
+| **fold** pixels to H3 cells | DataFusion + h3ronpy | whole-column conversion; DuckDB calls a UDF once per row (70 ms against 462 ms on 1.58M rows) |
+| **polyfill** division polygon to cells | DuckDB `h3` | the only engine with one, and it wraps Uber's C library |
+| **dissolve** tile-clipped pieces | DuckDB `spatial` | `ST_Union_Agg` per division id |
+| **join** cells to divisions | DataFusion | an integer equi-join and a group-by, no geometry involved. The cells are already there |
+| render | lonboard | |
+
+Shipping the cells over to DuckDB because DuckDB happens to hold the polygons would have
+been backwards. The geometry steps go where the geometry is; the join goes where the data
+is.
 
 ## The counter-intuitive part
 
 Each fold reads only the padded viewport, from the overview matching the H3 resolution it
-is about to build. So the **finest views are the cheapest**: the viewport shrinks faster
-than the resolution grows. Band by band, res 5 at 1920 m reads about 4.1M pixels; res 11
-at 30 m reads 72,890.
+is about to build, so the **finest views are the cheapest**: the viewport shrinks faster
+than the resolution grows.
 
-Res 11 is the floor, and it belongs to the data rather than the code: a res 11 hexagon
-holds 2.3 pixels of 30 m NLCD, and res 12 would hold 0.6 and hole out.
+| res | cells globally | edge | reads | px/hex |
+|---|---:|---:|---|---:|
+| 4 | 288,122 | 26.1 km | L6 (6.4 km) | 43 |
+| 5 | 2,016,842 | 9.9 km | L5 (3.2 km) | 25 |
+| 6 | 14,117,882 | 3.7 km | L3 (800 m) | 56 |
+| 7 | 98,825,162 | 1.4 km | L2 (400 m) | 32 |
+| 8 | 691,776,122 | 0.5 km | L1 (200 m) | 18 |
 
-## Two engines, each doing the half it wins
+Res 4 draws the whole planet comfortably: 288 thousand cells, not 288 million. The world
+at res 4 is 15.7M pixels read in 821 ms plus a 282 ms fold, and 8 ms plus 211 ms the
+second time off the tile cache.
 
-The division of labour was benchmarked, not assumed, and it goes both ways. Same
-viewport, 1.58M pixels folded to 132,759 cells:
+## The COG is sparse and async-geotiff does not know it
 
-| | DataFusion + h3ronpy | DuckDB |
+73.6% of full-resolution tiles have offset 0 and length 0, because ocean is simply not
+stored. A read that touches one issues the byte range `0..0` and raises
+
+```
+TypeError: ValueError: Invalid range requested, start: 0 end: 0
+```
+
+which names neither the tile nor the sparseness, so it reads like a corrupt file. Reading
+on the COG's own 512 px tile grid and consulting `tile_byte_counts` first turns that from
+a crash into a **speedup**: an absent tile is NaN with no request at all. This is the piece
+most worth stealing from this notebook, and the piece that looks most like boilerplate.
+
+## Boundaries come from PMTiles, not GeoParquet
+
+Overture's `division_area` GeoParquet has no spatial ordering, so geometry (99.0% of the
+bytes) cannot be pruned: a Rondônia-sized viewport decodes about **190 MB** per file to
+keep 6,337 rows, and no query makes that smaller. That was measured to the floor before it
+was abandoned.
+
+The same release published as PMTiles is the layout problem solved upstream, and it is the
+vector twin of the COG's overview pyramid: one 19.5 GB object, anonymous ranged GETs,
+Hilbert-ordered gzipped MVT, z0-12. The same viewport reads about **0.8 MB**.
+
+| | PMTiles | GeoParquet |
 |---|---:|---:|
-| **fold**: pixels to cells, majority class | **70 ms** | 462 ms |
-| **dissolve**: cells to region outlines | 928 ms | **75 ms** |
+| regions, Rondônia-sized viewport, cold | **0.74 s** | 13.8 s |
+| regions, whole planet | **4.2 s** | not reachable |
+| counties, Iowa view (137 rows) | **0.36 s** | |
+| polyfill at res 6 (50,750 cells) | **0.09 s** | |
 
-The fold stays in DataFusion because h3ronpy converts a whole column at once, where
-DuckDB calls `h3_latlng_to_cell` once per row, 1.58 million times. The dissolve goes to
-DuckDB because its `h3` extension wraps Uber's C library, where the cells-to-polygon work
-lives; h3ronpy wraps [h3o](https://github.com/HydroniumLabs/h3o), a separate Rust
-implementation, so that work never reaches it.
+The PMTiles v3 reader and the MVT decode are hand-rolled on the same varint machinery,
+verified ring-exact and property-exact against `mapbox-vector-tile` on ten tiles including
+the world tile, Java's coastline and Italy's enclaves. Tile geometry arrives clipped, so
+one division comes back as several pieces and they are dissolved per `division_id` before
+anything downstream sees them, or the stroke draws tile seams across the map.
 
 ## What the map answers
 
-- **Colour is the majority class** in each cell. Hover for its *purity*: how much of the
-  cell actually is that class.
-- **It opens on forest.** The `classes` menu under the map switches between broad
-  groupings (forest, developed, agriculture, water and wetland, barren/shrub/grass) and
-  *Everything*. It filters the fold already in hand, so a switch costs one dissolve and
-  no read, and the outlines are dissolved from exactly the cells on screen.
-- **Outlines** are dissolved regions, one polygon per run of touching same-class cells,
-  built in a single SQL statement.
-- **Draw a box** and it is folded across all 40 years of Annual NLCD, 1985 to 2024, at
-  the resolution on screen when you drew it. Two answers side by side: **area** per class
-  per year, which is a cell question, and **patch count**, which is not. A class can hold
-  its share of the box while breaking into more pieces, and only the dissolved polygons
-  see that. Kentucky, 1985 to 2024: Pasture/Hay loses 2.9 points of area while going from
-  90 patches to 121.
+- **Colour is the mean share deforested** across the cells in view, or across a division
+  once boundaries are on.
+- **Draw a box** with the ▢ button and the join becomes a number: every division inside
+  it, ranked by mean share deforested. It reads one H3 resolution finer than the screen,
+  sizes that resolution from the box rather than the current zoom, and falls back county
+  to region to country, because Overture has counties for only 171 of 219 countries.
+- **The camera answers from memory first.** `view_state` fires on every frame of a drag,
+  and any frame servable from what is already folded (a pan inside the current box, a zoom
+  back to a resolution already visited) is answered synchronously in the comm handler. Only
+  a view that genuinely needs bytes goes through the debounce.
 
-Forty years of a drawn box costs about 300 ms of reads, for the same reason as above: the box is small and the overview matches the resolution.
+Subtype floors are baked into the tileset by the build and are honoured here: country z2,
+region z4, county z8. Measured off the tiles, not documented anywhere.
 
-## Pipeline
+## Colour, and why zero gets its own swatch
 
-1. **Camera moves.** A debounced coroutine reads the padded viewport, so a drag reads once at the end rather than at every position it passed through.
-2. **Stream** the overview window with `obstore` + `async-geotiff`, from a 512-tile cache keyed per overview level, so panning re-reads only the new strip.
-3. **Raster to H3 in SQL** with xarray-sql over DataFusion, `h3_latlng_to_cell` wired in as an h3ronpy UDF, taking the modal class per cell.
-4. **Dissolve to outlines** in DuckDB: dissolve per class, `ST_Dump` into connected runs,
-   drop the speckle.
-5. **Render** flat H3 hexagons in NLCD's own palette, swapping traits on live layers so the camera never re-runs a marimo cell.
+Folded at res 4 over the world, **69.6% of cells are exactly zero** and the nonzero values
+span nine orders of magnitude (p1 7.3e-8, p50 2.1e-3, p99.9 0.45). A linear 0 to 1 ramp
+paints a blank world, so the ramp is cividis, log10, over 1e-4 to 0.5.
 
-## Colour
+Zero has to be separated from "almost zero" by **luminance, not hue**, and that was
+measured rather than guessed: a flat neutral grey lands at luminance 0.313 and the 0.1%
+stop of full-range cividis lands at 0.318, so "none" and "0.1%" came out as the same
+colour, which is the worst thing this legend could do given zero is the majority case.
+Hue cannot fix it, because the point of cividis is that hue carries nothing. So the ramp
+floor is lifted to the upper 75% of cividis and zero takes the dark end alone.
 
-The palette is NLCD's own, read out of the COG. The one it replaced was invented here on a teal-to-brown axis with the forests separated by lightness, which put deciduous forest at luminance 0.103 in a region where it is 39.7% of the cells: half the map came out near black. Lightness was the problem, not hue.
+| stop | RGB | luminance | deuteranope luminance |
+|---|---|---:|---:|
+| none | (38,40,44) | 0.156 | 0.150 |
+| 0.01% | (67,78,107) | 0.305 | 0.284 |
+| 1% | (162,153,116) | 0.597 | 0.614 |
+| 10% | (216,196,91) | 0.756 | 0.800 |
+| 50%+ | (253,231,55) | 0.874 | 0.934 |
 
-## Also here
+Monotonic in luminance both normally and under a deuteranope simulation, which is the only
+thing a sequential ramp has to promise.
 
-`xsql-nlcd-zoom.py` is the same notebook with the dissolve left in h3ronpy, kept so the
-benchmark above stays runnable.
-`archive/` holds the earlier notebooks this grew out of (3DEP elevation, NAIP drapes,
-Overture buildings), kept for reference and not maintained.
+## Is it right?
 
-See `CLAUDE.md` for architecture and `docs/` for the working notes.
+Zonal means checked against geography we can reason about:
+
+| place | reading |
+|---|---|
+| Congo basin interior (DRC), res 6 | 0.80% to 19.9%, Kisangani highest: an active frontier |
+| Iowa, USA, res 6 | 0.011% to 0.296%: cleared in the 1800s, so almost nothing 2002-2022 |
+| Rondônia box | Rondônia 27.008%, Mato Grosso 21.571% |
+| Iowa box | Wapello 0.953%, Dallas 0.869%, Keokuk 0.754% |
+| Congo box | Mbandaka 16.701%, Ngabe 8.926%, Bongandanga 7.650% |
+
+A ~30x to ~70x split in the right direction and roughly the right magnitude. If the join
+were smearing neighbours together or dropping the area weighting, that contrast would
+collapse.
+
+## Everything else
+
+`archive/` holds what was built on the way here and is kept for reference, not maintained:
+the Annual NLCD zoom notebooks and their DataFusion-vs-DuckDB benchmark, the NLCD boundary
+over satellite imagery, the parked NLCD x terrain extrusion, and the NAIP, 3DEP and
+Overture GeoParquet helpers. The deforestation notebook imports none of it; its only
+dependencies are the third-party ones in its PEP 723 header.
+
+They still run. `archive/pyproject.toml` is the union of every archived notebook's header,
+pinned, so the root project can stay in sync with the one notebook that is maintained:
+
+```bash
+uv run --project archive marimo edit archive/xsql-nlcd-imagery.py
+# or, self-contained from the notebook's own PEP 723 header
+uv run marimo edit archive/xsql-nlcd-imagery.py --sandbox
+```
+
+`docs/` has the full working record for each of them, including the measurements quoted
+above. `docs/deforest-divisions-notes.md` is the one for this notebook.

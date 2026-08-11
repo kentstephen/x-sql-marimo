@@ -16,48 +16,60 @@
 #     "pyproj>=3.7",
 #     "duckdb>=1.5.5",
 #     "matplotlib==3.11.1",
+#     "pillow>=11",
+#     "morecantile>=7.0.3",
 # ]
 # ///
-"""Annual NLCD land cover in H3, folded in DataFusion, dissolved in DuckDB.
+"""NLCD class boundaries, drawn as lines over satellite imagery. Is the map right?
 
-TWO ENGINES, EACH DOING THE HALF IT WINS. This is the split version of
-`xsql-nlcd-zoom.py`, and the division of labour was benchmarked rather than assumed,
-because it goes both ways. Same viewport, 1.58M pixels to 132,759 cells:
+Same fold and the same dissolve as `xsql-duckdb-nlcd-h3.py`: the DataFusion fold takes
+pixels to H3 cells with a majority class, and DuckDB dissolves runs of touching like cells
+into one polygon each. What changes is what gets DRAWN.
 
-  the FOLD, pixels -> cells -> majority class   DataFusion + h3ronpy  70 ms
-                                                DuckDB               462 ms
-  the DISSOLVE, cells -> region outlines        DuckDB                75 ms
-                                                h3ronpy              928 ms
+THE HEXAGONS ARE OFF AND ONLY THE BOUNDARY IS SHOWN. The other notebooks paint the cells,
+and the map is then a picture of a classification: to believe it you have to trust it.
+Here the cells are hidden by default and only the dissolved boundary is drawn, as thin
+lines over imagery. A line over a photograph does not fight the photograph the way a
+translucent fill does, and it turns the map into something you can CHECK: the line either
+follows a real edge on the ground or it does not. NLCD says forest stops here. Here is the
+ground. No legend is needed to judge that.
 
-The fold stays in DataFusion because h3ronpy converts a whole column at once, where
-DuckDB calls h3_latlng_to_cell once per row, 1.58 million times. The dissolve goes to
-DuckDB because its h3 extension wraps Uber's C library, where the cells-to-polygon work
-lives; h3ronpy wraps h3o, a separate Rust reimplementation, so that work never reaches
-it. The union-find that used to prepare cells for the slow dissolve is gone from that
-path entirely: WASH_SQL dissolves everything and ST_Dump recovers the connected runs.
+The hexagons are still behind the switch, because the boundary IS hexagon-edged and it
+should be obvious why. At res 11 a hexagon is 25 m against 30 m NLCD, so the crenellation
+is not an artifact laid on top of the data, it is the resolution OF the data. A
+pixel-drawn boundary would be a staircase for the same reason.
 
-Nothing is read until the camera asks for it. Each fold pulls only the padded viewport,
-from the overview that matches the H3 resolution it is about to build, registers that
-window with xarray-sql and folds it in SQL. The counter-intuitive part is that the FINEST
-views are the cheapest: the viewport shrinks faster than the resolution grows, so res 11
-at 30 m reads 72,890 pixels where res 5 at 1920 m reads about 4.1M.
+THE IMAGERY IS A PLAIN XYZ TILE LAYER, and that is a retreat from something better. This
+notebook first read Earth Genome's Sentinel-2 mosaics off source.coop, which had a real
+argument behind it: same year as the land cover, so a disagreement between the line and
+the ground could only be classification error. The data side of that worked and is written
+up in `docs/imagery-and-terrain-notes.md`. The render side never became stable, through
+two separate architectures, and a BitmapTileLayer is the one imagery path here that always
+worked, because it is what already draws the place labels: the browser fetches tiles
+itself, nothing crosses the comm channel, and the layer follows the camera without the
+fold knowing it exists.
 
-That is what gets to res 11. Below it the cells would be finer than the imagery: a res 11
-hexagon holds 2.3 pixels of 30 m NLCD, and res 12 would hold 0.6 and hole out. The ceiling
-is the data's, not the code's.
+WHAT THAT COSTS, SAID PLAINLY: Esri World Imagery is a mosaic of many sources and dates
+that vary by location, so the same-vintage rule is gone. A boundary can now disagree with
+the photograph because the ground genuinely changed between the two, and nothing on screen
+distinguishes that from a classification error. Good enough to judge whether a forest edge
+is roughly right. Not evidence about a particular year.
 
-The fold is a mode, not a mean, because land cover is categorical: each cell takes its
-most frequent class, and colour is the class. Flat, not extruded: there is no height in
-a land cover map, and hexagon walls only hide the classes behind them.
+The land cover is read ONE OVERVIEW FINER than the other notebooks from res 7 up (see
+LEVEL_FOR_RES). There the mode is the thing on screen and 12-22 px/hex settles it; here
+the thing on screen is the boundary BETWEEN modes, which is decided by the cells where the
+class vote is closest, and those were the ones thinnest on evidence.
 
-The camera never re-runs a marimo cell. It schedules a coroutine that reads, folds and
-swaps three traits on the one live layer, so panning and zooming stay fluid and the view
-is never reset. Same shape as the Jupyter tutorial in `bias-bounty-map-tutorial`, which is
-where the pattern is proven.
+Both the outlines and the imagery are pickable. Click a region for its class, its ground
+area in acres, and roughly how many cells it holds; that count is derived from area rather
+than counted, because after the dissolve there are no cells left to count. The acreage is
+the polygon's own geodesic area (ST_Area_Spheroid), so it is a measurement of the drawn
+boundary, not a cell count multiplied by a nominal hexagon size.
 
 Data: Kyle Barron's mirror of USGS Annual NLCD on source.coop, public and unsigned.
+Imagery: Esri World Imagery, (c) Esri, Maxar, Earthstar Geographics.
 
-Run:  uv run marimo edit xsql-duckdb-nlcd-h3.py --sandbox
+Run:  uv run marimo edit xsql-nlcd-imagery.py --sandbox
 """
 
 import marimo
@@ -69,9 +81,14 @@ app = marimo.App(width="full")
 @app.cell
 def _():
     import asyncio
+    import base64
+    import io
+    import json
     import math
+    import urllib.request
 
     import duckdb
+    from PIL import Image
 
     import anywidget
     import traitlets
@@ -92,13 +109,20 @@ def _():
     from h3ronpy import grid_disk
     from h3ronpy.vector import coordinates_to_cells
     from geoarrow.rust.core import from_wkb, multipolygon
-    from lonboard import Map, H3HexagonLayer, BitmapTileLayer, PolygonLayer
+    from lonboard import (
+        Map,
+        H3HexagonLayer,
+        BitmapLayer,
+        BitmapTileLayer,
+        PolygonLayer,
+    )
     from lonboard.basemap import CartoBasemap, MaplibreBasemap
     from lonboard._serialization import infer_rows_per_chunk
 
     return (
         ArroArray,
         ArroTable,
+        BitmapLayer,
         BitmapTileLayer,
         CartoBasemap,
         GeoTIFF,
@@ -252,9 +276,65 @@ def _(anywidget, traitlets):
             return w;
           };
 
-          // Integer slider, and it fires on CHANGE not INPUT: each step re-dissolves
-          // the wash, which is ~1 s of work, so it runs when the handle is released.
-          const steps = (key, label, lo, hi) => {
+          // STOPS, NOT A RANGE. min cluster ran 1 to 300 in steps of 1 across a 5rem
+          // track: 300 values over 80 pixels, so nearly four values moved under every
+          // pixel and landing on one was luck. The slider now indexes a list of stops,
+          // which fixes both halves of that. It is coarse where the answer is coarse (the
+          // polygon count collapses 1,200x between 1 and 300, so 240 and 250 are the same
+          // map) and fine at the bottom where each step visibly changes what survives.
+          //
+          // Still fires on CHANGE, not INPUT: each stop re-dissolves the wash, which is
+          // real work, so it runs when the handle is released and the caption tracks the
+          // drag in the meantime.
+          const STOPS = [1, 2, 3, 5, 8, 12, 20, 30, 50, 75, 100, 150, 200, 300];
+          const nearest = (v) => {
+            let best = 0;
+            for (let i = 1; i < STOPS.length; i++) {
+              if (Math.abs(STOPS[i] - v) < Math.abs(STOPS[best] - v)) best = i;
+            }
+            return best;
+          };
+          // Line width, in screen pixels. Its own control because over imagery this is
+          // not a cosmetic preference: too thin and the boundary disappears into a busy
+          // photograph, too thick and the line covers the very edge you are trying to
+          // judge it against. It fires live, since it is one trait on an existing layer.
+          const widthCtl = (key, label) => {
+            const w = document.createElement("span");
+            w.style.cssText = "display:inline-flex;align-items:center;gap:.35rem";
+            const cap = document.createElement("span");
+            cap.style.cssText = "opacity:.7;white-space:nowrap";
+            const draw = () => {
+              cap.textContent = label + " " + Number(model.get(key)).toFixed(1);
+            };
+            const s = document.createElement("input");
+            s.type = "range";
+            // Sub-pixel at the bottom end, because in pixel units the line CAN go below
+            // 1 and a hairline is what reads best over a busy photograph.
+            s.min = "0.5"; s.max = "6"; s.step = "0.5";
+            s.value = model.get(key);
+            // 12 STOPS NEED ROOM. At 4.5rem this was ~6 px of track per half-step, which
+            // is inside the slop of a trackpad drag: you aim for 1.5 and land on 2.5, and
+            // the control feels like it is fighting you. 9rem is ~12 px per stop, which is
+            // wide enough to land on deliberately.
+            s.style.cssText = "width:9rem;margin:0;cursor:pointer";
+            // LIVE. This commits on every input event, and that is right here: the whole
+            // update is three floats on one layer inside a hold_sync, so it is ONE small
+            // comm message and the line rethickens under the cursor. Deferring it to
+            // release (which an earlier version did, to cut traffic that was never the
+            // problem) just made a cheap control feel unresponsive. `min cluster` still
+            // waits for release, because that one re-dissolves the wash.
+            s.addEventListener("input", () => {
+              cap.textContent = label + " " + parseFloat(s.value).toFixed(1);
+              model.set(key, parseFloat(s.value));
+              model.save_changes();
+            });
+            model.on("change:" + key, () => { s.value = model.get(key); draw(); });
+            draw();
+            w.appendChild(cap);
+            w.appendChild(s);
+            return w;
+          };
+          const steps = (key, label) => {
             const w = document.createElement("span");
             w.style.cssText = "display:inline-flex;align-items:center;gap:.4rem";
             const cap = document.createElement("span");
@@ -262,15 +342,22 @@ def _(anywidget, traitlets):
             const draw = () => { cap.textContent = label + " " + model.get(key); };
             const s = document.createElement("input");
             s.type = "range";
-            s.min = String(lo); s.max = String(hi); s.step = "1";
-            s.value = model.get(key);
-            s.style.cssText = "width:5rem;margin:0;cursor:pointer";
-            s.addEventListener("input", () => { cap.textContent = label + " " + s.value; });
+            s.min = "0"; s.max = String(STOPS.length - 1); s.step = "1";
+            s.value = String(nearest(model.get(key)));
+            // Wider than the opacity sliders because this one is aimed rather than
+            // nudged, and every pixel of track is a stop you can actually land on.
+            s.style.cssText = "width:7rem;margin:0;cursor:pointer";
+            s.addEventListener("input", () => {
+              cap.textContent = label + " " + STOPS[parseInt(s.value, 10)];
+            });
             s.addEventListener("change", () => {
-              model.set(key, parseInt(s.value, 10));
+              model.set(key, STOPS[parseInt(s.value, 10)]);
               model.save_changes();
             });
-            model.on("change:" + key, () => { s.value = model.get(key); draw(); });
+            model.on("change:" + key, () => {
+              s.value = String(nearest(model.get(key)));
+              draw();
+            });
             draw();
             w.appendChild(cap);
             w.appendChild(s);
@@ -324,11 +411,12 @@ def _(anywidget, traitlets):
           box.appendChild(check("cells", "show"));
           box.appendChild(slider("cell_opacity", "opacity"));
           box.appendChild(slider("cell_coverage", "coverage"));
-          box.appendChild(group("clusters"));
-          box.appendChild(check("cluster_fill", "fill"));
+          box.appendChild(group("boundary"));
           box.appendChild(check("cluster_line", "outline"));
+          box.appendChild(check("cluster_fill", "fill"));
+          box.appendChild(widthCtl("cluster_width", "width"));
           box.appendChild(slider("cluster_opacity", "opacity"));
-          box.appendChild(steps("min_cluster", "min cluster", 1, 300));
+          box.appendChild(steps("min_cluster", "min cluster"));
           el.appendChild(box);
         }
         export default { render };
@@ -339,7 +427,15 @@ def _(anywidget, traitlets):
         # "all" is in the menu for the picture.
         class_set = traitlets.Unicode("forest").tag(sync=True)
         class_options = traitlets.List([]).tag(sync=True)
-        cells = traitlets.Bool(True).tag(sync=True)
+        # OFF. This is the one default that makes this notebook a different notebook: the
+        # hexagons are what the other two are FOR, and here they cover the photograph the
+        # boundary is meant to be judged against. The switch is still there, and turning it
+        # on is the fastest way to see why the line is hexagon-edged.
+        cells = traitlets.Bool(False).tag(sync=True)
+        # Screen pixels, and a Float so the line can go to a half-pixel hairline. 1.5
+        # rather than 3: over imagery a thick line hides the edge it is claiming, which is
+        # the one thing this map exists to let you look at.
+        cluster_width = traitlets.Float(1).tag(sync=True)
         # OFF by default now that the outline is dissolved on parent hexagons. The
         # polygon is coarser than the cells and bulges past them, so filling it paints a
         # class over cells that are not that class. As an outline it reads as "a region is
@@ -358,7 +454,7 @@ def _(anywidget, traitlets):
         # Counted in whatever `outline coarsen` is set to: cells at 0, parent hexagons
         # above that, where one parent holds ~7 children. So dropping coarsen from 1 to 0
         # means this wants to go up by roughly 7x to keep the same amount of speckle out.
-        min_cluster = traitlets.Int(20).tag(sync=True)
+        min_cluster = traitlets.Int(1).tag(sync=True)
 
     return (Controls,)
 
@@ -387,7 +483,22 @@ def _(math):
     # res 11 against 30 m imagery is 2.3 pixels per hexagon, and that is the floor: res 12
     # would be 0.6 and the map would hole out. This is where the data stops, not where the
     # code does.
-    LEVEL_FOR_RES = {5: 6, 6: 5, 7: 4, 8: 3, 9: 2, 10: 1, 11: 0}
+    # ONE LEVEL FINER FROM RES 7 UP, and that is a change this notebook earns where the
+    # other two do not. There the mode is the thing on screen and 12-22 px/hex already
+    # settles it; here the thing on screen is the BOUNDARY between modes, and a boundary is
+    # decided by the cells along it, where the vote is closest. More pixels under those
+    # cells is a straighter, better-placed line, which is the entire subject of the map.
+    #
+    # px/hex, four times the old count wherever the level dropped:
+    #   res 5  L6   69      res  8  L2   50      res 11  L0  2.3
+    #   res 6  L5   39      res  9  L1   28
+    #   res 7  L3   88      res 10  L0   16
+    # res 11 does not move: L0 is 30 m native and there is nothing finer to read.
+    #
+    # The cost is 4x the pixels per fold over that range, which the notebook's own
+    # inversion pays for: these are the ZOOMED-IN bands, where the viewport is small.
+    # It also lines up with the imagery, which only exists from zoom 8 (res 8) anyway.
+    LEVEL_FOR_RES = {5: 6, 6: 5, 7: 3, 8: 2, 9: 1, 10: 0, 11: 0}
     MAX_RES = 11
 
     # The map's pixel size, assumed. It only sets how much of the world the viewport box
@@ -415,9 +526,49 @@ def _(math):
     #   min run  2000 ->       8 polygons   1.8 MB   0.7 s
     # The polygon count collapses 1,200x while the cells covered only halve, because nearly
     # all of those runs are a handful of cells. 500 leaves the genuinely large regions.
-    MIN_CLUSTER = 50
+    MIN_CLUSTER = 1
     CLUSTER_OPACITY = 1.0
-    CLUSTER_WIDTH = 4  # stroke width in screen pixels
+    CLUSTER_WIDTH = 1  # stroke width in screen pixels, and now a slider (see Controls)
+
+    # ---------------------------------------------------------------- imagery basemap
+    # ESRI WORLD IMAGERY, AS A PLAIN XYZ TILE LAYER. This replaces a Sentinel-2 COG
+    # pipeline (STAC search, windowed reads, WebP encode, data URI) that was correct on
+    # the data side and never stable on the render side. A BitmapTileLayer is already
+    # proven in this notebook, because it is what draws the place labels: the browser
+    # fetches tiles itself, nothing crosses the comm channel, and the layer follows the
+    # camera without the fold knowing it exists.
+    #
+    # {z}/{y}/{x}, NOT {z}/{x}/{y}. Esri puts the ROW before the column, which is the
+    # opposite of the Carto labels URL two layers up. Swapping them silently serves
+    # imagery from the wrong place rather than 404ing, so it looks like a projection bug.
+    #
+    # THE TRADE, AND IT IS REAL: this is a mosaic of many sources and dates that vary by
+    # location, so the "same vintage as NLCD" rule the Sentinel-2 version enforced is gone.
+    # A boundary can now disagree with the photograph because the ground genuinely changed
+    # between the two, and nothing on screen distinguishes that from a classification
+    # error. It is still good enough to judge whether a forest edge is roughly right, which
+    # is what this map is for; it is not evidence about a particular year.
+    ESRI_IMAGERY = (
+        "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery"
+        "/MapServer/tile/{z}/{y}/{x}"
+    )
+    IMAGERY_NOTE = (
+        "Imagery &copy; Esri, Maxar, Earthstar Geographics &middot; dates vary by "
+        "location, so this is not a same-year comparison"
+    )
+
+    # WHERE IT OPENS: the whole country, same as the other two notebooks.
+    #
+    # The Sentinel-2 version of this notebook could NOT open here. Its imagery pyramid
+    # stopped at about zoom 8, so the opening frame was blank imagery under a boundary too
+    # coarse to check, and it had to start at the Front Range instead. An XYZ basemap has
+    # every zoom, so that constraint is gone: res 5 draws the country, and zooming in
+    # tightens the boundary and sharpens the photograph together.
+    #
+    # If you want the sharpest test of whether the line tracks the ground, fly to the
+    # Front Range near (-105.34, 39.78) at zoom 11: forest stops dead where the plains
+    # begin, so a disagreement shows up as a disagreement rather than a gradient.
+    HOME = {"longitude": -98.5, "latitude": 39.5, "zoom": 3.8}
     # 1.0 is the class colour exactly. Lower values darken the edge; below about 0.6 every
     # class collapses toward black and the outlines stop telling each other apart.
     CLUSTER_DARKEN = 1.0
@@ -512,6 +663,16 @@ def _(math):
     # is a fresh read of the whole country, and there is no point putting that behind a
     # control while the thing it feeds is still the open question.
     YEAR = 2024
+    # SAME VINTAGE, DERIVED NOT REPEATED. The whole question this notebook asks is whether
+    # a boundary matches the ground, and that question is void if the line is from one year
+    # and the photograph from another: real change between the two reads as classification
+    # error, and there is no way to tell them apart by looking. Two constants would drift
+    # the first time either moved, so there is only one.
+    #
+    # The overlap is 2022-2024: Annual NLCD runs 1985-2024, Earth Genome's yearly mosaics
+    # start in 2022. Outside it there is no honest pairing to make.
+    S2_YEAR = YEAR
+    assert 2022 <= S2_YEAR <= 2024, f"no paired NLCD + S2 mosaic for {S2_YEAR}"
     # The whole Annual NLCD series on the mirror. Measured for a drawn box at the zoom's own
     # resolution: 0.45-1.5 s to read all 40 years, ~40 ms to compose them, ~30 ms/year to
     # fold to H3 and 4-10 ms to dissolve a class. The series is cheap because the BOX is
@@ -525,6 +686,7 @@ def _(math):
         CLUSTER_OPACITY,
         CLUSTER_WIDTH,
         GROUPS,
+        HOME,
         LEVEL_FOR_RES,
         NODATA,
         PAD,
@@ -632,6 +794,14 @@ def _(
     # MultiPolygon per class, and its parts are exactly the connected runs, so dumping them
     # recovers the same grouping the union-find used to compute.
     #
+    # ACREAGE IS THE ONE REAL-WORLD NUMBER ON THE MAP, and it does NOT come from the
+    # ST_Area above: that one is square degrees, which is only ever compared against
+    # another square-degree number in the same view. Ground area is ST_Area_Spheroid,
+    # and it takes coordinates as (latitude, longitude), the opposite of everything else
+    # here, so the geometry is flipped on the way in. Without the flip a CONUS longitude
+    # is read as a latitude of -105, which is off the globe, and the function returns NaN
+    # rather than an error: a silently empty column, not a crash. 4046.8564224 m2 = 1 acre.
+    #
     # The size test is in AREA, not cells, because after the dissolve there are no cells
     # left to count. cell_area is calibrated per class from the data in hand (total area
     # over total cells), so it needs no hexagon-area constant and no latitude correction:
@@ -652,7 +822,10 @@ def _(
                      / max(n_cells) OVER (PARTITION BY cls) AS cell_area
             FROM parts
         )
-        SELECT cls, ST_AsWKB(geom) AS wkb
+        SELECT cls, ST_AsWKB(geom) AS wkb,
+               CAST(area / cell_area AS BIGINT) AS n_cells,
+               ROUND(ST_Area_Spheroid(ST_FlipCoordinates(geom)) / 4046.8564224, 1)
+                 AS acres
         FROM sized
         WHERE area >= ? * cell_area
         ORDER BY cls
@@ -679,6 +852,11 @@ def _(
             return None
 
         cls = np.asarray(out["cls"])
+        # DERIVED, NOT COUNTED. After the dissolve there are no cells left to count, so
+        # the size of a region is its area over the per-class cell area calibrated in
+        # WASH_SQL. Checked against the union-find on the same field: largest run 70,610
+        # by area against 70,581 by counting.
+        n_cells = np.asarray(out["n_cells"])
         # Straight from the Arrow column. to_pylist() here would materialise every polygon
         # as a Python bytes object on the way past, which is the one place this path could
         # have thrown away what DuckDB just won.
@@ -692,8 +870,11 @@ def _(
                 ArroArray.from_arrow(
                     pa.FixedSizeListArray.from_arrays(pa.array(rgb.ravel()), 3)
                 ),
+                ArroArray.from_arrow(pa.array([_names[c] for c in cls])),
+                ArroArray.from_arrow(pa.array(n_cells, pa.int64())),
+                ArroArray.from_arrow(out["acres"].combine_chunks()),
             ],
-            names=["geometry", "color"],
+            names=["geometry", "color", "class", "cells", "acres"],
         )
 
     def cluster_runs(hx, cs):
@@ -804,6 +985,7 @@ def _(
     Controls,
     H3HexagonLayer,
     HOLD,
+    HOME,
     Map,
     MaplibreBasemap,
     PAD,
@@ -864,12 +1046,40 @@ def _(
         table=_cseed,
         get_fill_color=_cseed["color"],
         get_line_color=_cseed["color"],
+        # Always filled; the fill is switched by get_fill_color's alpha.
         filled=True,
         stroked=True,
-        line_width_min_pixels=CLUSTER_WIDTH,
+        # PIXELS, EXPLICITLY. deck's default line_width_units is METRES with
+        # get_line_width defaulting to 1, so the width you actually see was
+        # max(1 metre in pixels, line_width_min_pixels): two numbers in different units
+        # fighting over one line, where only the floor ever moved and nothing could take
+        # the line BELOW it. Over imagery that matters, because a boundary you cannot
+        # thin is a boundary covering the edge it is supposed to be judged against.
+        # In pixel units get_line_width is the width, full stop, and it can go sub-pixel.
+        line_width_units="pixels",
+        get_line_width=CLUSTER_WIDTH,
+        line_width_min_pixels=0,
+        line_width_max_pixels=CLUSTER_WIDTH,
         opacity=CLUSTER_OPACITY,
-        pickable=False,
+        # PICKABLE. It was False so a hover could never be intercepted on its way to a
+        # cell underneath, which mattered when the cells were the map. Here they are off
+        # by default and the boundary IS the map, so the region is the thing you want to
+        # interrogate: click one for its class and roughly how many cells it holds.
+        pickable=True,
         visible=False,
+    )
+
+    # THE IMAGERY. A plain XYZ tile layer, which is the same thing that draws the place
+    # labels below and the only imagery approach in this notebook that ever worked: the
+    # browser fetches tiles itself, nothing crosses the comm channel, and it follows the
+    # camera without the fold knowing it exists.
+    imagery = BitmapTileLayer(
+        data=ESRI_IMAGERY,
+        tile_size=256,
+        max_zoom=19,
+        min_zoom=0,
+        opacity=1.0,
+        pickable=False,
     )
 
     labels = BitmapTileLayer(
@@ -880,14 +1090,18 @@ def _(
         opacity=0.9,
         pickable=False,
     )
+    # ORDER IS THE WHOLE DESIGN. Imagery on the bottom as the reference, the hexagons
+    # above it (off by default), the dissolved boundary above those as the claim being
+    # made, and place labels last so they stay readable over a photograph.
     deck = Map(
         [
-        h3_layer, 
-        clusters, 
+        imagery,
+        h3_layer,
+        clusters,
         labels
         ],
-        basemap=MaplibreBasemap(style=CartoBasemap.PositronNoLabels),
-        view_state={"longitude": -98.5, "latitude": 39.5, "zoom": 3.8},
+        basemap=MaplibreBasemap(style=CartoBasemap.Positron),
+        view_state=HOME,
         height=VIEW_H,
         # Hover to inspect. show_tooltip defaults to False, which leaves show_side_panel
         # (click) as the only way into a cell's class and purity.
@@ -901,6 +1115,32 @@ def _(
     # own schedule (outlines are hidden the moment the cells they describe go away) and has
     # to ask WANT before turning them back on, or a fold would undo the switch.
     controls = Controls(class_options=CLASS_OPTIONS)
+
+    # A NEW MAP INHERITS NOTHING ABOUT THE OLD ONE'S SCREEN. HOLD lives in a cell that
+    # cannot re-run, which is what lets the camera survive; the cost is that a re-run of
+    # THIS cell builds fresh layers and a fresh WANT while HOLD still describes the map
+    # that just went away. Every field below is about that dead screen:
+    #
+    #   busy/pending  a fold from the previous run, still in flight against layers nobody
+    #                 can see. Left set, `refresh` parks the forced opening draw in
+    #                 `pending` and returns, so no fold ever runs on the new map, nothing
+    #                 calls put_clusters, WANT["built"] stays False, and the cluster
+    #                 checkboxes are dead: they set a trait on a layer whose `visible` is
+    #                 gated on a wash that is never going to be built. THIS is "the fill
+    #                 stops working after a re-run".
+    #   res/box       "the screen is already correct for this view", which the forced
+    #                 opening draw ignores but every later camera event does not.
+    #   cache [1][2]  cells and wash tables built for the OLD layers.
+    #
+    # The raw folds stay: they are the expensive half, they describe the data rather than
+    # the screen, and derive() rebuilds cells and wash from them in milliseconds.
+    if HOLD["task"] is not None:
+        HOLD["task"].cancel()
+    HOLD["task"] = None
+    HOLD["busy"], HOLD["pending"] = False, None
+    HOLD["res"], HOLD["box"] = None, None
+    for _e in HOLD["cache"].values():
+        _e[1], _e[2] = None, None
 
     def class_entry():
         """The menu's current entry, falling back to the DEFAULT and never to None.
@@ -951,6 +1191,39 @@ def _(
     # dissolved from the cells that are on screen right now. Visible needs both.
     WANT = {"clusters": True, "built": False}
 
+    def set_line_width(px):
+        """Width in screen pixels, set on all three traits that can govern it.
+
+        get_line_width alone is not enough: max_pixels stays wherever it was and silently
+        caps the value you just asked for, so widening past the old cap does nothing and
+        looks like the slider is broken above some arbitrary number.
+        """
+        with clusters.hold_sync():
+            clusters.get_line_width = float(px)
+            clusters.line_width_min_pixels = 0.0
+            clusters.line_width_max_pixels = float(px)
+
+    def fill_color():
+        """The fill accessor for the current switch: class colours, or transparent."""
+        ent = HOLD["cache"].get(HOLD["res"])
+        ctbl = ent[2] if ent else None
+        if controls.cluster_fill and ctbl is not None:
+            return ctbl["color"]
+        return [0, 0, 0, 0]
+
+    def redraw_clusters():
+        """Re-push the wash so deck rebuilds the layer's sublayers.
+
+        `filled` decides whether the polygon layer has a FILL SUBLAYER at all, and
+        flipping the flag on its own is not reliably enough to make deck create one that
+        did not exist at init. Re-assigning the table forces the update. This is the
+        "fill button does nothing" fix, and it is cheap: the wash is already in hand, so
+        nothing is read, refolded or re-dissolved.
+        """
+        ent = HOLD["cache"].get(HOLD["res"])
+        if ent and ent[2] is not None:
+            put_clusters(ent[2])
+
     def apply_controls():
         """Push every control onto the layers, once, at build time.
 
@@ -964,9 +1237,12 @@ def _(
         h3_layer.visible = controls.cells
         h3_layer.opacity = controls.cell_opacity
         h3_layer.coverage = controls.cell_coverage
-        clusters.filled = controls.cluster_fill
+        # filled stays TRUE for the life of the layer; see put_clusters. Only `stroked`
+        # is a real toggle, because a line sublayer does rebuild reliably.
+        clusters.filled = True
         clusters.stroked = controls.cluster_line
         clusters.opacity = controls.cluster_opacity
+        set_line_width(controls.cluster_width)
         WANT["clusters"] = controls.cluster_fill or controls.cluster_line
 
     apply_controls()
@@ -981,6 +1257,8 @@ def _(
             h3_layer.coverage = val
         elif name == "cluster_opacity":
             clusters.opacity = val
+        elif name == "cluster_width":
+            set_line_width(val)
         elif name == "min_cluster":
             rewash()
         elif name == "class_set":
@@ -989,7 +1267,17 @@ def _(
             # Fill and outline are the two halves of the cluster layer. With both off there
             # is nothing left to draw, so the layer itself comes off and stays off until one
             # of them is asked for again.
-            setattr(clusters, "filled" if name == "cluster_fill" else "stroked", val)
+            if name == "cluster_line":
+                clusters.stroked = val
+            else:
+                # FILL IS AN ALPHA, NOT A FLAG. `filled` decides whether deck builds a
+                # fill SUBLAYER at all, and flipping it after init does not reliably make
+                # one appear: that is the whole "the fill button does nothing" bug, and
+                # re-pushing the table did not fix it either. The layer is now always
+                # filled, and the fill is switched by swapping get_fill_color between the
+                # class colours and a fully transparent constant. That is a plain
+                # accessor assignment, which always propagates.
+                clusters.get_fill_color = fill_color()
             WANT["clusters"] = controls.cluster_fill or controls.cluster_line
             # ASKING FOR THEM IS ALSO ASKING FOR THEM TO EXIST. This is why "fill does
             # nothing": every path that skips the dissolve leaves WANT["built"] False, and
@@ -1008,6 +1296,7 @@ def _(
             "cells",
             "cluster_fill",
             "cluster_line",
+            "cluster_width",
             "cell_opacity",
             "cell_coverage",
             "cluster_opacity",
@@ -1281,7 +1570,10 @@ def _(
         with clusters.hold_sync():
             clusters.table = ctbl
             clusters.get_line_color = ctbl["color"]
-            clusters.get_fill_color = ctbl["color"]
+            # Transparent rather than absent when the fill is off. See _on_controls.
+            clusters.get_fill_color = (
+                ctbl["color"] if controls.cluster_fill else [0, 0, 0, 0]
+            )
             clusters.visible = WANT["clusters"]
         WANT["built"] = True
 
@@ -1346,9 +1638,9 @@ def _(
         if dz > 0.75 or dx > 0.75 or dy > 0.75:
             HOLD["jumps"] += 1
             opening = (
-                abs(new.longitude + 98.5) < 0.01
-                and abs(new.latitude - 39.5) < 0.01
-                and abs(new.zoom - 3.8) < 0.01
+                abs(new.longitude - HOME["longitude"]) < 0.01
+                and abs(new.latitude - HOME["latitude"]) < 0.01
+                and abs(new.zoom - HOME["zoom"]) < 0.01
             )
             status.value = (
                 f"<b style='color:#E69F00'>camera jumped ({HOLD['jumps']}):</b> "
@@ -1783,7 +2075,8 @@ def _(GROUPS, controls, deck, mo, status):
             mo.md(
                 "<div style='font-size:.8rem;opacity:.75'>Fullscreen: use marimo's "
                 "button, not the button in lonboard, to use the "
-                "legend and layer controls.</div>"
+                "legend and layer controls. &middot; "
+                # f"{IMAGERY_NOTE}</div>"
             ),
             status,
             deck,
@@ -1795,10 +2088,11 @@ def _(GROUPS, controls, deck, mo, status):
                 # two lines: one about colour, one about the box. `<br>` rather than a
                 # blank line, which would start a second paragraph and add its margin to
                 # a height that has none to give.
-                + "</div>\n\nColour is the majority class in the cell; hover for its "
-                "**purity**. The **classes** menu picks which are drawn; it opens on "
-                "forest.<br>"
-                "**Draw a box** (box button, bottom right) for 40 years of "
+                + "</div>\n\nLines are the **dissolved NLCD boundary** for the selected "
+                "classes, over the **Sentinel-2 mosaic of the same year**. The question is "
+                "whether the line follows a real edge on the ground.<br>"
+                "Turn **hexagons** on to see why the boundary is hexagon-edged: at res 11 "
+                "a cell is 25 m against 30 m NLCD. **Draw a box** for 40 years of "
                 "analytics below."
             ),
             controls,
