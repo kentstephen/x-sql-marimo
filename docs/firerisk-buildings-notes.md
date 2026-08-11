@@ -191,6 +191,34 @@ p50 of 0.057 for the surrounding L1 window: structures in town sit on lower-mode
 ground than the forest around them, which is what a burn-probability model does with dense
 development and is worth knowing before quoting a number.
 
+## Open: reported glitchy in the browser, symptom not captured
+
+The headless test passes and the first interactive run drew correctly, but Stephen reported
+the map "kinda glitchy" and the session ended before the symptom was described. **Ask before
+guessing.** Reading the controller afterwards found three real defects, any of which could
+be it. None is exercised by `tools/itest_firerisk.py`, which drives `refresh` directly and
+never goes through the comm handler.
+
+1. **The scenario dropdown is dead until the map is moved.** The opening draw calls
+   `refresh(_VS(), force=True)` with a throwaway view object and never assigns `HOLD["vs"]`,
+   which is only set in `_on_camera`. `_on_controls` guards on `HOLD["vs"] is not None`, so
+   on a fresh load switching 2011 -> 2047 clears the cache and then does nothing, leaving
+   the dropdown disagreeing with the map.
+
+2. **Ground with no buildings re-folds the raster on every camera event.** `hide_buildings`
+   sets `HOLD["bld"] = False`, and `_instant`'s `bld_ok` needs `HOLD["bld"]` true whenever
+   `want_bld` is true. Above `BLD_ZOOM` in a place Overture has no footprints, that can
+   never be satisfied, so `_instant` always returns False and every frame of a pan runs a
+   full `_draw`. Needs a third state distinguishing "not fetched" from "fetched, none here".
+
+3. **Outrunning the buildings box re-reads the raster unnecessarily.** `_instant` is
+   all-or-nothing, so losing buildings coverage forces a full re-fold even when the cell
+   cache still covers the view. The cells are the expensive half; the two steps should be
+   able to invalidate independently.
+
+Ruled out: `TILE_CAP`. Tile counts across latitudes are 45 at z13.0, 18 at z13.6 and 15 at
+z14 against a cap of 64, so it never bites at a reachable zoom.
+
 ## Not built
 
 - **The drawn box.** Deferred deliberately. The interesting version is a count of structures
