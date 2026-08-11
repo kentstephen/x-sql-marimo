@@ -5,7 +5,7 @@ Guidance for Claude Code working in this repository. Inherits the global rules i
 
 ## Repository layout
 
-**Two notebooks are the repo.** Everything else is in `archive/`, kept for reference and
+**Three notebooks are the repo.** Everything else is in `archive/`, kept for reference and
 not maintained.
 
 `xsql-firerisk-buildings.py` folds CarbonPlan's 30 m CONUS wildfire-risk **Zarr v3
@@ -43,13 +43,67 @@ the parked terrain notebook), the MVT decode too; tile-clipped pieces are dissol
 `division_id` in DuckDB before drawing or the stroke shows tile seams. Full record in
 `docs/deforest-divisions-notes.md`.
 
-Neither notebook imports anything from `archive/`: their only dependencies are the
+`xsql-hfp-divisions.py` is the deforestation notebook's machinery pointed at Vizzuality's
+Global 100 m Terrestrial Human Footprint (HFP-100 v1.2, CC-BY 4.0, same source.coop
+account, `vizzuality/hfp-100/hfp_<year>_100m_v1-2_cog.tif`, years 2017-2021; `YEAR` in
+the constants cell is the seam a year slider would use). Four things to know:
+
+- **The COG is World Mollweide (ESRI:54009), not EPSG:4326.** The "no reprojection"
+  simplification the deforestation notebook leans on does not hold. Both directions are
+  closed-form spherical formulas on R=6378137 in the fold cell: forward (viewport box ->
+  pixel window) needs a Newton solve on the parametric angle, inverse (pixel centres ->
+  lat/lng for the H3 fold) is three arcsins. No pyproj. Pixels outside the Mollweide
+  ellipse invert to |lon| > 180 and are masked before the fold sees them.
+- **Values are the index x1000 in uint16, nodata 65535.** The tile reader must use
+  `np.ma.filled`, not `np.asarray`, on the masked read: asarray silently drops the mask
+  and a nodata coast would average in at score 65.5.
+- **Zero cells are KEPT and sit inside the ramp**, not on a separate swatch: 36.7% of
+  land scores exactly 0 and that is untouched ground, the bottom of a continuum. Ocean is
+  NaN (65.7% of full-res tiles are unstored), so zero and no-data are distinguishable,
+  which the deforestation COG never offered. The ramp is log1p over 0-40 on full-range
+  cividis (measured: p50 1.0, p75 5.5, p99 23.4).
+- **The overview pyramid AVERAGES**, verified the same way as the deforestation COG
+  (mean survives an 8x downsample 15.135 -> 15.150 while the max collapses 51.2 -> 45.9),
+  and the pyramid geometry is identical (100 m native, ten doublings), so
+  `LEVEL_FOR_RES` carries over with one addition: the zoom ladder here is ONE STEP FINER
+  than the deforestation notebook (`BASE_RES 5`, range 5-9, res 9 reading the full-res
+  level at ~10 px per cell). The opening view folds ~475k cells from L5 instead of ~70k
+  from L6, and `TILE_BUDGET` is doubled to 512 MB because one world window at L5 is
+  ~253 MB of cached tiles on its own.
+- **The viewport size is MEASURED, not assumed, and lonboard cannot tell you it.**
+  `view_state` carries longitude/latitude/zoom and nothing about the canvas, so the old
+  `VIEW_W`/`VIEW_H` guess (1400x620) was the only source of the fold box's size, and
+  fullscreen broke it visibly: cells folded for a 620 px band across a 1500 px screen,
+  ragged hex edges top and bottom. The fix lives in the Status widget: every widget
+  shares the page document, so it finds the deck canvas (largest canvas on the page),
+  watches it with a ResizeObserver plus `resize` and `fullscreenchange` listeners
+  (fullscreening an ELEMENT fires no window resize), and syncs `view_wh` to the kernel,
+  where `HOLD["wh"]` replaces the constants and a size jump beyond 25 px refolds the
+  current view. The constants remain only as the seed for the opening fold and headless
+  runs. The deforestation and fire-risk notebooks still carry the guess and the same
+  fullscreen defect; port by hand per the shared-by-copy rule. Two browser facts the
+  ruler had to learn, each a debugging round trip:
+  - **marimo puts cell output in shadow DOM**, so `document.querySelectorAll("canvas")`
+    finds nothing even with the map on screen. The search must recurse into every
+    `shadowRoot`. A ResizeObserver works fine across the boundary once the canvas is
+    found.
+  - **The measurement crosses the bridge as a Unicode `"WxH"` string.** A
+    `traitlets.List(traitlets.Float())` trait synced from JS never reached the kernel
+    under marimo's anywidget bridge; the only trait types proven in these notebooks are
+    Unicode (kernel -> browser) and Bool (browser -> kernel), so the ruler uses one of
+    those. The on-screen diagnostics for all this (a px readout in the status line, a
+    dim browser-side "ruler" line) are commented out next to `set_status` and in
+    `Status._esm`, ready to re-enable.
+
+None of the notebooks import anything from `archive/`: their only dependencies are the
 third-party ones in their PEP 723 headers.
 
 **The PMTiles reader and MVT decode are shared by copy, not by import.** The divisions
-notebook's version was ported from the parked terrain notebook, and the buildings notebook's
-from the divisions one. A fix to the directory walk or the varint machinery in one of them
-should be carried to the other by hand.
+notebook's version was ported from the parked terrain notebook, the buildings notebook's
+from the divisions one, and the HFP notebook is a whole-file fork of the divisions
+notebook (its diff is the raster side only: CRS, scaling, zero handling, ramp). A fix to
+the directory walk or the varint machinery in one of them should be carried to the others
+by hand.
 
 ### What is in `archive/`, and what each one still proves
 
