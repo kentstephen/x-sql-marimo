@@ -395,15 +395,17 @@ def _(math):
     # One H3 resolution per 1.4 zoom levels, because each H3 step is 2.65x linear and
     # log2(2.65) = 1.4. That keeps a hexagon a constant size ON SCREEN.
     #
-    # BASE_RES 5, ONE STEP FINER THAN THE DEFORESTATION NOTEBOOK ACROSS THE WHOLE LADDER.
-    # Smaller hexagons at every zoom, at a measured cost: the opening world view folds L5
-    # instead of L6 (~62M pixels against ~16M) and hands lonboard roughly 280k cells
-    # instead of 70k. If the opening view ever feels heavy, this constant is the reason.
+    # BASE_RES 5, ONE STEP FINER THAN THE DEFORESTATION NOTEBOOK FROM ZOOM 4 UP: smaller
+    # hexagons at every working zoom. The world view is the exception, carved out by
+    # MIN_RES below.
     #
     # math.floor, NOT int(): int truncates toward zero, so every zoom below ZOOM0 would
     # collapse onto BASE_RES instead of continuing down to MIN_RES.
     ZOOM0, PER_RES, BASE_RES = 4.0, 1.4, 5
-    MIN_RES, MAX_RES = 5, 9
+    # MIN_RES 4, not 5: fully zoomed out was folding ~475k res 5 cells from L5 and it
+    # was slow on screen. Below zoom ~2.6 the ladder now bottoms out at res 4 (~70k
+    # cells, read from L6); every rung from res 5 up is unchanged.
+    MIN_RES, MAX_RES = 4, 9
 
     def res_for_zoom(z):
         return max(MIN_RES, min(MAX_RES, BASE_RES + math.floor((z - ZOOM0) / PER_RES)))
@@ -473,11 +475,11 @@ def _(math):
     # toggled off; the RGB underneath is the same ramp either way.
     LINE_ALPHA = 205
 
-    # Opens on the Europe-Africa-India band, where the index shows its whole range: the
-    # Sahara near 0, the Nile valley, Europe pushing 30+. Zoom 4, not the old 2.4 world
-    # view: the ladder is unchanged (res 5 holds at 4 and everything below), this only
-    # opens closer in.
-    HOME = {"longitude": 20.0, "latitude": 18.0, "zoom": 4.0}
+    # Opens on the Europe-Africa-India band, because that is where the index shows its
+    # whole range in one view: the Sahara and the Congo basin near 0, the Nile valley,
+    # Europe and the Ganges plain pushing 30+. The world view is affordable because
+    # MIN_RES 4 catches it (see the ladder above).
+    HOME = {"longitude": 20.0, "latitude": 18.0, "zoom": 2.4}
     return (
         COG,
         DIVISION_LABEL,
@@ -527,7 +529,7 @@ def _(matplotlib, np):
     # sequential ramp has to promise.
     HI = 40.0
     ZERO_RGB = (38, 40, 44)  # NaN only; see above
-    _CIVIDIS = matplotlib.colormaps["cividis"]
+    _RAMP = matplotlib.colormaps["inferno"]
 
     def ramp(v):
         """footprint 0-50 -> uint8 RGB, log1p-stretched; NaN takes the dark swatch."""
@@ -536,7 +538,7 @@ def _(matplotlib, np):
         t = np.zeros(v.shape)
         if live.any():
             t[live] = np.log1p(np.clip(v[live], 0.0, HI)) / np.log1p(HI)
-        out = (_CIVIDIS(t)[..., :3] * 255).astype(np.uint8)
+        out = (_RAMP(t)[..., :3] * 255).astype(np.uint8)
         out[~live] = ZERO_RGB
         return out
 
@@ -1892,7 +1894,6 @@ async def _(
     SOURCE_BUCKET,
     TILE,
     TILE_BUDGET,
-    VIEW_W,
     Window,
     XarrayContext,
     asyncio,

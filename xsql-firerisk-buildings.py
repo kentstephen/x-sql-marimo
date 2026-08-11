@@ -145,8 +145,8 @@ def _():
         gzip,
         infer_rows_per_chunk,
         math,
-        mo,
         matplotlib,
+        mo,
         multipolygon,
         np,
         obstore,
@@ -386,7 +386,6 @@ def _(math):
         FETCH_AT_ONCE,
         HOME,
         LEVEL_FOR_RES,
-        MAX_RES,
         PAD,
         PM_BUCKET,
         PM_LAYER,
@@ -438,7 +437,7 @@ def _(matplotlib, np):
     # has to promise.
     FLOOR = 0.25
     ZERO_RGB = (38, 40, 44)
-    _CIVIDIS = matplotlib.colormaps["cividis"]
+    _CIVIDIS = matplotlib.colormaps["inferno"]
 
     def ramp(v):
         """RPS -> uint8 RGB, with exact zero (and NaN) taking the dark swatch."""
@@ -1183,7 +1182,6 @@ def _(
     VIEW_H,
     VIEW_W,
     asyncio,
-    buildings_to_layer,
     cells_to_layer,
     from_wkb,
     infer_rows_per_chunk,

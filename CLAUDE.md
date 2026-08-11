@@ -46,7 +46,8 @@ the parked terrain notebook), the MVT decode too; tile-clipped pieces are dissol
 `xsql-hfp-divisions.py` is the deforestation notebook's machinery pointed at Vizzuality's
 Global 100 m Terrestrial Human Footprint (HFP-100 v1.2, CC-BY 4.0, same source.coop
 account, `vizzuality/hfp-100/hfp_<year>_100m_v1-2_cog.tif`, years 2017-2021; `YEAR` in
-the constants cell is the seam a year slider would use). Four things to know:
+the constants cell is the seam a year slider would use). Full record in
+`docs/hfp-divisions-notes.md`. Four things to know:
 
 - **The COG is World Mollweide (ESRI:54009), not EPSG:4326.** The "no reprojection"
   simplification the deforestation notebook leans on does not hold. Both directions are
@@ -66,10 +67,11 @@ the constants cell is the seam a year slider would use). Four things to know:
   (mean survives an 8x downsample 15.135 -> 15.150 while the max collapses 51.2 -> 45.9),
   and the pyramid geometry is identical (100 m native, ten doublings), so
   `LEVEL_FOR_RES` carries over with one addition: the zoom ladder here is ONE STEP FINER
-  than the deforestation notebook (`BASE_RES 5`, range 5-9, res 9 reading the full-res
-  level at ~10 px per cell). The opening view folds ~475k cells from L5 instead of ~70k
-  from L6, and `TILE_BUDGET` is doubled to 512 MB because one world window at L5 is
-  ~253 MB of cached tiles on its own.
+  than the deforestation notebook from zoom 4 up (`BASE_RES 5`, res 9 reading the
+  full-res level at ~10 px per cell), but `MIN_RES` is 4, so fully zoomed out falls to
+  res 4 (~70k cells from L6). It briefly ran with a res 5 floor and the ~475k-cell world
+  view was visibly slow; that is why the floor is 4. `TILE_BUDGET` stays 512 MB because
+  a wide view in the res 5 band still holds ~253 MB of L5 tiles on its own.
 - **The viewport size is MEASURED, not assumed, and lonboard cannot tell you it.**
   `view_state` carries longitude/latitude/zoom and nothing about the canvas, so the old
   `VIEW_W`/`VIEW_H` guess (1400x620) was the only source of the fold box's size, and
