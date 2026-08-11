@@ -5,8 +5,30 @@ Guidance for Claude Code working in this repository. Inherits the global rules i
 
 ## Repository layout
 
-**One notebook is the repo: `xsql-deforest-divisions.py`.** Everything else is in
-`archive/`, kept for reference and not maintained.
+**Two notebooks are the repo.** Everything else is in `archive/`, kept for reference and
+not maintained.
+
+`xsql-firerisk-buildings.py` folds CarbonPlan's 30 m CONUS wildfire-risk **Zarr v3
+pyramid** to H3 and joins the cells onto **Overture building footprints**, so the map says
+which real structures stand on high-risk ground. Full record in
+`docs/firerisk-buildings-notes.md`. Four things to know before touching it:
+
+- **Overture's buildings tileset carries attributes ONLY at z14.** Planetiler strips them
+  below the top zoom, so at z13 every feature has `@geometry_source`, `@height_source` and
+  nothing else. `id` is 100% present at z14 and 0% at z13, measured at four places. `id` is
+  the dissolve key and the join key, so a coarser fetch silently returns thousands of
+  anonymous polygons: the decode succeeds and nothing errors. The tile zoom is therefore
+  pinned at 14 and the camera zoom only decides whether buildings are drawn at all.
+- **The polyfill mode is `overlap`, not `center`.** A building is smaller than a res 11
+  cell (150-250 m2 against 2,150), so it contains no cell centre and `center` returns
+  nothing; `full` wants the cell inside the polygon and is worse. The reason `overlap` was
+  rejected for divisions (counties tile the plane, so shared cells double count) does not
+  apply, because buildings are disjoint islands.
+- **Res 11 is the floor and the raster sets it**, same arithmetic as the NLCD notebooks.
+  Res 12 would hold ~0.35 pixels and hole out. The polyfill cannot run finer than the fold,
+  since both sides of the equi-join must be the same resolution.
+- **Zero cells are KEPT**, the opposite of the deforestation notebook. There zero was ocean;
+  here it is ground that will not burn and it is exactly where the buildings are.
 
 `xsql-deforest-divisions.py` folds a global deforestation COG to H3 and joins the cells
 onto Overture divisions for a zoomable choropleth plus a drawn-box ranking. The raster is
@@ -21,8 +43,13 @@ the parked terrain notebook), the MVT decode too; tile-clipped pieces are dissol
 `division_id` in DuckDB before drawing or the stroke shows tile seams. Full record in
 `docs/deforest-divisions-notes.md`.
 
-The notebook imports nothing from `archive/`: its only dependencies are the third-party
-ones in its PEP 723 header.
+Neither notebook imports anything from `archive/`: their only dependencies are the
+third-party ones in their PEP 723 headers.
+
+**The PMTiles reader and MVT decode are shared by copy, not by import.** The divisions
+notebook's version was ported from the parked terrain notebook, and the buildings notebook's
+from the divisions one. A fix to the directory walk or the varint machinery in one of them
+should be carried to the other by hand.
 
 ### What is in `archive/`, and what each one still proves
 
@@ -199,10 +226,10 @@ in `s1m_viewer.py`) and lean on **extrusion height** as a redundant, non-color c
 
 ```bash
 # Dev (full venv)
-uv run marimo edit xsql-deforest-divisions.py
+uv run marimo edit xsql-firerisk-buildings.py
 
 # Shareable sandbox (PEP 723 inline deps in the notebook header)
-uv run marimo edit xsql-deforest-divisions.py --sandbox
+uv run marimo edit xsql-firerisk-buildings.py --sandbox
 
 # Headless smoke test (runs every cell, no browser)
 uv run marimo export html xsql-deforest-divisions.py -o /tmp/out.html
@@ -211,9 +238,9 @@ uv run marimo export html xsql-deforest-divisions.py -o /tmp/out.html
 uv run --project archive marimo edit archive/xsql-nlcd-imagery.py
 ```
 
-**Two pyprojects, deliberately.** The root `pyproject.toml` is in sync with
-`xsql-deforest-divisions.py`'s PEP 723 header and nothing more, so it stays honest about
-what is actually imported. `archive/pyproject.toml` is the union of every archived
+**Two pyprojects, deliberately.** The root `pyproject.toml` is the union of the two
+maintained notebooks' PEP 723 headers and nothing more, so it stays honest about what is
+actually imported (`async-geotiff` for the COG reader, `zarr` for the pyramid reader). `archive/pyproject.toml` is the union of every archived
 notebook's header (adds `aiohttp`, `arro3-io`, `geoarrow-rust-io`, `geopy`, `morecantile`,
 `palettable`, `pillow`, `planetary-computer`, `pyproj`, `pystac-client`, `shapely`) and
 is pinned, because a frozen environment is the point of an archive. Keep each notebook's

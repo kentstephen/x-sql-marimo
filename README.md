@@ -1,21 +1,33 @@
 # x-sql-marimo
 
-Fly across the planet and watch where forest was lost between 2002 and 2022, as H3
-hexagons that get finer as you zoom, joined onto real administrative boundaries. Nothing
-is read until the camera asks for it.
+Fold a raster to H3 in SQL, then join it to something that has edges. Two notebooks do
+that with two different pairs, and nothing is read until the camera asks for it.
 
 ```bash
+# where forest was lost 2002-2022, by administrative division, worldwide
 uv run marimo edit xsql-deforest-divisions.py --sandbox
+
+# which buildings stand on high wildfire-risk ground, CONUS
+uv run marimo edit xsql-firerisk-buildings.py --sandbox
 ```
 
-One 5.7 GB global COG is streamed straight out of object storage with
-[obstore](https://developmentseed.org/obstore/) and
-[async-geotiff](https://developmentseed.org/async-geotiff/), folded into
-[H3](https://h3geo.org/) cells in SQL, joined to Overture division polygons on the cell
-id, and drawn with [lonboard](https://developmentseed.org/lonboard/). No tile server, no
-STAC API, no pixels leave the bucket until the viewport asks for them.
+Both stream their raster straight out of object storage with
+[obstore](https://developmentseed.org/obstore/), fold it into [H3](https://h3geo.org/) cells
+in SQL, join those cells to Overture geometry on the cell id, and draw the result with
+[lonboard](https://developmentseed.org/lonboard/). No tile server, no STAC API, no pixels
+leave the bucket until the viewport asks for them.
 
-## The data
+The first is written up in full below, because it is where the machinery was worked out.
+[The second](#the-second-notebook-which-structures-are-on-dangerous-ground) reuses it and
+only the differences are worth reading.
+
+## Deforestation by Overture division
+
+A 5.7 GB global COG, read with
+[async-geotiff](https://developmentseed.org/async-geotiff/), against administrative
+boundaries.
+
+### The data
 
 **[vizzuality/lg-land-carbon-data](https://source.coop/vizzuality/lg-land-carbon-data)**
 on Source Cooperative: "Land, carbon and biodiversity data for supply chain impact
@@ -39,7 +51,7 @@ one-line swap.
 Boundaries are [Overture Maps](https://overturemaps.org/) divisions, read from the pinned
 release's own PMTiles build.
 
-## Why H3 is not just a demo step
+### Why H3 is not just a demo step
 
 The COG is in degrees, so **its pixels are not equal area**: a 100 m pixel at the equator
 covers about twice the ground of one at 60 degrees. Average pixels directly over a country
@@ -56,7 +68,7 @@ Two weightings, each fixing a different bias:
 
 Getting this wrong is invisible on screen, which is the dangerous part.
 
-## Each engine doing the half it wins
+### Each engine doing the half it wins
 
 | step | engine | why |
 |---|---|---|
@@ -71,7 +83,7 @@ Shipping the cells over to DuckDB because DuckDB happens to hold the polygons wo
 been backwards. The geometry steps go where the geometry is; the join goes where the data
 is.
 
-## The counter-intuitive part
+### The counter-intuitive part
 
 Each fold reads only the padded viewport, from the overview matching the H3 resolution it
 is about to build, so the **finest views are the cheapest**: the viewport shrinks faster
@@ -89,7 +101,7 @@ Res 4 draws the whole planet comfortably: 288 thousand cells, not 288 million. T
 at res 4 is 15.7M pixels read in 821 ms plus a 282 ms fold, and 8 ms plus 211 ms the
 second time off the tile cache.
 
-## The COG is sparse and async-geotiff does not know it
+### The COG is sparse and async-geotiff does not know it
 
 73.6% of full-resolution tiles have offset 0 and length 0, because ocean is simply not
 stored. A read that touches one issues the byte range `0..0` and raises
@@ -103,7 +115,7 @@ on the COG's own 512 px tile grid and consulting `tile_byte_counts` first turns 
 a crash into a **speedup**: an absent tile is NaN with no request at all. This is the piece
 most worth stealing from this notebook, and the piece that looks most like boilerplate.
 
-## Boundaries come from PMTiles, not GeoParquet
+### Boundaries come from PMTiles, not GeoParquet
 
 Overture's `division_area` GeoParquet has no spatial ordering, so geometry (99.0% of the
 bytes) cannot be pruned: a Rondônia-sized viewport decodes about **190 MB** per file to
@@ -127,7 +139,7 @@ the world tile, Java's coastline and Italy's enclaves. Tile geometry arrives cli
 one division comes back as several pieces and they are dissolved per `division_id` before
 anything downstream sees them, or the stroke draws tile seams across the map.
 
-## What the map answers
+### What the map answers
 
 - **Colour is the mean share deforested** across the cells in view, or across a division
   once boundaries are on.
@@ -143,7 +155,7 @@ anything downstream sees them, or the stroke draws tile seams across the map.
 Subtype floors are baked into the tileset by the build and are honoured here: country z2,
 region z4, county z8. Measured off the tiles, not documented anywhere.
 
-## Colour, and why zero gets its own swatch
+### Colour, and why zero gets its own swatch
 
 Folded at res 4 over the world, **69.6% of cells are exactly zero** and the nonzero values
 span nine orders of magnitude (p1 7.3e-8, p50 2.1e-3, p99.9 0.45). A linear 0 to 1 ramp
@@ -167,7 +179,7 @@ floor is lifted to the upper 75% of cividis and zero takes the dark end alone.
 Monotonic in luminance both normally and under a deuteranope simulation, which is the only
 thing a sequential ramp has to promise.
 
-## Is it right?
+### Is it right?
 
 Zonal means checked against geography we can reason about:
 
@@ -183,13 +195,72 @@ A ~30x to ~70x split in the right direction and roughly the right magnitude. If 
 were smearing neighbours together or dropping the area weighting, that contrast would
 collapse.
 
+## The second notebook: which structures are on dangerous ground
+
+```bash
+uv run marimo edit xsql-firerisk-buildings.py --sandbox
+```
+
+Same machinery, different pair. The raster is
+[carbonplan/carbonplan-ocr](https://source.coop/carbonplan/carbonplan-ocr) on Source
+Cooperative (CarbonPlan's Open Climate Risk project, CC-BY 4.0), a Zarr v3 multiscale
+pyramid covering CONUS at 30 m. The vector side is Overture **building footprints** rather
+than divisions.
+
+The value is **RPS, Risk to Potential Structures**: burn probability times the conditional
+risk to a structure, were one there. That name is the reason for the join. RPS is computed
+without knowing whether anything is actually built, so joining it to real footprints turns
+"this ground is dangerous" into "this structure is on dangerous ground".
+
+Nothing in the docs says what `rps` means, so it was settled from the sibling Icechunk
+store, which publishes the factors separately: `corr(rps_2011, bp_2011 * crps_scott)` is
+1.000000 over 160k pixels, the USFS Wildfire Risk to Communities formula exactly.
+
+**Zarr turns out to be the easier side of the trade.** Three things the COG notebook builds
+by hand come free: the pyramid declares `"resampling_method": "mean"` in its metadata
+instead of having to be measured; absent chunks read as fill because that is in the spec,
+so the sparse-tile crash has no equivalent; and the coordinates are published arrays, so
+there is no geotransform to derive. obstore stays the transport either way.
+
+**Buildings have a minimum zoom, and the tiles are always z14.** Overture's tileset carries
+footprint geometry from z4, but Planetiler strips the *attributes* off everything below its
+top zoom:
+
+| | z13 features | `id` present | z14 features | `id` present |
+|---|---:|---:|---:|---:|
+| Paradise CA | 1,109 | **0** | 618 | 618 |
+| Downtown LA | 4,162 | **0** | 1,875 | 1,875 |
+
+`id` is both the dissolve key and the join key, so a z13 fetch returns thousands of
+anonymous polygons and nothing errors: the decode succeeds, the winding is right, the count
+is right, and every feature is unusable.
+
+**The polyfill runs in `overlap` mode, where the divisions notebook uses `center`,** and
+that inverts for a good reason. A division holds thousands of cells, so `center` assigns
+each cell to exactly one division and the map partitions. A building is 150-250 m² against
+a 2,150 m² cell: it contains no cell centre at all, and `center` returns nothing for it.
+Buildings are disjoint islands rather than a partition, so the double-counting objection
+that ruled `overlap` out for counties doesn't apply.
+
+Which leaves the honest limit, and the notebook says it on screen: a house is 10% of a
+res-11 cell, so its number is the cell's number. The 30 m raster does not resolve a house;
+it resolves the hillside it stands on.
+
+**Is it right?** A building's joined RPS against the raster value at its own centroid, read
+straight out of the Zarr window: `corr = 0.9803`, median ratio `1.002` over 3,735 buildings.
+That is the check that catches a mis-indexed read or a resolution mismatch, neither of which
+changes a single row count.
+
+`docs/firerisk-buildings-notes.md` has the rest, including why res 11 is the floor and what
+the Icechunk store would buy.
+
 ## Everything else
 
-`archive/` holds what was built on the way here and is kept for reference, not maintained:
+`archive/` holds what was built on the way to these and is kept for reference, not maintained:
 the Annual NLCD zoom notebooks and their DataFusion-vs-DuckDB benchmark, the NLCD boundary
 over satellite imagery, the parked NLCD x terrain extrusion, and the NAIP, 3DEP and
-Overture GeoParquet helpers. The deforestation notebook imports none of it; its only
-dependencies are the third-party ones in its PEP 723 header.
+Overture GeoParquet helpers. Neither maintained notebook imports any of it; their only
+dependencies are the third-party ones in their PEP 723 headers.
 
 They still run. `archive/pyproject.toml` is the union of every archived notebook's header,
 pinned, so the root project can stay in sync with the one notebook that is maintained:
