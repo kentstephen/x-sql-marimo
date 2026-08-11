@@ -150,6 +150,12 @@ the 30 m raster, not the join. Where `overlap` earns its keep is the large tail,
 ground a structure sits on) and it is a one-word change; the line is commented so the
 choice is visible rather than accidental.
 
+**The join is DataFusion, despite a pyarrow `.join` sitting nearby.** The analytical step
+(the hex equi-join plus group-by) is `JOIN_SQL` run in the shared DataFusion context, in
+both notebooks. The pyarrow `vis.join(joined, keys="id")` right after it only glues the
+aggregated numbers back onto the geometry rows for the layer. Reading that line as "the
+join is pyarrow" is a natural mistake and has now been made once.
+
 `ST_Dump` is still required: `h3_polygon_wkb_to_cells_experimental` rejects MultiPolygon
 and `_feature_wkb` always emits one.
 
@@ -190,6 +196,71 @@ Opening view is Paradise, CA at z13.6. Median RPS under its buildings is 0.0085 
 p50 of 0.057 for the surrounding L1 window: structures in town sit on lower-modelled-risk
 ground than the forest around them, which is what a burn-probability model does with dense
 development and is worth knowing before quoting a number.
+
+## The repo's own vector products (checked 2026-08-11, and they change the calculus)
+
+Prompted by "why is burn probability not on screen": it is not in the pyramid, but the
+source.coop repository publishes it per building, precomputed. Under
+`output/fire-risk/vector/production/v0.13.0/`:
+
+- **`geoparquet/buildings.parquet/`, hive-partitioned `state_fips=XX/county_fips=XXX/`.**
+  Every CONUS building as a row: `USFS_RPS`, `wind_risk_2011`, `wind_risk_2047`,
+  `burn_probability_2011`, `burn_probability_2047`, `conditional_risk_usfs`,
+  `burn_probability_usfs_2011`, `burn_probability_usfs_2047`, census block `GEOID`,
+  `state`, `county`, WKB `geometry`, and a `bbox` struct column. CarbonPlan already did
+  the raster-to-building sampling; this is their headline product. The partitioning means
+  a county's worth of buildings is a handful of small files, so a drawn-box ranking or a
+  risk-band count reads cheaply and exactly.
+- **`pmtiles/buildings.pmtiles`**, 11.5 GB, z0-14, one layer `risk`, 155.5M polygons.
+  Built with **tippecanoe** (`--drop-smallest-as-needed`), which is the opposite tradeoff
+  from Overture's Planetiler build: **attributes survive at every zoom** and what gets
+  dropped at low zoom is the smallest FEATURES. So risk-attributed footprints are visible
+  from any zoom, biased toward larger structures as you zoom out. Caveat before trusting
+  a number: the field names are stripped to `"0"`..`"6"` (seven of them against eight
+  numeric GeoParquet columns), so the index-to-column mapping has to be pinned down first.
+- **`pmtiles/regions.pmtiles`**, 2.7 GB, z0-12, layers `counties`, `tracts`, `blocks`,
+  each polygon carrying aggregate risk stats (five numeric fields plus GEOID/name
+  strings, same unnamed-field caveat). Plain CSV/GeoJSON per-county and per-tract stats
+  sit next to it in `region-analysis/`.
+
+So burn probability at building resolution does not need the Icechunk store; the vector
+product carries it. What the vector product does NOT give is a new raster variable for
+the hexagons: the pyramid still publishes RPS only.
+
+**The tension, named before anything is built on this:** the point of the notebook has
+been doing the fold and the join itself from open primitives, and CarbonPlan ships the
+finished join. Directions that were on the table when this was recorded:
+
+1. Regions (counties/tracts) as the low-zoom clue below `BLD_ZOOM`, keeping the
+   notebook's own join as the high-zoom truth.
+2. CarbonPlan's buildings tileset as the locator at any zoom, which makes buildings
+   findable from z8 but turns the notebook's own join into decoration.
+3. The hive-partitioned GeoParquet as the drawn-box ranking / risk-band counting side,
+   which is also the natural place for "only buildings above a threshold".
+4. Their `USFS_RPS` per building against the joined RPS as an external validation,
+   stronger than the centroid-pixel test.
+
+## Open: browser symptoms from the second session (2026-08-11)
+
+Two symptoms reported directly, one diagnosed by reading, one a design gap:
+
+- **Hexagons do not fill the screen while panning.** Mechanism found: `view_to_bbox`
+  computes the viewport from `VIEW_W = 1400`, a GUESS at the browser width (`VIEW_H` is
+  real; it is passed to the Map). On a wider window the computed box is narrower than the
+  actual screen, and the same wrong box feeds both sides: `_pad` decides what to fold and
+  `_covers` in `_instant` decides whether a refetch is needed. The fold stops short of the
+  screen edge and the controller then believes it is covered and never refetches. The 25%
+  `PAD` margin is eaten instantly by a 2000+ px window. This is the terrain notebook's
+  "VIEW_W is a guess" weakness made visible, because hexagons have edges and bitmaps do
+  not. Crude fix: bump the guess and widen `PAD`. Correct fix: have the widget report its
+  actual clientWidth over the comm (anywidget can).
+- **Buildings are hard to FIND.** Below `BLD_ZOOM` (13.0; the z14 number is the tile
+  fetch, not the gate) the map is hexagons with no hint of where structures are, and the
+  gate cannot simply be lowered while the buildings come from Overture, because the
+  attributes only exist at z14. The candidate clues are the regions/buildings products
+  above. Related open design question, also raised: whether to draw ALL joined buildings
+  or filter/fade below a risk threshold. Zero-risk ground is kept deliberately (see
+  above), but that argument is about cells, not about which footprints deserve ink.
 
 ## Open: reported glitchy in the browser, symptom not captured
 
