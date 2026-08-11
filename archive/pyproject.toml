@@ -1,0 +1,48 @@
+[project]
+name = "x-sql-marimo-archive"
+version = "0.1.0"
+description = "Complete environment for the archived notebooks. Not maintained; kept so they still run."
+requires-python = ">=3.13"
+
+# The union of every PEP 723 header in this directory, so any archived notebook runs
+# without --sandbox:
+#
+#     uv run --project archive marimo edit archive/xsql-nlcd-imagery.py
+#
+# The root pyproject.toml is trimmed to what xsql-deforest-divisions.py actually imports.
+# That is the only notebook that is maintained; everything here is reference. Where two
+# notebooks disagree on a constraint the pin wins (matplotlib, numpy, geopy), because a
+# frozen environment is the point of an archive.
+dependencies = [
+    "aiohttp>=3.10",
+    "anywidget>=0.9",
+    "arro3-core",
+    "arro3-io",
+    "async-geotiff>=0.4",
+    "datafusion>=54.0.0",
+    "duckdb>=1.5.5",
+    "geoarrow-rust-core>=0.6",
+    "geoarrow-rust-io>=0.6",
+    "geopy==2.5.0",
+    "h3ronpy>=0.22.0",
+    "lonboard>=0.16.0",
+    "marimo>=0.23.16",
+    "matplotlib==3.11.1",
+    "morecantile>=7.0.3",
+    "numpy==2.5.1",
+    "obstore>=0.9.2",
+    "palettable>=3.3",
+    "pillow>=11",
+    "planetary-computer>=1.0.0",
+    "pyarrow>=25.0.0",
+    "pyproj>=3.7",
+    "pystac-client>=0.9.0",
+    "shapely>=2.1.2",
+    "xarray",
+    "xarray-sql>=0.3.2",
+]
+
+# The SurfaceLayer notebooks (xsql-naip-drape.py, xsql-s1m-surface.py, xsql-naip-tiles.py)
+# additionally need `uv run python archive/tools/patch_lonboard_surface.py` after every
+# install, or the textured mesh comes back covered in pale facets. See
+# docs/xsql-naip-drape-notes.md.

@@ -1,29 +1,27 @@
 [project]
 name = "x-sql-marimo"
 version = "0.1.0"
-description = "Add your description here"
+description = "Global deforestation 2002-2022 folded to H3 and joined onto Overture divisions"
 readme = "README.md"
 requires-python = ">=3.13"
+
+# In sync with the PEP 723 header of xsql-deforest-divisions.py, which is the only
+# maintained notebook. The archived notebooks need a wider set; that lives in
+# archive/pyproject.toml so this one can stay honest about what is actually imported.
 dependencies = [
-    "aiohttp>=3.10",
+    "anywidget>=0.9",
+    "arro3-core",
     "async-geotiff>=0.4",
     "datafusion>=54.0.0",
     "duckdb>=1.5.5",
     "geoarrow-rust-core>=0.6",
-    "geoarrow-rust-io>=0.4",
-    "geopy>=2.5.0",
     "h3ronpy>=0.22.0",
     "lonboard>=0.16.0",
     "marimo>=0.23.16",
-    "matplotlib>=3.11.1",
-    "morecantile>=7.0.3",
+    "matplotlib==3.11.1",
+    "numpy==2.5.1",
     "obstore>=0.9.2",
-    "palettable>=3.3",
-    "pillow>=11",
-    "planetary-computer>=1.0.0",
     "pyarrow>=25.0.0",
-    "pyproj>=3.7",
-    "pystac-client>=0.9.0",
-    "shapely>=2.1.2",
+    "xarray",
     "xarray-sql>=0.3.2",
 ]

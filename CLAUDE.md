@@ -5,39 +5,71 @@ Guidance for Claude Code working in this repository. Inherits the global rules i
 
 ## Repository layout
 
-Four notebooks are the repo:
+**One notebook is the repo: `xsql-deforest-divisions.py`.** Everything else is in
+`archive/`, kept for reference and not maintained.
 
-- `xsql-nlcd-zoom.py` folds and dissolves entirely in DataFusion + h3ronpy.
+`xsql-deforest-divisions.py` folds a global deforestation COG to H3 and joins the cells
+onto Overture divisions for a zoomable choropleth plus a drawn-box ranking. The raster is
+Vizzuality / LandGriffon's `deforest_100m_cog.tif` (CC-BY 4.0) from the source.coop
+repository [`vizzuality/lg-land-carbon-data`](https://source.coop/vizzuality/lg-land-carbon-data),
+read from `s3://us-west-2.opendata.source.coop/vizzuality/lg-land-carbon-data/`. Divisions
+come from Overture's own PMTiles build of the pinned release
+(`overturemaps-extras-us-west-2/tiles/<release>/divisions.pmtiles`), NOT the GeoParquet:
+the GeoParquet layout makes geometry (99% of the bytes) unprunable, measured at ~190 MB
+per viewport against ~0.8 MB from tiles. The PMTiles reader is hand-rolled (ported from
+the parked terrain notebook), the MVT decode too; tile-clipped pieces are dissolved per
+`division_id` in DuckDB before drawing or the stroke shows tile seams. Full record in
+`docs/deforest-divisions-notes.md`.
+
+The notebook imports nothing from `archive/`: its only dependencies are the third-party
+ones in its PEP 723 header.
+
+### What is in `archive/`, and what each one still proves
+
+- `xsql-nlcd-zoom.py` folds and dissolves Annual NLCD entirely in DataFusion + h3ronpy.
 - `xsql-duckdb-nlcd-h3.py` keeps the DataFusion fold and moves the dissolve to DuckDB's
   h3 extension. Measured on the same viewport: the fold is 70 ms in DataFusion against
   462 ms in DuckDB, and the dissolve is 75 ms in DuckDB against 928 ms in h3ronpy. The
   reason is which H3 lives underneath: duckdb-h3 wraps Uber's C library, h3ronpy wraps
-  h3o. Keeping both means the comparison stays runnable rather than a claim in a commit.
+  h3o. That benchmark is why the deforestation notebook splits the engines the way it does.
 - `xsql-nlcd-imagery.py` is the DuckDB notebook with the hexagons switched OFF: only the
   dissolved boundary is drawn, as thin lines over an Esri World Imagery tile layer. The
   point is that the map becomes checkable rather than trustable, since the line either
   follows a real edge on the ground or it does not. It also reads NLCD one overview finer
   from res 7 up, because the boundary is decided by the cells where the class vote is
   closest and those were thinnest on evidence.
-- `xsql-deforest-divisions.py` folds a global deforestation COG to H3 and joins the cells
-  onto Overture divisions for a zoomable choropleth plus a drawn-box ranking. Divisions
-  come from Overture's own PMTiles build of the pinned release
-  (`overturemaps-extras-us-west-2/tiles/<release>/divisions.pmtiles`), NOT the GeoParquet:
-  the GeoParquet layout makes geometry (99% of the bytes) unprunable, measured at ~190 MB
-  per viewport against ~0.8 MB from tiles. The PMTiles reader is hand-rolled (ported from
-  the parked terrain notebook), the MVT decode too; tile-clipped pieces are dissolved per
-  `division_id` in DuckDB before drawing or the stroke shows tile seams. Full record in
-  `docs/deforest-divisions-notes.md`.
+- `xsql-duckdb-terrain-h3.py` is the parked NLCD x terrain extrusion. See "Parked
+  experiment" below; its PMTiles v3 client is what the divisions reader was ported from.
+- `xsql-nlcd-sentinel2.py` is an empty placeholder from the abandoned Sentinel-2 render.
+- The rest (`xsql-dem-*`, `xsql-naip-*`, `xsql-s1m-*`, `naip.py`, `overture_core.py`,
+  `tools/patch_lonboard_surface.py`) are the earlier notebooks and helpers.
 
-One more runs but is parked, not maintained, and not recommended:
-`xsql-duckdb-terrain-h3.py`. See "Parked experiments" below.
+Paths in the sections below that name an archived notebook still resolve, with `archive/`
+in front.
 
-Everything else that was built along the way lives in `archive/` (earlier notebooks, the
-Overture and NAIP helpers, the lonboard patch script) and is kept for reference, not
-maintained. Neither notebook imports any of it: their only dependencies are the
-third-party ones in their PEP 723 headers.
+## Current project
 
-## Project overview
+`xsql-deforest-divisions.py`, described above. The shape of it, in one line: **free-fly
+the planet**, and everywhere the camera lands, the mean share of ground deforested
+2002-2022 as H3 hexagons and as a number per administrative division.
+
+- **Raster:** `deforest_100m_cog.tif`, 5.7 GB, EPSG:4326, whole globe, 100 m, from the
+  source.coop repository <https://source.coop/vizzuality/lg-land-carbon-data> (Vizzuality
+  / LandGriffon, CC-BY 4.0). Values are the **portion of each pixel deforested**, 0-1, so
+  `mean()` is valid at every scale and the averaged overview pyramid is legitimate. The
+  same repository holds nine other layers of the same shape and CRS: any of them is a
+  one-line swap.
+- **Boundaries:** Overture divisions, PMTiles, as above.
+- **Engines:** obstore streams, DataFusion folds and joins, DuckDB does the two geometry
+  steps (polyfill, tile-seam dissolve), lonboard renders.
+- **Run:** `uv run marimo edit xsql-deforest-divisions.py --sandbox`
+
+Everything from "Original brief" down is the 3DEP/NLCD lineage this grew out of. The
+pipeline described there is now entirely in `archive/`, but the techniques (VRT as
+catalog, obstore COG streaming, the H3 UDF, the lonboard gotchas) still apply and are why
+those sections are kept.
+
+## Original brief (3DEP; now archived)
 
 A marimo notebook to **free-fly across the USA**: draw a box anywhere on a map, and
 the app streams the **USGS 3DEP 10m (1/3 arc-second) seamless DEM** for that AOI
@@ -167,23 +199,36 @@ in `s1m_viewer.py`) and lean on **extrusion height** as a redundant, non-color c
 
 ```bash
 # Dev (full venv)
-uv run marimo edit <notebook>.py
+uv run marimo edit xsql-deforest-divisions.py
 
 # Shareable sandbox (PEP 723 inline deps in the notebook header)
-uv run marimo edit <notebook>.py --sandbox
+uv run marimo edit xsql-deforest-divisions.py --sandbox
 
 # Headless smoke test (runs every cell, no browser)
-uv run marimo export html <notebook>.py -o /tmp/out.html
+uv run marimo export html xsql-deforest-divisions.py -o /tmp/out.html
+
+# An archived notebook, from the archive's own environment
+uv run --project archive marimo edit archive/xsql-nlcd-imagery.py
 ```
 
-Core deps (see `pyproject.toml`): `marimo`, `datafusion`, `h3ronpy`, `pyarrow`,
-`xarray-sql`, plus the streaming/render stack to add: `obstore`, `async-geotiff`,
-`lonboard`. `duckdb` (with `INSTALL spatial`) is there for exactly one job: reading the
-S1M footprint GeoPackage, where `ST_Read` parses the geometry blobs and `ST_Transform`
-takes Albers to degrees. It is not a second query engine for the fold; that stays
-DataFusion. Keep each notebook's PEP 723 header in sync with `pyproject.toml` so
-`--sandbox` stays self-contained. Pin the deck.gl-raster / lonboard versions; they
-move fast.
+**Two pyprojects, deliberately.** The root `pyproject.toml` is in sync with
+`xsql-deforest-divisions.py`'s PEP 723 header and nothing more, so it stays honest about
+what is actually imported. `archive/pyproject.toml` is the union of every archived
+notebook's header (adds `aiohttp`, `arro3-io`, `geoarrow-rust-io`, `geopy`, `morecantile`,
+`palettable`, `pillow`, `planetary-computer`, `pyproj`, `pystac-client`, `shapely`) and
+is pinned, because a frozen environment is the point of an archive. Keep each notebook's
+PEP 723 header in sync with whichever pyproject covers it, so `--sandbox` stays
+self-contained either way. Pin the deck.gl-raster / lonboard versions; they move fast.
+
+`duckdb` carries `INSTALL spatial` plus `INSTALL h3`, and in the deforestation notebook it
+does exactly two jobs, both geometry: the polygon-to-cells polyfill and the `ST_Union_Agg`
+that removes tile seams. It is not a second query engine for the fold; that stays
+DataFusion.
+
+`.cache/` is gitignored and disposable: everything in it is fetched at runtime (the 3DEP
+VRT, the S1M GeoPackage, the Overture GeoParquet file-bbox indexes) and all of it belongs
+to archived notebooks. The deforestation notebook writes nothing to disk, so a fresh clone
+has no `.cache/` at all and never grows one.
 
 ### Required for every SurfaceLayer notebook
 
