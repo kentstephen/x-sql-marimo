@@ -119,10 +119,10 @@ What is fussy, and why this stays a question rather than a plan:
   taking deck.gl's H3HexagonLayer with string/bigint cell ids and eating the conversion.
   Fussy, not impossible.
 - **The divisions machinery would need DuckDB-WASM** with the spatial and h3 community
-  extensions. Whether the h3 community extension has a working wasm build is a fact to
-  check, not guess. If it does not, the browser app drops the divisions join and becomes
-  purely the finder, which for this idea might be fine.
+  extensions. The h3 extension working under wasm is CONFIRMED: Isaac Brodsky (the
+  extension's author) has said it does. So the divisions join survives a browser port,
+  and DuckDB-WASM could even cover the fold-side H3 call if the JS loop measures slow,
+  though that trades the per-row-call overhead the Python split exists to avoid.
 
-Cheap probe order: (1) time h3-js folding a synthetic 1M-pixel viewport; (2) check
-duckdb-wasm community extension availability for h3; (3) only then decide. The marimo
+Cheap probe: time h3-js folding a synthetic 1M-pixel viewport, then decide. The marimo
 version does not wait on this; path 1 above is a one-session experiment either way.
