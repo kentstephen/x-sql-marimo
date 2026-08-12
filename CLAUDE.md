@@ -5,7 +5,7 @@ Guidance for Claude Code working in this repository. Inherits the global rules i
 
 ## Repository layout
 
-**Three interactive notebooks are the repo**, plus one static one-shot. Everything else
+**Four interactive notebooks are the repo**, plus one static one-shot. Everything else
 is in `archive/`, kept for reference and not maintained.
 
 `xsql-firerisk-buildings.py` folds CarbonPlan's 30 m CONUS wildfire-risk **Zarr v3
@@ -118,6 +118,34 @@ North-America box is ~760M pixels, 15-20 GB of RAM, 4.88M cells (both measured).
 fold cell is a straightened-out copy of the interactive notebook's read cell, so fixes
 to the sparse-tile check, the Mollweide pair or the fold SQL carry across by hand.
 
+`xsql-canopy-3d.py` draws Meta & WRI's High Resolution Canopy Height Maps (~1 m, uint8
+metres, CC-BY 4.0, `s3://dataforgood-fb-data/forests/v1/alsgedi_global_v6_float/`) as
+an extruded H3HexagonLayer: column height IS mean canopy metres times a stated 3x
+exaggeration, colour (matplotlib Greens) repeats it. One dataset, one encoding; it is
+the survivor of two parked pairings (see archive). Opens pitched over Prairie Creek
+Redwoods. Things to know before touching it:
+
+- **The CHM has NO overview pyramid, and that shapes everything.** 56,147 zoom-9 Web
+  Mercator quadkey BigTIFFs, 65,536 px square, deflate + predictor 2 (inverted with a
+  wrapping uint8 cumsum), and every strip is ONE ROW of 65,536 px, so any window read
+  pays for full-width strips and there is no affordable wide view. The layer therefore
+  hides below zoom 13 and folds per viewport above it, res 10 -> 12 on the standard
+  ladder formula (read stride 4, relaxing to 2 at res 12). `CANOPY_BUDGET` refuses
+  monster reads: dense-forest strips run ~16 KB compressed against a 320 B archive
+  average, so the same viewport is 2 MB in most places and ~100 MB over Paradise CA.
+- **The msk sidecars are IGNORED, measured, not assumed:** the Paradise mask reads all
+  zero across rows carrying real 40 m heights and ~10k tiles have no sidecar, so
+  GDAL's 0-is-invalid rule would nuke live data. No-data is an ABSENT quadkey tile
+  (ocean, unimaged), which folds no cells; zero canopy is a real measurement and sits
+  INSIDE the ramp.
+- **The CHM reader is shared by copy** with the two parked canopy forks in `archive/`;
+  the full dataset recon (IFD layout, strip sizes, quadkey math, mask finding) is in
+  `docs/canopy-firerisk-notes.md`. Vintage is per Maxar acquisition (2018-2020, dates
+  in `tiles.geojson`, not yet read); the model saturates in the tallest stands
+  (measured max 57 m over real ~100 m redwoods).
+- It carries the HFP ruler, a `SessionContext` instead of XarrayContext (no raster
+  windowing, so no xarray), and no DuckDB (no polyfill, no dissolve).
+
 None of the notebooks import anything from `archive/`: their only dependencies are the
 third-party ones in their PEP 723 headers.
 
@@ -144,6 +172,20 @@ by hand.
   closest and those were thinnest on evidence.
 - `xsql-duckdb-terrain-h3.py` is the parked NLCD x terrain extrusion. See "Parked
   experiment" below; its PMTiles v3 client is what the divisions reader was ported from.
+- `xsql-canopy-firerisk-buildings.py` is the fire-risk buildings notebook plus canopy
+  height per building (mean over the footprint's cells widened one ring). Parked on
+  MEANING: RPS's LANDFIRE fuel inputs already contain canopy structure, height is the
+  wrong fuel axis (the Marshall Fire footprint scores canopy ~0), and the
+  structure-survival literature finds spacing and materials dominate. What it still
+  proves: the CHM strip reader end to end, and `docs/canopy-firerisk-notes.md` holds
+  the whole dataset recon plus two unbuilt ideas (RPS-vs-CHM disagreement layer, the
+  CAL FIRE DINS per-structure test).
+- `xsql-canopy-deforest.py` is the deforestation notebook with a canopy paint switch
+  at deep zoom, two ladders (deforest res 8 cap, canopy res 10-12) bridged by an
+  `h3_cell_to_parent` join so each fine cell carries its coarse parent's cleared
+  share. Parked as "comparing, not solving"; `docs/canopy-deforest-notes.md` records
+  the way back (four-state cleared/regrown/intact map, still-bare permanence ranking,
+  acquisition-date gate). Also proves the ruler port onto the deforestation base.
 - `xsql-nlcd-sentinel2.py` is an empty placeholder from the abandoned Sentinel-2 render.
 - The rest (`xsql-dem-*`, `xsql-naip-*`, `xsql-s1m-*`, `naip.py`, `overture_core.py`,
   `tools/patch_lonboard_surface.py`) are the earlier notebooks and helpers.
@@ -153,7 +195,15 @@ in front.
 
 ## Current project
 
-`xsql-deforest-divisions.py`, described above. The shape of it, in one line: **free-fly
+`xsql-canopy-3d.py`, described above, and the stated next step is pairing it with
+**imagery or a DEM**: canopy columns are heights ABOVE ground, so a terrain base
+(Mapterhorn PMTiles, reader already proven in the parked terrain notebook) would put
+them at their true elevation, and imagery under the columns has the BitmapTileLayer
+lessons in "Imagery, and why it is a tile layer" plus the Sentinel-2 data path in
+`docs/imagery-and-terrain-notes.md`. Re-read the parked-terrain section before
+building either; every deck.gl trap listed there applies.
+
+Before that, `xsql-deforest-divisions.py`. The shape of it, in one line: **free-fly
 the planet**, and everywhere the camera lands, the mean share of ground deforested
 2002-2022 as H3 hexagons and as a number per administrative division.
 
@@ -295,9 +345,11 @@ dissolves at native resolution and the outline is exact.
 
 ## Colorblind-safe rendering (hard requirement)
 
-Stephen is red-green colorblind. Never encode elevation (or anything) on a red-green
-axis. Default to **viridis / cividis** luminance ramps (viridis is already the choice
-in `s1m_viewer.py`) and lean on **extrusion height** as a redundant, non-color cue.
+Stephen has trouble seeing RED (protan-type). Never encode anything on a red-green
+axis or in red alone; green by itself is fine, and he reads mono-green luminance ramps
+(matplotlib Greens) without trouble. Default to **viridis / cividis** or single-hue
+luminance ramps (viridis is already the choice in `s1m_viewer.py`) and lean on
+**extrusion height** as a redundant, non-color cue.
 
 ## Environment
 
