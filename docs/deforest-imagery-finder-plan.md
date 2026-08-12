@@ -109,11 +109,14 @@ What moves cleanly:
 
 What is fussy, and why this stays a question rather than a plan:
 
-- **The fold needs H3 in the browser.** h3ronpy (vectorized over Arrow) has no wasm
-  story; the browser options are h3-js (Uber's emscripten transpile, scalar calls in a
-  loop over the pixel array) or compiling h3o to wasm. Whether a scalar loop over a
-  viewport's pixels (order 10^5-10^6 at these zooms) is fast enough is measurable in an
-  afternoon and should be measured before anything else.
+- **The fold needs H3 in the browser, and h3o IS the fold engine already.** h3ronpy is
+  a wrapper around h3o (Rust), and h3o is why the fold wins its benchmark (70 ms vs
+  462 ms; the archive comparison is which-H3-lives-underneath, h3o vs Uber's C). Rust
+  compiles to wasm, so the natural port is h3o-to-wasm: the same speed demon, one
+  toolchain step away. Check whether a published h3o wasm package exists before
+  building one. h3-js (the emscripten transpile of Uber's C, scalar calls in a loop)
+  is the fallback, and it is the losing library from that benchmark, so measure it
+  rather than assume it is fine: a viewport is order 10^5-10^6 pixels at these zooms.
 - **Getting folded cells into deck as geoarrow.** The Python side hands lonboard real
   Arrow tables; in the browser the equivalent is building geoarrow buffers by hand or
   taking deck.gl's H3HexagonLayer with string/bigint cell ids and eating the conversion.
@@ -124,5 +127,6 @@ What is fussy, and why this stays a question rather than a plan:
   and DuckDB-WASM could even cover the fold-side H3 call if the JS loop measures slow,
   though that trades the per-row-call overhead the Python split exists to avoid.
 
-Cheap probe: time h3-js folding a synthetic 1M-pixel viewport, then decide. The marimo
-version does not wait on this; path 1 above is a one-session experiment either way.
+Cheap probe: look for a published h3o wasm build, then time it (or h3-js as fallback)
+folding a synthetic 1M-pixel viewport, then decide. The marimo version does not wait on
+this; path 1 above is a one-session experiment either way.
