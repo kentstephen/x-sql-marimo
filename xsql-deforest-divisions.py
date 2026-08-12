@@ -68,11 +68,14 @@ magnitude (p1 7.3e-8, p50 2.1e-3, p99.9 0.45), so a linear 0-1 ramp paints a bla
 Zero takes its own dark swatch and the rest is log10 over 1e-4 to 0.5, which is p25 to
 p99.9. See the ramp cell for why zero is separated by luminance and not by hue.
 
-DRAW A BOX AND THE JOIN BECOMES A NUMBER. The ▢ button at the lower right of the map ranks
-every division inside the box you draw by its mean share deforested. It reads one H3
-resolution finer than the screen does, sizes that resolution from the BOX rather than the
-current zoom, and falls back county -> region -> country, because Overture has counties for
-only 171 of 219 countries. This is the one output here that is a figure rather than a colour.
+PRESS THE BUTTON AND THE JOIN BECOMES A NUMBER. "rank what's in view", in the controls
+under the map, ranks every division in the current view by its mean share deforested. It
+reads one H3 resolution finer than the screen does, sizes that resolution from the view
+box rather than the current zoom, and falls back county -> region -> country, because
+Overture has counties for only 171 of 219 countries. This is the one output here that is
+a figure rather than a colour. It replaced lonboard's draw-box tool, which asked the
+user to describe a region twice (camera, then rectangle); the toolbar for that tool is
+hidden from the Controls widget, since lonboard 0.16 has no Python-side switch for it.
 
 THE CAMERA ANSWERS FROM MEMORY FIRST. `view_state` fires on every frame of a drag, and any
 frame that can be served from what is already folded (a pan inside the current box, a zoom
@@ -121,13 +124,7 @@ def _():
     return (
         ArroArray,
         ArroTable,
-        BitmapTileLayer,
-        CartoBasemap,
         GeoTIFF,
-        H3HexagonLayer,
-        Map,
-        MaplibreBasemap,
-        PolygonLayer,
         S3Store,
         Window,
         XarrayContext,
@@ -137,7 +134,6 @@ def _():
         duckdb,
         from_wkb,
         gzip,
-        infer_rows_per_chunk,
         math,
         matplotlib,
         mo,
@@ -175,12 +171,25 @@ def _(duckdb):
 @app.cell
 def _(anywidget, traitlets):
     class Status(anywidget.AnyWidget):
-        """A one-line status readout the camera can write to.
+        """A one-line status readout the camera can write to, and the viewport ruler.
 
         A widget rather than `mo.md`, because the only way to update marimo output is to
         re-run the cell that produced it, and the cell holding the map is downstream of any
         state the camera could write: re-running it rebuilds the Map and throws the view
         away. A widget trait syncs straight to the browser instead.
+
+        THE RULER, AND WHY IT LIVES HERE. lonboard's view_state carries longitude,
+        latitude and zoom but NOT the canvas size, so the kernel cannot know how much
+        world the screen shows: VIEW_W/VIEW_H were assumed, and going fullscreen made
+        that assumption visibly wrong (cells folded for a 620 px band inside a 1400 px
+        screen). This widget is always mounted just below the map, and every widget
+        shares the page document, so it finds the deck canvas (the largest canvas on the
+        page), measures its CSS size, and syncs it up as `view_wh`. Remeasured on window
+        resize, on fullscreenchange (fullscreening an ELEMENT resizes no window, so a
+        resize listener alone misses it), and via a ResizeObserver on the canvas itself
+        for layout changes that are neither. Ported from the HFP notebook, where the
+        fullscreen defect was found and the trait-type and shadow-DOM lessons were paid
+        for.
         """
 
         _esm = """
@@ -189,14 +198,79 @@ def _(anywidget, traitlets):
           line.style.cssText =
             "font:12.5px ui-monospace,SFMono-Regular,Menlo,monospace;" +
             "opacity:.85;padding:.15rem 0;min-height:1.2em";
+          // The browser's OWN reading, drawn from JS with no kernel round trip. When
+          // the ruler works, this matches the px readout in the kernel's line above it;
+          // when it does not, whichever half is missing names the broken leg. An error
+          // in the measuring code lands here too instead of vanishing.
+          const probe = document.createElement("div");
+          probe.style.cssText =
+            "font:10px ui-monospace,SFMono-Regular,Menlo,monospace;opacity:.4";
           const draw = () => { line.innerHTML = model.get("value"); };
           draw();
           model.on("change:value", draw);
           el.appendChild(line);
+          // The diagnostic line, off by default. Everything still measures and syncs;
+          // this only decides whether the browser-side reading is SHOWN.
+          el.appendChild(probe);
+
+          let watched = null;
+          const ro = new ResizeObserver(() => kick());
+          // marimo puts cell output inside shadow DOM, and document.querySelectorAll
+          // does not pierce shadow roots: the deck canvas is on screen and invisible to
+          // a plain query (measured: "no canvas found" while the map was clearly
+          // there). So the search walks INTO every shadowRoot it passes.
+          const collect = (root, out) => {
+            root.querySelectorAll("canvas").forEach((c) => out.push(c));
+            root.querySelectorAll("*").forEach((n) => {
+              if (n.shadowRoot) collect(n.shadowRoot, out);
+            });
+          };
+          const send = () => {
+            try {
+              let best = null, area = 0;
+              const found = [];
+              collect(document, found);
+              found.forEach((c) => {
+                const a = c.clientWidth * c.clientHeight;
+                if (a > area) { area = a; best = c; }
+              });
+              let w, h, tag;
+              if (best) {
+                w = best.clientWidth; h = best.clientHeight; tag = "ruler ";
+                if (best !== watched) {
+                  if (watched) ro.unobserve(watched);
+                  ro.observe(best);
+                  watched = best;
+                }
+              } else {
+                // No canvas even through the shadow roots: fall back to the window,
+                // which OVERSTATES the map and costs a larger read, the cheap
+                // direction to be wrong in. A band on screen is the expensive one.
+                w = window.innerWidth; h = window.innerHeight; tag = "ruler window ";
+              }
+              if (w > 0 && h > 0) {
+                probe.textContent = tag + w + "x" + h;
+                // A string, not a number list: the only trait types this notebook has
+                // PROVEN to cross marimo's anywidget bridge are Unicode (value, down)
+                // and Bool (the Controls, up). The first ruler used List(Float) and
+                // the kernel never heard a word.
+                model.set("view_wh", w + "x" + h);
+                model.save_changes();
+              }
+            } catch (err) {
+              probe.textContent = "ruler error: " + err;
+            }
+          };
+          let t = null;
+          const kick = () => { clearTimeout(t); t = setTimeout(send, 250); };
+          window.addEventListener("resize", kick);
+          document.addEventListener("fullscreenchange", kick);
+          setTimeout(send, 500);
         }
         export default { render };
         """
         value = traitlets.Unicode("").tag(sync=True)
+        view_wh = traitlets.Unicode("").tag(sync=True)
 
     class Controls(anywidget.AnyWidget):
         """Layer switches, under the map next to the legend.
@@ -229,7 +303,47 @@ def _(anywidget, traitlets):
           check("show_cells", "hexagons");
           check("show_divisions", "boundaries");
           check("division_fill", "boundary fill");
+
+          // The ranking trigger, HERE rather than lonboard's draw-box tool. A Bool
+          // toggle, not a counter: Bool is a trait type proven to cross marimo's
+          // anywidget bridge browser -> kernel, and the kernel observer fires on any
+          // change, so flipping the value is a click.
+          const btn = document.createElement("button");
+          btn.textContent = "rank what's in view";
+          btn.style.cssText =
+            "font:12px ui-sans-serif,system-ui,sans-serif;cursor:pointer;" +
+            "padding:.15rem .6rem;border-radius:4px;border:1px solid " +
+            "rgba(127,127,127,.45);background:transparent;color:inherit";
+          btn.onclick = () => {
+            model.set("rank_view", !model.get("rank_view"));
+            model.save_changes();
+          };
+          box.appendChild(btn);
           el.appendChild(box);
+
+          // HIDE LONBOARD'S DRAW-BOX TOOL. Its toolbar is rendered unconditionally in
+          // the bundled JS (lonboard 0.16): the Map's `controls` trait governs only
+          // fullscreen/navigation/scale, so there is no Python-side switch. The button
+          // lives in lonboard's shadow root, hence the same recurse-into-shadowRoots
+          // walk the Status ruler uses; an interval rather than a one-shot because the
+          // map mounts after this widget and can be rebuilt by a cell re-run.
+          const hideBbox = (root) => {
+            let hid = false;
+            root.querySelectorAll("button[aria-label]").forEach((b) => {
+              const a = b.getAttribute("aria-label");
+              if (a === "Select BBox" || a === "Cancel drawing" ||
+                  a === "Clear bounding box") {
+                const holder = b.closest("div[style*='absolute']") || b;
+                holder.style.display = "none";
+                hid = true;
+              }
+            });
+            root.querySelectorAll("*").forEach((n) => {
+              if (n.shadowRoot) hid = hideBbox(n.shadowRoot) || hid;
+            });
+            return hid;
+          };
+          setInterval(() => hideBbox(document), 1000);
         }
         export default { render };
         """
@@ -239,6 +353,8 @@ def _(anywidget, traitlets):
         # choropleth is what it produces, so shipping it behind an unticked box meant the
         # result was invisible unless you went looking for it.
         division_fill = traitlets.Bool(True).tag(sync=True)
+        # The ranking trigger. Value is meaningless; a CHANGE is a click.
+        rank_view = traitlets.Bool(False).tag(sync=True)
 
     class Panel(anywidget.AnyWidget):
         """A block of HTML the kernel can rewrite, for the drawn-box ranking.
@@ -260,7 +376,7 @@ def _(anywidget, traitlets):
         """
         value = traitlets.Unicode("").tag(sync=True)
 
-    return Controls, Panel, Status
+    return
 
 
 @app.cell
@@ -351,9 +467,12 @@ def _(math):
     SUB_MINZOOM = {"country": 2, "region": 4, "county": 8}
 
     # ------------------------------------------------------------------ view
-    # The map's pixel size, assumed. It only sets how much of the world the viewport box
-    # covers, and PAD is loose, so being wrong by a few hundred pixels costs a slightly
-    # larger query and nothing else.
+    # The map's pixel size BEFORE the browser reports the real one. The Status widget
+    # measures the deck canvas (view_state has no width/height, so this cannot come from
+    # the camera) and overwrites HOLD["wh"]; these constants only cover the opening fold
+    # and any headless run, where no browser ever reports in. Fullscreen is the case that
+    # made the difference visible: a 620 px assumption inside a 1500 px screen folds a
+    # band, not the viewport.
     VIEW_W, VIEW_H = 1400, 620
     PAD = 1.25
 
@@ -378,24 +497,18 @@ def _(math):
     HOME = {"longitude": -20.0, "latitude": 0.0, "zoom": 2.4}
     return (
         COG,
-        DIVISION_LABEL,
         FETCH_AT_ONCE,
         FILL_ALPHA,
         HOME,
         LEVEL_FOR_RES,
         LINE_ALPHA,
         MAX_RES,
-        PAD,
         PM_BUCKET,
         PM_PATH,
-        SETTLE,
         SOURCE_BUCKET,
         SUB_MINZOOM,
         TILE,
         TILE_BUDGET,
-        VIEW_H,
-        VIEW_W,
-        division_for_zoom,
         res_for_zoom,
     )
 
@@ -468,7 +581,7 @@ def _(matplotlib, np):
         (2.5e-1, "25%"),
         (5e-1, "50%+"),
     ]
-    return STOPS, ramp, ramp_rgba
+    return ramp, ramp_rgba
 
 
 @app.cell
@@ -478,9 +591,10 @@ def _():
     # its opening view_state and the camera would snap home on every pan. A plain dict is
     # invisible to the dataflow graph.
     HOLD = {
+        "wh": (1400.0, 620.0),  # the real canvas size, measured by Status; this is the seed
         "fold": None,  # the SQL fold, set by the read cell
         "zonal": None,  # cells -> division means, set by the read cell
-        "rank": None,  # drawn box -> divisions ranked, set by the read cell
+        "rank": None,  # view box -> divisions ranked, set by the read cell
         "res": None,  # H3 resolution currently on screen
         "box": None,  # padded degree box the current cells cover
         "div": None,  # division subtype currently on screen
@@ -1302,7 +1416,7 @@ def _(
         stroked=False,
         high_precision=True,
         coverage=1,
-        opacity=0.7,
+        opacity=0.5,
         pickable=True,
     )
 
@@ -1347,7 +1461,7 @@ def _(
         tile_size=512,
         max_zoom=19,
         min_zoom=0,
-        opacity=0.8,
+        opacity=0.6,
         pickable=False,
     )
 
@@ -1367,6 +1481,7 @@ def _(
             HOLD[_t].cancel()
         HOLD[_t] = None
     HOLD["busy"], HOLD["pending"] = False, None
+    HOLD["wh"] = (float(VIEW_W), float(VIEW_H))
     HOLD["res"], HOLD["box"], HOLD["div"] = None, None, None
     HOLD["divpair"], HOLD["divbox"], HOLD["vs"] = None, None, None
     HOLD["head"], HOLD["tail"] = "", ""
@@ -1378,11 +1493,17 @@ def _(
         Web Mercator: the horizontal span is a straight function of zoom, and the vertical
         span is that scaled by the aspect ratio and by cos(latitude), because a degree of
         longitude narrows toward the poles.
+
+        The size comes from HOLD["wh"], which is the MEASURED canvas, not the old
+        VIEW_W/VIEW_H guess: view_state has no width or height in it, so the Status
+        widget rulers the deck canvas in the browser and syncs it up. Fullscreen was
+        where the guess failed visibly.
         """
         import math as _m
 
-        span = 360.0 * VIEW_W / (512 * 2**vs.zoom)
-        lat_span = span * (VIEW_H / VIEW_W) * _m.cos(_m.radians(vs.latitude))
+        vw, vh = HOLD["wh"]
+        span = 360.0 * vw / (512 * 2**vs.zoom)
+        lat_span = span * (vh / vw) * _m.cos(_m.radians(vs.latitude))
         return (
             max(-180.0, vs.longitude - span / 2),
             max(-85.0, vs.latitude - lat_span / 2),
@@ -1426,8 +1547,18 @@ def _(
         Kept separate from the read because most camera moves read nothing, and the zoom
         readout still has to move: zooming IN always lands inside the box the last read
         covered, so without this the line would freeze exactly when the map is busiest.
+
+        THE VIEWPORT DIAGNOSTICS ARE ENABLED, matching the HFP notebook, where the
+        fullscreen defect has been seen again since the ruler landed and is not yet
+        closed. The px readout below is the kernel's half (1400x620 that never moves
+        means the browser has not reported in); el.appendChild(probe) in Status._esm is
+        the browser's half, no kernel involved. The two disagreeing names the broken
+        leg. Comment both out once the defect is closed.
         """
-        status.value = f"{HOLD['head']}{HOLD['tail']} · zoom {vs.zoom:.1f}"
+        status.value = (
+            f"{HOLD['head']}{HOLD['tail']} · zoom {vs.zoom:.1f}"
+            f" · {HOLD['wh'][0]:.0f}x{HOLD['wh'][1]:.0f}px"
+        )
 
     def put_cells(tbl):
         cells._rows_per_chunk = max(1, infer_rows_per_chunk(tbl))
@@ -1465,6 +1596,36 @@ def _(
                 put_divisions(HOLD["divpair"])
 
     controls.observe(_on_controls, names=["show_cells", "show_divisions", "division_fill"])
+
+    def _on_wh(change):
+        """The canvas changed size: fullscreen, a window resize, a layout shift.
+
+        The measured size replaces the guess, and if the box already folded no longer
+        covers what the bigger canvas now shows, the same path a camera move takes will
+        refold it. Sub-25 px jitter is ignored: PAD absorbs it, and a ResizeObserver
+        will happily fire on a 1 px scrollbar appearing.
+        """
+        try:
+            wh = [float(v) for v in str(change["new"]).split("x")]
+        except ValueError:
+            return
+        if len(wh) != 2 or wh[0] <= 0 or wh[1] <= 0:
+            return
+        old = HOLD["wh"]
+        HOLD["wh"] = (wh[0], wh[1])
+        vs = HOLD["vs"]
+        if vs is not None:
+            set_status(vs)  # the px readout is the ruler's proof of life
+        if abs(wh[0] - old[0]) < 25 and abs(wh[1] - old[1]) < 25:
+            return
+        if vs is None:
+            return
+        if HOLD["busy"]:
+            HOLD["pending"] = vs
+        elif not _instant(vs):
+            HOLD["task"] = _spawn(refresh(vs))
+
+    status.observe(_on_wh, names="view_wh")
 
     def _instant(vs):
         """Everything answerable without a read, done synchronously in the comm handler.
@@ -1625,19 +1786,19 @@ def _(
 
     deck.observe(_on_camera, names="view_state")
 
-    # ---------------------------------------------------------------- the drawn box
-    # Draw a box with the ▢ button at the lower right of the map and the divisions inside it
-    # come back ranked, below. This is the one place the join produces a NUMBER rather than a
-    # colour, and it is deliberately not tied to the camera: the box is an explicit ask, so
-    # it reads one level FINER than the screen and it names the divisions outright.
+    # ---------------------------------------------------------------- the ranking
+    # Press "rank what's in view" in the controls and the divisions on screen come back
+    # ranked, below. This is the one place the join produces a NUMBER rather than a
+    # colour. The box is the view itself, but the READ is still an explicit ask: it goes
+    # one level FINER than the screen and it names the divisions outright.
     RANK_N = 25
 
     def rank_html(out):
         if out is None:
             return (
                 "<div style='font:12.5px ui-monospace,SFMono-Regular,Menlo,monospace;"
-                "opacity:.75;padding:.5rem 0'>No division in that box caught a cell centre. "
-                "Draw a larger box, or zoom in first.</div>"
+                "opacity:.75;padding:.5rem 0'>No division in view caught a cell centre. "
+                "Zoom out for larger divisions, or in for finer cells.</div>"
             )
         sub, res, tbl, n_small = out
         names = tbl["name"].to_pylist()
@@ -1669,7 +1830,7 @@ def _(
                 f"</tr>"
             )
         head = (
-            f"<b>{len(names):,} {DIVISION_LABEL[sub]} in the box</b>, ranked by mean share "
+            f"<b>{len(names):,} {DIVISION_LABEL[sub]} in view</b>, ranked by mean share "
             f"deforested 2002-2022, measured at H3 res {res}"
             + (
                 f" · <span style='color:#E69F00'>{n_small} too small to measure</span>"
@@ -1689,14 +1850,24 @@ def _(
             "<table style='border-collapse:collapse'>" + "".join(rows) + "</table></div>"
         )
 
-    def _on_select(change):
-        b = change["new"]
-        if not b:
-            return  # a fresh Map resets selected_bounds to None
-        box = tuple(float(v) for v in b)
+    def _on_rank_view(change):
+        """The ranking, for WHAT IS ON SCREEN. Replaces lonboard's draw-box tool.
+
+        The drawn box asked the user to describe a region twice: once with the camera
+        and again with a rectangle. The button keeps the camera as the only statement
+        of intent: the ranked box is exactly the view, through the same view_to_bbox
+        the fold uses. The Bool's value carries nothing; any change is a click.
+        """
+        vs = HOLD["vs"]
+        if vs is None:
+            # No camera event yet: the map still shows HOME, so rank that.
+            from types import SimpleNamespace
+
+            vs = SimpleNamespace(**HOME)
+        box = view_to_bbox(vs)
         ranking.value = (
             "<div style='font:12.5px ui-monospace,SFMono-Regular,Menlo,monospace;"
-            "opacity:.7;padding:.5rem 0'><b>ranking</b> the divisions in that box…</div>"
+            "opacity:.7;padding:.5rem 0'><b>ranking</b> the divisions in view…</div>"
         )
 
         async def go():
@@ -1712,7 +1883,7 @@ def _(
 
         HOLD["seltask"] = _spawn(go())
 
-    deck.observe(_on_select, names="selected_bounds")
+    controls.observe(_on_rank_view, names="rank_view")
 
     # The legend, built from the same `ramp` the layers use, so a colour on the map and a
     # colour in the key cannot drift apart. The division fill uses the same ramp at a lower
@@ -1730,6 +1901,7 @@ def _(
         "<b style='margin-right:.7rem'>share of cell deforested 2002-2022</b>"
         f"{_sw}</div>"
     )
+    
     return controls, deck, legend, ranking, refresh, status
 
 
@@ -1746,7 +1918,6 @@ async def _(
     SOURCE_BUCKET,
     TILE,
     TILE_BUDGET,
-    VIEW_W,
     Window,
     XarrayContext,
     asyncio,
@@ -2025,22 +2196,22 @@ async def _(
         )
 
     async def rank(box):
-        """Every division inside a drawn box, with its mean, for the ranking below the map.
+        """Every division inside the ranked box, with its mean, for the panel below the map.
 
         Returns (subtype, resolution, table, divisions with no number) or None.
 
         THREE THINGS THIS DOES NOT SHARE WITH THE CAMERA, AND WHY.
-        1. It reads ONE RESOLUTION FINER than the screen would. A drawn box is an explicit
+        1. It reads ONE RESOLUTION FINER than the screen would. The button is an explicit
            question about a specific place, so it is worth a read the camera would not
            spend, and the finer the cells the fewer divisions fall through the 'center' rule.
-        2. It derives that resolution from the BOX, not from the current zoom, so a small box
-           drawn on a wide view still gets measured properly.
+        2. It derives that resolution from the BOX, not from the camera's zoom trait, so
+           the two cannot drift.
         3. It falls back county -> region -> country. Overture has counties for 171 of 219
            countries, so a box over the other 48 would otherwise come back empty rather than
            answering at the finest level that exists there.
         """
         span = max(box[2] - box[0], 1e-9)
-        z = math.log2(360.0 * VIEW_W / (512 * span))
+        z = math.log2(360.0 * HOLD["wh"][0] / (512 * span))
         res = min(MAX_RES, res_for_zoom(z) + 1)
         raw, _fetched, _skipped = await fold(res, box)
         if raw is None or raw.num_rows == 0:
@@ -2083,8 +2254,8 @@ def _(controls, deck, legend, mo, ranking, status):
                 "A division's value is the mean over the H3 cells whose CENTRE falls "
                 "inside it, so divisions smaller than one cell at the current resolution "
                 "are drawn unfilled rather than given a number. "
-                "**Draw a box** with the ▢ button at the lower right of the map to rank "
-                "the divisions inside it."
+                "**Press \"rank what's in view\"** in the controls above to rank the "
+                "divisions on screen."
             ),
             ranking,
         ]
