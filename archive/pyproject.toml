@@ -40,6 +40,7 @@ dependencies = [
     "shapely>=2.1.2",
     "xarray",
     "xarray-sql>=0.3.2",
+    "zarr>=3.1",
 ]
 
 # The SurfaceLayer notebooks (xsql-naip-drape.py, xsql-s1m-surface.py, xsql-naip-tiles.py)
