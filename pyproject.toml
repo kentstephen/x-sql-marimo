@@ -11,6 +11,7 @@ requires-python = ">=3.13"
 #
 #   xsql-deforest-divisions.py   adds async-geotiff (the COG reader)
 #   xsql-firerisk-buildings.py   adds zarr          (the pyramid reader)
+#   xsql-terrain-3d.py           adds pillow        (the terrarium WebP decode)
 dependencies = [
     "anywidget>=0.9",
     "arro3-core",
@@ -24,6 +25,7 @@ dependencies = [
     "matplotlib==3.11.1",
     "numpy==2.5.1",
     "obstore>=0.9.2",
+    "pillow>=11",
     "pyarrow>=25.0.0",
     "xarray",
     "xarray-sql>=0.3.2",

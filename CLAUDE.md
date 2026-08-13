@@ -193,6 +193,45 @@ water instead of fire, with the raster replaced by vector polygons. Things to kn
   Debug against the browser console; the earcut-pool cascade recorded above is what
   a dead deck looks like and is NOT evidence about which layer is at fault.
 
+`xsql-terrain-3d.py` (EXPERIMENTAL, open defects below) draws Mapterhorn terrain
+worldwide as extruded H3 columns: the DEM half of the parked
+`archive/xsql-duckdb-terrain-h3.py` standing alone, on the canopy notebook's chassis
+(ruler Status widget, camera machinery, `_instant`/`refresh`). No DuckDB, no pyproj;
+the fold is xarray-sql + the h3 UDF, `avg(elev)` per cell. Things to know:
+
+- **Two archive tiers, one reader.** `planet.pmtiles` (z0-12) serves everything up to
+  res 11; res 12 and 13 route to the regional `6-{x}-{y}.pmtiles` archives (z13-18,
+  z17 over flat country, 457 land-only files; an ocean key is an ABSENT OBJECT, not
+  an empty archive). The PMTiles client is the parked notebook's, generalised to
+  archive-per-path (`_pm_open`); a tile at z > 12 belongs to the regional archive at
+  `(x >> (z-6), y >> (z-6))`, opened lazily as a task per key. res 12 reads z14
+  (~23 px/hex), res 13 reads z15 (~13 px/hex).
+- **No bathymetry, measured.** Open-ocean tiles are absent from ~z6 up; where ocean
+  exists at coarse zooms it reads ~0 m (mid-Pacific z4: 99.7% of pixels within 1 m of
+  zero). The fold drops `|elev| <= 1` and `elev <= -500`; Death Valley (-86) and the
+  Dead Sea shore (-430) survive as signed metres.
+- **Pitch eats the padding AND the resolution.** `_pad` extends the fold box toward
+  the horizon along the bearing (anisotropic, unlike the parked notebook's symmetric
+  9x overread), and pitch >= 35 folds one H3 step coarser to pay for it. `_same_view`
+  includes pitch/bearing, and coverage is gated by `_cam_ok`, or tilting past the
+  folded trapezoid leaves a band of missing cells at the horizon (seen in fullscreen
+  over Tibet before the fix).
+- **The ladder** is BASE_RES 7 / ZOOM0 6.2 / PER_RES 1.4, MIN_RES 4, MAX_RES 13, plus
+  a `res` +/- 2 slider offset in the panel. The scale opens at a FIXED 20x at every
+  zoom; the auto button fits relief to ~1.5 hexagon edges (the parked rule) and the
+  same button resets to 20. `RAMP["name"]` in the ramp cell is the one-word colormap
+  seam; reverse serves the matplotlib `_r` twin, and repaints are generation-counted
+  (`RAMP["gen"]`) so stale cached tables recolour lazily on serve.
+- **OPEN DEFECTS AND NEXT WORK, dictated at session end:** (1) reverse cmap is STILL
+  extremely slow even after the colours-only/lazy rework; the recolor design "doesn't
+  add value"; candidate fix is deleting it in favour of the ordinary serve path (or
+  the button entirely), and nobody has profiled where the time actually goes.
+  (2) The res-to-zoom ratio "isn't right, doesn't look good yet". (3) Auto scale
+  fits to ~25 px of relief and reads flat next to the 20x default. (4) Planned next:
+  RELATIVE COLOURS, the ramp normalised to what's in view; requires (1) solved,
+  since it repaints every fold. (5) res 12/13 regional reads are probed but not yet
+  exercised interactively.
+
 None of the notebooks import anything from `archive/`: their only dependencies are the
 third-party ones in their PEP 723 headers.
 
