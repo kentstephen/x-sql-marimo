@@ -230,7 +230,9 @@ the fold is xarray-sql + the h3 UDF, `avg(elev)` per cell. Things to know:
   fits to ~25 px of relief and reads flat next to the 20x default. (4) Planned next:
   RELATIVE COLOURS, the ramp normalised to what's in view; requires (1) solved,
   since it repaints every fold. (5) res 12/13 regional reads are probed but not yet
-  exercised interactively.
+  exercised interactively. (6) The res offset slider is "a little glitchy" (his
+  words); the stepped-stops pattern here fires on change with a live caption, so
+  suspect the caption/thumb sync or the refold landing mid-drag.
 
 None of the notebooks import anything from `archive/`: their only dependencies are the
 third-party ones in their PEP 723 headers.

@@ -280,7 +280,7 @@ def _(anywidget, traitlets):
           rcap.style.cssText = "opacity:.7;white-space:nowrap";
           const roff = () => Number(model.get("res_off"));
           const rdraw = (v) =>
-            { rcap.textContent = "res " + (v > 0 ? "+" + v : v); };
+            { rcap.textContent = "res offset " + (v > 0 ? "+" + v : v); };
           const rs = document.createElement("input");
           rs.type = "range";
           rs.min = "0"; rs.max = String(ROFFS.length - 1); rs.step = "1";
