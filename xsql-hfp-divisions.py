@@ -18,13 +18,23 @@
 #     "matplotlib==3.11.1",
 # ]
 # ///
-"""Global deforestation 2002-2022, folded to H3 and joined onto Overture divisions.
+"""Global human footprint 2021, folded to H3 and joined onto Overture divisions.
 
-Vizzuality's `deforest_100m_cog.tif` is one 5.7 GB COG covering the planet at 100 m. Its
-value is the PORTION OF EACH CELL deforested between 2002 and 2022: an intensive 0-1
-quantity. That single fact decides most of this notebook. A portion can be averaged at any
-scale, so `mean()` is valid at every H3 resolution and the COG's averaged overview pyramid
-is legitimate rather than a lie. No majority vote, no mode, no class fold.
+Vizzuality's HFP-100 (`hfp_2021_100m_v1-2_cog.tif`) is one 14 GB COG covering the planet
+at 100 m. Its value is the HUMAN FOOTPRINT INDEX, 0-50: the summed pressure of built land,
+cropland, pasture, population, night lights, roads, railways and navigable rivers on each
+hectare (stored uint16 x1000, nodata 65535). An index that sums intensities is intensive,
+so `mean()` is valid at every H3 resolution, and the COG's overview pyramid AVERAGES
+(verified: over one window the mean survives an 8x downsample, 15.135 -> 15.150, while the
+max collapses 51.2 -> 45.9). No majority vote, no mode, no class fold.
+
+This is the deforestation notebook's machinery pointed at a different raster, and the two
+differences are the whole diff. First, HFP-100 is in WORLD MOLLWEIDE (ESRI:54009), not
+EPSG:4326: the viewport box is forward-projected to find the pixel window, and each
+pixel centre is inverse-projected to feed the H3 fold. Both directions are closed-form
+spherical formulas on R=6378137, a dozen lines of numpy, no pyproj. Second, ZERO IS KEPT:
+36.7% of land scores exactly 0 and that is the point, untouched ground, where the
+deforestation notebook's zero was ocean and was dropped.
 
 WHAT EACH ENGINE DOES:
 
@@ -49,29 +59,27 @@ lines than the dependency. Tile geometry is quantized to ~2.4 m at z12 and clipp
 tile edges; the polyfill is 'center'-ruled at res 4-8 (cells 460 m and up), so the cells
 land identically, and the dissolve below removes the clip edges before anything is drawn.
 
-WHY H3 IS NOT JUST A DEMO STEP. The COG is EPSG:4326, so its pixels are not equal area: a
-100 m pixel at the equator covers about twice the ground of one at 60 degrees. Averaging
-pixels directly over a country spanning many latitudes overweights its poleward end. H3
-cells are near-equal-area, so folding to H3 and then averaging CELLS equally is an
-area-weighted mean almost for free. Pixel count weights WITHIN a cell (a coastal cell is
-mostly NaN ocean and should not count as a full one); cells are equal-weighted within a
-division. Two weightings, each correcting a different bias.
+WHY H3 STILL MATTERS UNDER AN EQUAL-AREA CRS. Mollweide pixels are a true hectare
+everywhere, so the latitude bias the deforestation notebook used H3 to remove does not
+exist here. What remains is the join: cells are the unit the divisions machinery fills,
+ranks and draws, and pixel count still weights WITHIN a cell (a coastal cell is mostly
+NaN ocean and should not count as a full one).
 
-THE COG IS SPARSE AND async-geotiff DOES NOT KNOW IT. 73.6% of full-resolution tiles have
+THE COG IS SPARSE AND async-geotiff DOES NOT KNOW IT. 65.7% of full-resolution tiles have
 offset 0 and length 0, because ocean is not stored, and a read touching one issues a byte
 range 0..0 and raises `Invalid range requested, start: 0 end: 0`. Reading on the COG's own
 512 px tile grid and consulting `ifd.tile_byte_counts` first turns that from a crash into
 a speedup: an empty tile is NaN with no request at all.
 
-COLOUR. 69.6% of res-4 cells are exactly zero and the nonzero values span nine orders of
-magnitude (p1 7.3e-8, p50 2.1e-3, p99.9 0.45), so a linear 0-1 ramp paints a blank world.
-Zero takes its own dark swatch and the rest is log10 over 1e-4 to 0.5, which is p25 to
-p99.9. See the ramp cell for why zero is separated by luminance and not by hue.
+COLOUR. The land distribution is heavily bottom-loaded (p50 1.0, p75 5.5, p99 23.4, max
+~51, measured globally at L7), so a linear 0-50 ramp lights only the cities. The ramp is
+log1p over 0-40: zero sits at the dark end of cividis as the bottom of a continuum, not a
+dropped case. See the ramp cell.
 
 PRESS THE BUTTON AND THE JOIN BECOMES A NUMBER. "rank what's in view", in the controls
-under the map, ranks every division in the current view by its mean share deforested. It
-reads one H3 resolution finer than the screen does, sizes that resolution from the view
-box rather than the current zoom, and falls back county -> region -> country, because
+under the map, ranks every division in the current view by its mean footprint. It reads
+one H3 resolution finer than the screen does, sizes that resolution from the view box
+rather than the current zoom, and falls back county -> region -> country, because
 Overture has counties for only 171 of 219 countries. This is the one output here that is
 a figure rather than a colour. It replaced lonboard's draw-box tool, which asked the
 user to describe a region twice (camera, then rectangle); the toolbar for that tool is
@@ -82,8 +90,10 @@ frame that can be served from what is already folded (a pan inside the current b
 back to a resolution already visited) is answered synchronously in the comm handler. Only a
 view that genuinely needs bytes goes through the debounce. See `_instant`.
 
-Data: Vizzuality / LandGriffon, CC-BY 4.0, on source.coop. Boundaries: Overture Maps.
-Run:  uv run marimo edit xsql-deforest-divisions.py --sandbox
+Data: Vizzuality / Impact Observatory HFP-100 v1.2, CC-BY 4.0, on source.coop. Years
+2017-2021 are published; YEAR below picks one and is the seam a year slider would use.
+Boundaries: Overture Maps.
+Run:  uv run marimo edit xsql-hfp-divisions.py --sandbox
 """
 
 import marimo
@@ -124,7 +134,13 @@ def _():
     return (
         ArroArray,
         ArroTable,
+        BitmapTileLayer,
+        CartoBasemap,
         GeoTIFF,
+        H3HexagonLayer,
+        Map,
+        MaplibreBasemap,
+        PolygonLayer,
         S3Store,
         Window,
         XarrayContext,
@@ -134,6 +150,7 @@ def _():
         duckdb,
         from_wkb,
         gzip,
+        infer_rows_per_chunk,
         math,
         matplotlib,
         mo,
@@ -187,9 +204,7 @@ def _(anywidget, traitlets):
         page), measures its CSS size, and syncs it up as `view_wh`. Remeasured on window
         resize, on fullscreenchange (fullscreening an ELEMENT resizes no window, so a
         resize listener alone misses it), and via a ResizeObserver on the canvas itself
-        for layout changes that are neither. Ported from the HFP notebook, where the
-        fullscreen defect was found and the trait-type and shadow-DOM lessons were paid
-        for.
+        for layout changes that are neither.
         """
 
         _esm = """
@@ -376,55 +391,69 @@ def _(anywidget, traitlets):
         """
         value = traitlets.Unicode("").tag(sync=True)
 
-    return
+    return Controls, Panel, Status
 
 
 @app.cell
 def _(math):
     # ------------------------------------------------------------------ the raster
     SOURCE_BUCKET = "us-west-2.opendata.source.coop"
-    COG = "vizzuality/lg-land-carbon-data/deforest_100m_cog.tif"
+    # 2017-2021 are published, identical in shape. This constant is the year seam.
+    YEAR = 2021
+    COG = f"vizzuality/hfp-100/hfp_{YEAR}_100m_v1-2_cog.tif"
 
     # The COG's own tile size, at every level. Reading on this grid is what makes a read
     # shareable between viewports AND what lets the sparse-tile check work, since a tile is
     # the unit that is either present or absent.
     TILE = 512
     FETCH_AT_ONCE = 32  # tiles are only faster than one ranged read if they fly together
-    TILE_BUDGET = 256 * 1024 * 1024  # float32, so ~1,000 tiles resident
+    # 512 MB, not the deforestation notebook's 256: the ladder here starts at res 5, so
+    # the opening world view alone holds ~253 L5 tiles (~253 MB, sparse ocean included,
+    # since a skipped tile still caches as a NaN block), and a budget the size of one
+    # window would evict everything else on every world look.
+    TILE_BUDGET = 512 * 1024 * 1024
 
     # WHICH OVERVIEW EACH H3 RESOLUTION READS. The pyramid is 100 m native and doubles ten
     # times: L0 100 m, L1 200, L2 400, L3 800, L4 1.6 km, L5 3.2, L6 6.4, L7 12.8, L8 25.6,
-    # L9 51, L10 102.
+    # L9 51, L10 102. Same geometry as the deforestation COG, and Mollweide pixels are
+    # TRUE areas, so the pixels-per-cell arithmetic below is exact rather than equatorial.
     #
-    # Chosen so 20-80 pixels sit under every cell: enough for a mean to mean something,
-    # without reading pixels the cell will only average away.
+    # Chosen so ~20-80 pixels sit under every cell: enough for a mean to mean something,
+    # without reading pixels the cell will only average away. Res 9 is the exception and
+    # the ceiling: it reads the FULL-RESOLUTION level at ~10 px per cell, and there is
+    # nothing finer to read, so the ladder ends there.
     #   res 4 (1,770 km2) / L6 (40.7 km2)  = 43 px
     #   res 5 (  253 km2) / L5 (10.2 km2)  = 25 px
     #   res 6 ( 36.1 km2) / L3 (0.64 km2)  = 56 px
     #   res 7 ( 5.16 km2) / L2 (0.16 km2)  = 32 px
     #   res 8 (0.737 km2) / L1 (0.04 km2)  = 18 px
+    #   res 9 (0.105 km2) / L0 (0.01 km2)  = 10 px
     #
     # Reading an overview is only equivalent to reading pixels if the pyramid AVERAGES, and
-    # that was verified rather than assumed: over one 1-degree box the mean survives a 64x
-    # downsample (0.2260 -> 0.2342) while the max collapses (1.0 -> 0.65) and the
-    # exact-zero fraction goes 62% -> 0%. That is the signature of average resampling.
-    LEVEL_FOR_RES = {4: 6, 5: 5, 6: 3, 7: 2, 8: 1}
+    # that was verified rather than assumed, same discipline as the deforestation COG: over
+    # one window (0-10E, 45-50N) the mean survives an 8x downsample (L3 15.135 -> L6
+    # 15.150) while the max collapses (51.2 -> 45.9). That is the signature of average
+    # resampling.
+    LEVEL_FOR_RES = {4: 6, 5: 5, 6: 3, 7: 2, 8: 1, 9: 0}
 
     # ------------------------------------------------------------------ the zoom ladder
     # One H3 resolution per 1.4 zoom levels, because each H3 step is 2.65x linear and
     # log2(2.65) = 1.4. That keeps a hexagon a constant size ON SCREEN.
     #
+    # BASE_RES 5, ONE STEP FINER THAN THE DEFORESTATION NOTEBOOK FROM ZOOM 4 UP: smaller
+    # hexagons at every working zoom. The world view is the exception, carved out by
+    # MIN_RES below.
+    #
     # math.floor, NOT int(): int truncates toward zero, so every zoom below ZOOM0 would
     # collapse onto BASE_RES instead of continuing down to MIN_RES.
-    ZOOM0, PER_RES, BASE_RES = 4.0, 1.4, 4
-    MIN_RES, MAX_RES = 4, 8
+    ZOOM0, PER_RES, BASE_RES = 4.0, 1.4, 5
+    # MIN_RES 4, not 5: fully zoomed out was folding ~475k res 5 cells from L5 and it
+    # was slow on screen. Below zoom ~2.6 the ladder now bottoms out at res 4 (~70k
+    # cells, read from L6); every rung from res 5 up is unchanged.
+    MIN_RES, MAX_RES = 4, 9
 
     def res_for_zoom(z):
         return max(MIN_RES, min(MAX_RES, BASE_RES + math.floor((z - ZOOM0) / PER_RES)))
-
-    # RES 4 COMFORTABLY DRAWS THE WHOLE PLANET: H3 res 4 is 288,122 cells globally, of
-    # which ~224k carry data. Measured world fold at res 4: 15.7M pixels read in 821 ms
-    # (68 tiles fetched, 10 skipped as sparse), folded in 282 ms.
 
     # WHICH DIVISION LEVEL IS DRAWN AT WHICH ZOOM, AND WHY THERE IS NONE AT THE TOP.
     #
@@ -432,26 +461,33 @@ def _(math):
     # Under GeoParquet that was forced (a world view of countries meant reading most of
     # 5.5 GB to find 219 rows); under PMTiles a world of countries is 16 tiles at z2 and
     # the constraint is gone. The band is kept as a design choice: at the opening zoom
-    # the map is about where deforestation IS, and country outlines over it answer a
+    # the map is about where pressure IS, and country outlines over it answer a
     # question nobody has asked yet. Lower DIV_ZOOM if that reading changes.
     #
     # Overture has counties for 171 of 219 countries, so the county band is genuinely empty
     # in places rather than merely sparse.
     DIV_ZOOM = 4.5
 
-    # TODO: a fourth band, `locality`, above roughly zoom 9.5. The tileset carries
-    # localities from z10, so under PMTiles the cost question is already answered; what
-    # remains is the meaning question. A locality boundary is a settlement, so most of a
-    # drawn box would fall outside every polygon and the ranking would describe the towns
-    # rather than the ground. Decide that before adding the band.
+    # The locality band, the old TODO, is IN: fully zoomed in, the finest divisions the
+    # tileset has. The meaning caveat stands and is accepted: a locality boundary is a
+    # settlement, so unincorporated ground between towns has no polygon and the
+    # choropleth is honestly patchy there. The ranking describes the towns in view at
+    # that depth, which at that depth is what a viewer is looking at.
     def division_for_zoom(z):
         if z < DIV_ZOOM:
             return None
         if z < 7.0:
             return "region"
-        return "county"
+        if z < 9.5:
+            return "county"
+        return "locality"
 
-    DIVISION_LABEL = {"country": "countries", "region": "regions", "county": "counties"}
+    DIVISION_LABEL = {
+        "country": "countries",
+        "region": "regions",
+        "county": "counties",
+        "locality": "localities",
+    }
 
     # ------------------------------------------------------------------ boundaries
     # Overture's own PMTiles build of the same release the GeoParquet path used to read.
@@ -464,7 +500,7 @@ def _(math):
     # tiles themselves (probe: Rondonia, Iowa, Congo, z2-z10), not documented anywhere:
     # Planetiler's minzoom rules are baked into the build. Every subtype persists from its
     # floor up to z12, so these are floors for the zoom picker, not bands.
-    SUB_MINZOOM = {"country": 2, "region": 4, "county": 8}
+    SUB_MINZOOM = {"country": 2, "region": 4, "county": 8, "locality": 10}
 
     # ------------------------------------------------------------------ view
     # The map's pixel size BEFORE the browser reports the real one. The Status widget
@@ -491,68 +527,70 @@ def _(math):
     # toggled off; the RGB underneath is the same ramp either way.
     LINE_ALPHA = 205
 
-    # Opens on the tropics, because that is where the data is: the Amazon, the Congo basin
-    # and insular southeast Asia are the three places a 2002-2022 deforestation layer has
-    # anything dramatic to say, and all three are in view from here.
-    HOME = {"longitude": -20.0, "latitude": 0.0, "zoom": 2.4}
+    # Opens on the Europe-Africa-India band, because that is where the index shows its
+    # whole range in one view: the Sahara and the Congo basin near 0, the Nile valley,
+    # Europe and the Ganges plain pushing 30+. The world view is affordable because
+    # MIN_RES 4 catches it (see the ladder above).
+    HOME = {"longitude": 20.0, "latitude": 18.0, "zoom": 2.4}
     return (
         COG,
+        DIVISION_LABEL,
         FETCH_AT_ONCE,
         FILL_ALPHA,
         HOME,
         LEVEL_FOR_RES,
         LINE_ALPHA,
         MAX_RES,
+        PAD,
         PM_BUCKET,
         PM_PATH,
+        SETTLE,
         SOURCE_BUCKET,
         SUB_MINZOOM,
         TILE,
         TILE_BUDGET,
+        VIEW_H,
+        VIEW_W,
+        division_for_zoom,
         res_for_zoom,
     )
 
 
 @app.cell
 def _(matplotlib, np):
-    # THE LOG RAMP.
+    # THE LOG1P RAMP.
     #
-    # 69.6% of res-4 cells are exactly zero and the nonzero part spans nine orders of
-    # magnitude, so a linear 0-1 ramp is a blank map. LO..HI is p25..p99.9 of the nonzero
-    # values, which spends the whole ramp on the part of the data that varies.
-    LO, HI = 1e-4, 0.5
-
-    # THE ZERO SWATCH IS SEPARATED BY LUMINANCE, NOT HUE, AND THAT IS FORCED.
+    # The land distribution is bottom-loaded: p50 1.0, p75 5.5, p99 23.4, max ~51,
+    # measured globally at L7. A linear 0-50 ramp lights only the cities; a pure log
+    # cannot hold zero at all, and 36.7% of land IS exactly zero. log1p does both:
+    # t = log(1 + v) / log(1 + HI), so zero sits at t = 0 and the low end (0-5, where
+    # most of the world lives) gets most of the ramp.
     #
-    # The obvious flat neutral grey (78, 80, 84) lands at luminance 0.313, and the 0.1%
-    # stop of full-range cividis lands at 0.318. Measured, not guessed: "none" and "0.1%"
-    # came out the same colour, which is the worst thing this legend could do given zero is
-    # the majority case. Hue cannot fix it, because the entire point of cividis is that hue
-    # carries no information. So the ramp's floor is LIFTED off the bottom of cividis and
-    # zero takes the dark end alone.
+    # ZERO IS IN THE RAMP, NOT A SEPARATE SWATCH, and that is the opposite of the
+    # deforestation notebook's choice, deliberately. There zero was dropped ocean; here
+    # zero is untouched land, the bottom of a continuum, and a score of 0 against a score
+    # of 0.5 is a smaller distinction than "none against some". The dark swatch is kept
+    # only for NaN, which after the fold's `v = v` filter never reaches the screen.
     #
-    # FLOOR = 0.25 truncates cividis to its upper 75%, putting the ramp's darkest colour at
-    # luminance 0.305 against the zero swatch's 0.156. Nothing is lost: the ramp still
-    # spans 0.305 -> 0.874, more luminance range than most sequential maps get.
+    # HI = 40 rather than 50: p99.9 is 35.0, so the top fifth of the nominal scale holds
+    # nothing and would waste ramp on it. Values above HI clip into the top colour.
     #
     # cividis rather than viridis: both are colourblind-safe, but cividis is built for it.
     # It is strictly two-hue (blue -> yellow) and monotonic in luminance, and a deuteranope
-    # simulation of these exact stops is monotonic too, so the ORDER survives, which is the
-    # only thing a sequential ramp has to promise.
-    FLOOR = 0.25
-    ZERO_RGB = (38, 40, 44)
-    _CIVIDIS = matplotlib.colormaps["cividis"]
+    # simulation is monotonic too, so the ORDER survives, which is the only thing a
+    # sequential ramp has to promise.
+    HI = 40.0
+    ZERO_RGB = (38, 40, 44)  # NaN only; see above
+    _RAMP = matplotlib.colormaps["inferno"]
 
     def ramp(v):
-        """portion -> uint8 RGB, with exact zero (and NaN) taking the dark swatch."""
+        """footprint 0-50 -> uint8 RGB, log1p-stretched; NaN takes the dark swatch."""
         v = np.asarray(v, dtype="float64")
-        live = np.isfinite(v) & (v > 0)
+        live = np.isfinite(v)
         t = np.zeros(v.shape)
         if live.any():
-            t[live] = (np.log10(np.clip(v[live], LO, HI)) - np.log10(LO)) / (
-                np.log10(HI) - np.log10(LO)
-            )
-        out = (_CIVIDIS(FLOOR + t * (1 - FLOOR))[..., :3] * 255).astype(np.uint8)
+            t[live] = np.log1p(np.clip(v[live], 0.0, HI)) / np.log1p(HI)
+        out = (_RAMP(t)[..., :3] * 255).astype(np.uint8)
         out[~live] = ZERO_RGB
         return out
 
@@ -570,18 +608,18 @@ def _(matplotlib, np):
         out[..., 3] = alpha
         return out
 
-    # 1e-4 is the ramp floor, so anything under it is "below 0.01%", not zero.
+    # Stops chosen against the measured percentiles: 0 and 1 bracket the median, 5 sits
+    # at p75, 15 near p95, 40+ is the clipped top.
     STOPS = [
-        (0.0, "none"),
-        (1e-4, "0.01%"),
-        (1e-3, "0.1%"),
-        (1e-2, "1%"),
-        (5e-2, "5%"),
-        (1e-1, "10%"),
-        (2.5e-1, "25%"),
-        (5e-1, "50%+"),
+        (0.0, "0 · wild"),
+        (1.0, "1"),
+        (3.0, "3"),
+        (7.0, "7"),
+        (15.0, "15"),
+        (25.0, "25"),
+        (40.0, "40+"),
     ]
-    return ramp, ramp_rgba
+    return STOPS, ramp, ramp_rgba
 
 
 @app.cell
@@ -643,17 +681,17 @@ def _(
         afterwards needs the real type.
         """
         tbl = tbl.combine_chunks()
-        portion = np.asarray(tbl["portion"])
+        hfp = np.asarray(tbl["hfp"])
         return ArroTable.from_arrow(
             pa.table(
                 {
                     "hex": tbl["hex"],
                     "color": pa.FixedSizeListArray.from_arrays(
-                        pa.array(ramp(portion).ravel()), 3
+                        pa.array(ramp(hfp).ravel()), 3
                     ),
-                    # Percent, because "0.043 of a cell" is not how anyone reads this, and
-                    # the tooltip is the one place the number is stated outright.
-                    "deforested %": pa.array(np.round(portion * 100, 4)),
+                    # The index on its own 0-50 scale; the tooltip is the one place the
+                    # number is stated outright.
+                    "footprint": pa.array(np.round(hfp, 2)),
                     "pixels": tbl["px_total"],
                 }
             )
@@ -676,7 +714,7 @@ def _(
         once and shared by both tables.
         """
         tbl = tbl.combine_chunks()
-        portion = np.asarray(tbl["portion"], dtype="float64")
+        hfp = np.asarray(tbl["hfp"], dtype="float64")
         geom = ArroArray.from_arrow(
             from_wkb(
                 tbl["wkb"].combine_chunks(), to_type=multipolygon("xy", crs="EPSG:4326")
@@ -686,7 +724,7 @@ def _(
             ArroArray.from_arrow(tbl["name"].combine_chunks()),
             ArroArray.from_arrow(tbl["region"].combine_chunks()),
             ArroArray.from_arrow(tbl["country"].combine_chunks()),
-            ArroArray.from_arrow(pa.array(np.round(portion * 100, 4))),
+            ArroArray.from_arrow(pa.array(np.round(hfp, 2))),
             ArroArray.from_arrow(tbl["n_cells"].combine_chunks()),
         ]
         names = [
@@ -696,7 +734,7 @@ def _(
             "name",
             "region",
             "country",
-            "deforested %",
+            "footprint",
             "cells",
         ]
 
@@ -706,14 +744,14 @@ def _(
         # at the stroke's own alpha.
         line = ArroArray.from_arrow(
             pa.FixedSizeListArray.from_arrays(
-                pa.array(ramp_rgba(portion, LINE_ALPHA).ravel()), 4
+                pa.array(ramp_rgba(hfp, LINE_ALPHA).ravel()), 4
             )
         )
 
         def build(alpha):
             col = ArroArray.from_arrow(
                 pa.FixedSizeListArray.from_arrays(
-                    pa.array(ramp_rgba(portion, alpha).ravel()), 4
+                    pa.array(ramp_rgba(hfp, alpha).ravel()), 4
                 )
             )
             return ArroTable.from_arrays([geom, col, line, *rest], names=names)
@@ -734,7 +772,7 @@ def _(
                     "color": pa.FixedSizeListArray.from_arrays(
                         pa.array(np.array([13, 17, 23], dtype=np.uint8)), 3
                     ),
-                    "deforested %": pa.array([0.0]),
+                    "footprint": pa.array([0.0]),
                     "pixels": pa.array([0], type=pa.int64()),
                 }
             )
@@ -802,7 +840,7 @@ def _(
                 "name",
                 "region",
                 "country",
-                "deforested %",
+                "footprint",
                 "cells",
             ],
         )
@@ -1102,7 +1140,7 @@ async def _(
         subtype, and the clipped geometry as WKB. The maritime half of division_area is
         dropped here (is_land is always present in this tileset: measured True 431 /
         False 325 over seven tiles, never missing) for the same reason the GeoParquet
-        path dropped it: open water was never at risk of being deforested, and it drags
+        path dropped it: open water carries no footprint score at all, and it drags
         a coastal division's zonal mean toward zero.
         """
         k = (z, x, y)
@@ -1416,7 +1454,7 @@ def _(
         stroked=False,
         high_precision=True,
         coverage=1,
-        opacity=0.5,
+        opacity=0.7,
         pickable=True,
     )
 
@@ -1461,7 +1499,7 @@ def _(
         tile_size=512,
         max_zoom=19,
         min_zoom=0,
-        opacity=0.6,
+        opacity=0.8,
         pickable=False,
     )
 
@@ -1548,12 +1586,13 @@ def _(
         readout still has to move: zooming IN always lands inside the box the last read
         covered, so without this the line would freeze exactly when the map is busiest.
 
-        THE VIEWPORT DIAGNOSTICS ARE ENABLED, matching the HFP notebook, where the
-        fullscreen defect has been seen again since the ruler landed and is not yet
-        closed. The px readout below is the kernel's half (1400x620 that never moves
-        means the browser has not reported in); el.appendChild(probe) in Status._esm is
-        the browser's half, no kernel involved. The two disagreeing names the broken
-        leg. Comment both out once the defect is closed.
+        THE VIEWPORT DIAGNOSTICS ARE COMMENTED OUT, NOT DELETED. Debugging the ruler
+        meant asking two questions from screenshots: what does the browser measure, and
+        does the kernel hear it. To re-enable, append
+        f" · {HOLD['wh'][0]:.0f}x{HOLD['wh'][1]:.0f}px" to the line below (the kernel's
+        half: 1400x620 that never moves means the browser has not reported in) and
+        uncomment el.appendChild(probe) in Status._esm (the browser's half, no kernel
+        involved). The two disagreeing names the broken leg.
         """
         status.value = (
             f"{HOLD['head']}{HOLD['tail']} · zoom {vs.zoom:.1f}"
@@ -1805,14 +1844,14 @@ def _(
         country = tbl["country"].to_pylist()
         region = tbl["region"].to_pylist()
         n_cells = tbl["n_cells"].to_pylist()
-        portion = np.asarray(tbl["portion"], dtype="float64")
-        order = np.argsort(-portion)[:RANK_N]
-        top = float(portion[order[0]]) if len(order) else 1.0
+        hfp = np.asarray(tbl["hfp"], dtype="float64")
+        order = np.argsort(-hfp)[:RANK_N]
+        top = float(hfp[order[0]]) if len(order) else 1.0
         rows = []
         for place, i in enumerate(order, 1):
             i = int(i)
-            rgb = ",".join(str(int(c)) for c in ramp(np.array([portion[i]]))[0])
-            bar = max(2.0, 100.0 * portion[i] / max(top, 1e-12))
+            rgb = ",".join(str(int(c)) for c in ramp(np.array([hfp[i]]))[0])
+            bar = max(2.0, 100.0 * hfp[i] / max(top, 1e-12))
             label = names[i] or "(unnamed)"
             where = ", ".join(filter(None, [region[i], country[i] or "??"]))
             rows.append(
@@ -1821,7 +1860,7 @@ def _(
                 f"<td style='padding:.12rem .6rem .12rem 0;white-space:nowrap'>{label}"
                 f"<span style='opacity:.45'> · {where}</span></td>"
                 f"<td style='text-align:right;padding:.12rem .6rem .12rem 0;"
-                f"font-variant-numeric:tabular-nums'>{portion[i] * 100:.3f}%</td>"
+                f"font-variant-numeric:tabular-nums'>{hfp[i]:.2f}</td>"
                 f"<td style='width:180px;padding:.12rem .6rem .12rem 0'>"
                 f"<span style='display:block;height:9px;border-radius:2px;"
                 f"width:{bar:.1f}%;background:rgb({rgb})'></span></td>"
@@ -1830,8 +1869,8 @@ def _(
                 f"</tr>"
             )
         head = (
-            f"<b>{len(names):,} {DIVISION_LABEL[sub]} in view</b>, ranked by mean share "
-            f"deforested 2002-2022, measured at H3 res {res}"
+            f"<b>{len(names):,} {DIVISION_LABEL[sub]} in view</b>, ranked by mean "
+            f"human footprint (0-50), measured at H3 res {res}"
             + (
                 f" · <span style='color:#E69F00'>{n_small} too small to measure</span>"
                 if n_small
@@ -1898,10 +1937,9 @@ def _(
     legend = (
         "<div style=\"font:12px ui-sans-serif,system-ui,sans-serif;"
         "display:flex;flex-wrap:wrap;align-items:center;padding:.35rem 0\">"
-        "<b style='margin-right:.7rem'>share of cell deforested 2002-2022</b>"
+        "<b style='margin-right:.7rem'>human footprint 2021 (0 = no pressure, 50 = severe)</b>"
         f"{_sw}</div>"
     )
-    
     return controls, deck, legend, ranking, refresh, status
 
 
@@ -1947,13 +1985,13 @@ async def _(
     # WHICH TILES EXIST, PER LEVEL. This is the sparse-COG fix, and it is read straight out
     # of IFDs already in memory, so it costs no network at all.
     #
-    # 73.6% of L0 tiles have offset 0 and byte count 0: ocean is simply not stored. async
+    # 65.7% of L0 tiles have offset 0 and byte count 0: ocean is simply not stored. async
     # geotiff does not check, so a read touching one asks for byte range 0..0 and raises
     # `TypeError: ValueError: Invalid range requested, start: 0 end: 0`. That error names
     # neither the tile nor the fact that the file is sparse, so it reads like corruption.
     #
     # Consulting the table first turns the crash into a speedup: an absent tile becomes a
-    # NaN block with no request. Measured on the opening world view, 10 of 78 tiles skipped.
+    # NaN block with no request.
     _present = []
     for _lv in _levels:
         _ifd = _lv.ifd
@@ -1976,14 +2014,17 @@ async def _(
         if not _present[li][ty, tx]:
             return np.full((h, w), np.nan, dtype=np.float32), True
         async with _sem:
-            arr = np.asarray(
-                (
-                    await lv.read(
-                        window=Window(col_off=c0, row_off=r0, width=w, height=h)
-                    )
-                ).as_masked()[0]
-            ).astype(np.float32)
-        return arr, False
+            m = (
+                await lv.read(window=Window(col_off=c0, row_off=r0, width=w, height=h))
+            ).as_masked()[0]
+        # filled(), NOT np.asarray(): asarray on a masked array silently returns the raw
+        # data, so every masked 65535 would survive as a real number and a nodata coast
+        # would average in at score 65.5. The stored value is the index x1000 in uint16;
+        # dividing here means every tile in the cache is already in index units and
+        # nothing downstream knows about the encoding.
+        arr = np.ma.filled(m.astype(np.float32), np.nan)
+        arr[arr == 65535.0] = np.nan  # belt and braces if the mask ever goes missing
+        return arr / 1000.0, False
 
     async def _read_window(li, col0, row0, wpx, hpx):
         """The window, assembled from cached tiles plus whatever is missing.
@@ -2033,10 +2074,27 @@ async def _(
             _tiles[k] = _tiles.pop(k)
         return out, fetched, skipped
 
-    # EPSG:4326 IS THE WHOLE SIMPLIFICATION. The NLCD notebooks in this repo carry an Albers
-    # control grid, a bilinear interpolator and to_lat/to_lon UDFs purely to get degrees out
-    # of projected metres. Here the pixel grid IS degrees, so the y/x coordinates of the
-    # registered dataset feed h3_latlng_to_cell directly and all of that machinery is gone.
+    # THE CRS COMES BACK, AND IT IS TEN LINES, NOT THE NLCD MACHINERY. The deforestation
+    # notebook's "EPSG:4326 is the whole simplification" does not hold here: HFP-100 is
+    # World Mollweide (ESRI:54009), metres on a sphere of R = 6378137 (verified against
+    # the header: the raster is 36,080 km wide, which is 4*sqrt(2)*R plus a pixel of pad).
+    # But where the NLCD notebooks needed a control grid and a bilinear interpolator for
+    # Albers, Mollweide is closed-form BOTH ways: forward needs a Newton solve for the
+    # parametric angle (box -> pixel window, a few dozen points), and the inverse is three
+    # lines of arcsin (pixel centres -> lat/lng for the fold). No pyproj.
+    _SQ2R = math.sqrt(2.0) * 6378137.0
+
+    def _moll_fwd(lon, lat):
+        """Degrees -> Mollweide metres. Newton on 2t + sin 2t = pi sin(lat)."""
+        phi = np.radians(np.asarray(lat, dtype=np.float64))
+        lam = np.radians(np.asarray(lon, dtype=np.float64))
+        th = phi.copy()
+        for _ in range(12):  # converges in ~5 everywhere below 89 degrees
+            th -= (2 * th + np.sin(2 * th) - np.pi * np.sin(phi)) / np.maximum(
+                2 + 2 * np.cos(2 * th), 1e-9
+            )
+        return (2 * _SQ2R / np.pi) * lam * np.cos(th), _SQ2R * np.sin(th)
+
     ctx = XarrayContext()
     ctx.register_udf(
         udf(
@@ -2072,19 +2130,42 @@ async def _(
         H, W = rd.shape
         px, py = (_R - _L) / W, (_T - _B) / H
 
+        # Degree box -> pixel window, through the FORWARD projection. Mollweide meridians
+        # curve, so a lat/lng box does not map to a rectangle: the widest x is wherever
+        # the box comes closest to the equator, not at a corner. Projecting a sampled
+        # perimeter and taking the envelope handles that without case analysis.
         w, s, e, n = box
-        col0 = max(0, int((max(w, _L) - _L) / px))
-        col1 = min(W, int(math.ceil((min(e, _R) - _L) / px)))
-        row0 = max(0, int((_T - min(n, _T)) / py))
-        row1 = min(H, int(math.ceil((_T - max(s, _B)) / py)))
+        _t = np.linspace(0.0, 1.0, 33)
+        _bx, _by = _moll_fwd(
+            np.concatenate([w + (e - w) * _t, np.full(33, e), e + (w - e) * _t, np.full(33, w)]),
+            np.concatenate([np.full(33, s), s + (n - s) * _t, np.full(33, n), n + (s - n) * _t]),
+        )
+        col0 = max(0, int((max(_bx.min(), _L) - _L) / px))
+        col1 = min(W, int(math.ceil((min(_bx.max(), _R) - _L) / px)))
+        row0 = max(0, int((_T - min(_by.max(), _T)) / py))
+        row1 = min(H, int(math.ceil((_T - max(_by.min(), _B)) / py)))
         wpx, hpx = col1 - col0, row1 - row0
         if wpx <= 0 or hpx <= 0:
             return None, 0, 0
 
         arr, fetched, skipped = await _read_window(li, col0, row0, wpx, hpx)
 
-        # The window's own corner, not the raster's. Everything downstream is relative.
-        wl, wt = _L + col0 * px, _T - row0 * py
+        # Pixel centres -> lat/lng, through the INVERSE projection, which is closed form.
+        # The parametric angle depends only on the row, so lat is one arcsin per ROW and
+        # only lon is a full 2D array. Pixels outside the Mollweide ellipse (the dark
+        # corners of the projection plane) invert to |lon| > 180; they are unstored
+        # nodata anyway, and masking them keeps the fold from ever seeing a fake
+        # coordinate.
+        _ym = _T - (row0 + np.arange(hpx, dtype=np.float64) + 0.5) * py
+        _xm = _L + (col0 + np.arange(wpx, dtype=np.float64) + 0.5) * px
+        _th = np.arcsin(np.clip(_ym / _SQ2R, -1.0, 1.0))
+        _lat = np.degrees(
+            np.arcsin(np.clip((2 * _th + np.sin(2 * _th)) / np.pi, -1.0, 1.0))
+        )
+        _lon = np.degrees(
+            (np.pi * _xm[None, :]) / (2 * _SQ2R * np.maximum(np.cos(_th), 1e-12)[:, None])
+        )
+        arr[np.abs(_lon) > 180.0] = np.nan
         try:
             ctx.deregister_table("df")
         except Exception:
@@ -2092,44 +2173,35 @@ async def _(
         ctx.from_dataset(
             "df",
             xr.Dataset(
-                {"v": (("y", "x"), arr)},
-                coords={
-                    "y": wt - (np.arange(hpx) + 0.5) * py,
-                    "x": wl + (np.arange(wpx) + 0.5) * px,
+                {
+                    "v": (("y", "x"), arr),
+                    "lat": (("y", "x"), np.ascontiguousarray(np.broadcast_to(_lat[:, None], arr.shape))),
+                    "lon": (("y", "x"), _lon),
                 },
+                coords={"y": np.arange(hpx), "x": np.arange(wpx)},
             ),
             chunks={"y": 512},
         )
 
-        # `v = v` IS THE NaN TEST. This COG declares no nodata value at all, so ocean comes
-        # back as NaN rather than a sentinel, and `v != NULL` would not catch it. NaN is the
-        # one value that fails equality with itself.
+        # `v = v` IS THE NaN TEST. Ocean is unstored or nodata and both arrive as NaN,
+        # which `v != NULL` would not catch; NaN is the one value that fails equality
+        # with itself.
         #
         # px_total is not decoration: it is the weight a cell carries into the zonal join.
         # A coastal cell may be 90% NaN ocean and must not count as a full one.
-        # HAVING, NOT WHERE, AND THE DIFFERENCE IS THE WHOLE MEAN.
         #
-        # Cells with no deforestation at all are dropped, because they are overwhelmingly
-        # ocean and open water: 69.6% of res-4 cells are exactly zero, so drawing them
-        # covers the map in dark hexagons that say nothing and cost most of the render.
-        #
-        # But the filter has to be on the CELL, not the PIXEL. `WHERE v > 0` would exclude
-        # zero pixels from the average itself, so a cell that is 90% untouched forest and
-        # 10% clearcut would report 100% rather than 10%. Every zero pixel stays in the
-        # average; only cells whose average is zero are dropped.
-        #
-        # THE COST, SAID PLAINLY: land that genuinely lost no forest 2002-2022 disappears
-        # too, and looks identical to ocean. This map shows where deforestation IS, not
-        # where it is absent.
+        # NO `HAVING avg > 0`, AND THAT IS THE OPPOSITE OF THE DEFORESTATION NOTEBOOK.
+        # There zero cells were overwhelmingly ocean and were dropped; here ocean is
+        # already NaN and a zero cell is UNTOUCHED LAND, which is half of what this map
+        # has to say. The Sahara at 0 next to the Nile valley at 30 is the picture.
         return (
             ctx.sql(f"""
-                SELECT h3_latlng_to_cell(y, x, CAST({res} AS INT)) AS hex,
-                       avg(CAST(v AS DOUBLE)) AS portion,
+                SELECT h3_latlng_to_cell(lat, lon, CAST({res} AS INT)) AS hex,
+                       avg(CAST(v AS DOUBLE)) AS hfp,
                        count(*)               AS px_total
                 FROM df
                 WHERE v = v
                 GROUP BY 1
-                HAVING avg(CAST(v AS DOUBLE)) > 0
             """).to_arrow_table(),
             fetched,
             skipped,
@@ -2142,15 +2214,14 @@ async def _(
     # shipping them to DuckDB because DuckDB happens to hold the polygons would be
     # backwards.
     #
-    # avg(portion) EQUAL-WEIGHTS THE CELLS, AND THAT IS THE POINT. H3 cells are
-    # near-equal-area, so an unweighted mean over cells is an AREA-weighted mean of the
-    # ground. Weighting by px_total here instead would reintroduce exactly the EPSG:4326
-    # latitude bias that folding to H3 removed, because a degree box holds more pixels near
-    # the equator. The pixel weighting already happened, inside each cell, in `fold`.
+    # avg(hfp) EQUAL-WEIGHTS THE CELLS. H3 cells are near-equal-area and so are Mollweide
+    # pixels, so unweighted-over-cells and pixel-weighted agree here to within coastal
+    # NaN handling; equal weighting is kept because it matches what the choropleth colour
+    # already shows. The pixel weighting already happened, inside each cell, in `fold`.
     ZONAL_SQL = """
-        SELECT d.id           AS id,
-               avg(c.portion) AS portion,
-               count(*)       AS n_cells
+        SELECT d.id       AS id,
+               avg(c.hfp) AS hfp,
+               count(*)   AS n_cells
         FROM div_cells d JOIN cells c ON d.hex = c.hex
         GROUP BY d.id
     """
@@ -2178,7 +2249,7 @@ async def _(
         return out, max(0, meta.num_rows - out.num_rows)
 
     async def zonal(subtype, box, res, cells_tbl):
-        """Divisions in view, each with its area-weighted mean deforestation.
+        """Divisions in view, each with its mean human footprint.
 
         Returns (the two colour variants of the layer table, divisions drawn, divisions with
         no number) or None.
@@ -2206,9 +2277,11 @@ async def _(
            spend, and the finer the cells the fewer divisions fall through the 'center' rule.
         2. It derives that resolution from the BOX, not from the camera's zoom trait, so
            the two cannot drift.
-        3. It falls back county -> region -> country. Overture has counties for 171 of 219
-           countries, so a box over the other 48 would otherwise come back empty rather than
-           answering at the finest level that exists there.
+        3. It falls back locality -> county -> region -> country, starting wherever the
+           box's own zoom starts the display band. Overture has counties for 171 of 219
+           countries and localities only where settlements are, so a box anywhere else
+           would otherwise come back empty rather than answering at the finest level
+           that exists there.
         """
         span = max(box[2] - box[0], 1e-9)
         z = math.log2(360.0 * HOLD["wh"][0] / (512 * span))
@@ -2216,7 +2289,10 @@ async def _(
         raw, _fetched, _skipped = await fold(res, box)
         if raw is None or raw.num_rows == 0:
             return None
-        for sub in ("county", "region", "country"):
+        ladder = ("locality", "county", "region", "country")
+        if z < 9.5:  # match the display band: no locality answer for a wide box
+            ladder = ladder[1:]
+        for sub in ladder:
             meta, key = await fetch_divisions(sub, box)
             if meta is None or meta.num_rows == 0:
                 continue
@@ -2249,8 +2325,10 @@ def _(controls, deck, legend, mo, ranking, status):
             mo.Html(legend),
             controls,
             mo.md(
-                "Deforestation 2002-2022 as a share of each 100 m cell "
-                "(Vizzuality / LandGriffon, CC-BY 4.0). Boundaries: Overture Maps. "
+                "Human footprint 2021, the 0-50 pressure index summed from built land, "
+                "crops, pasture, population, night lights, roads, rails and rivers "
+                "(HFP-100 v1.2, Vizzuality / Impact Observatory, CC-BY 4.0). "
+                "Boundaries: Overture Maps. "
                 "A division's value is the mean over the H3 cells whose CENTRE falls "
                 "inside it, so divisions smaller than one cell at the current resolution "
                 "are drawn unfilled rather than given a number. "

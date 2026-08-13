@@ -18,7 +18,7 @@
 #     "matplotlib==3.11.1",
 # ]
 # ///
-"""Global deforestation 2002-2022, folded to H3 and joined onto Overture divisions.
+"""Deforestation 2002-2022 x canopy height today, on H3, joined onto Overture divisions.
 
 Vizzuality's `deforest_100m_cog.tif` is one 5.7 GB COG covering the planet at 100 m. Its
 value is the PORTION OF EACH CELL deforested between 2002 and 2022: an intensive 0-1
@@ -68,22 +68,41 @@ magnitude (p1 7.3e-8, p50 2.1e-3, p99.9 0.45), so a linear 0-1 ramp paints a bla
 Zero takes its own dark swatch and the rest is log10 over 1e-4 to 0.5, which is p25 to
 p99.9. See the ramp cell for why zero is separated by luminance and not by hue.
 
-PRESS THE BUTTON AND THE JOIN BECOMES A NUMBER. "rank what's in view", in the controls
-under the map, ranks every division in the current view by its mean share deforested. It
-reads one H3 resolution finer than the screen does, sizes that resolution from the view
-box rather than the current zoom, and falls back county -> region -> country, because
-Overture has counties for only 171 of 219 countries. This is the one output here that is
-a figure rather than a colour. It replaced lonboard's draw-box tool, which asked the
-user to describe a region twice (camera, then rectangle); the toolbar for that tool is
-hidden from the Controls widget, since lonboard 0.16 has no Python-side switch for it.
+DRAW A BOX AND THE JOIN BECOMES A NUMBER. The ▢ button at the lower right of the map ranks
+every division inside the box you draw by its mean share deforested. It reads one H3
+resolution finer than the screen does, sizes that resolution from the BOX rather than the
+current zoom, and falls back county -> region -> country, because Overture has counties for
+only 171 of 219 countries. This is the one output here that is a figure rather than a colour.
 
 THE CAMERA ANSWERS FROM MEMORY FIRST. `view_state` fires on every frame of a drag, and any
 frame that can be served from what is already folded (a pan inside the current box, a zoom
 back to a resolution already visited) is answered synchronously in the comm handler. Only a
 view that genuinely needs bytes goes through the debounce. See `_instant`.
 
+THE CANOPY SIDE. Meta/WRI's High Resolution Canopy Height Maps (dataforgood-fb-data,
+CC-BY 4.0) answer the question this notebook could not: the deforestation layer says
+what share of ground was CLEARED 2002-2022, the CHM says what STANDS THERE NOW, in
+metres at ~1 m. Cleared-and-regrown, cleared-and-gone and intact-and-tall become three
+different statements. A `colour` switch repaints the hexagons by either quantity; in
+canopy mode every cell's tooltip still carries the deforested share of the coarser cell
+it sits in, so the pairing is per-cell, not per-glance.
+
+The CHM has NO overview pyramid (56,147 zoom-9 Web Mercator quadkey BigTIFFs, uint8
+metres, deflate + predictor 2, every strip ONE ROW of 65,536 px), so there is no
+free-fly canopy: it reads per viewport above zoom 13, strided, through a hand-rolled
+strip reader, and the canopy zoom ladder runs FINER than the deforestation one (res 10-11
+against the res 8 cap) because 1 m supports cells 100 m cannot. Its msk sidecars were
+measured ALL ZERO over live data and are ignored; the only no-data signal is an absent
+quadkey tile, surfaced as a missing cell, never as height 0. Zero canopy is a real
+measurement and sits INSIDE the ramp (the HFP lesson); vintage is per Maxar acquisition
+(2018-2020 mostly), so a fresh clearcut can still wear last year's trees.
+
+This fork also ports the HFP notebook's measured-viewport ruler (the parent still
+assumes VIEW_W x VIEW_H and has the fullscreen defect).
+
 Data: Vizzuality / LandGriffon, CC-BY 4.0, on source.coop. Boundaries: Overture Maps.
-Run:  uv run marimo edit xsql-deforest-divisions.py --sandbox
+      Canopy: Meta & WRI High Resolution Canopy Height Maps, CC-BY 4.0, AWS Open Data.
+Run:  uv run marimo edit xsql-canopy-deforest.py --sandbox
 """
 
 import marimo
@@ -98,6 +117,7 @@ def _():
     import gzip
     import math
     import struct
+    import zlib
 
     import anywidget
     import traitlets
@@ -124,7 +144,13 @@ def _():
     return (
         ArroArray,
         ArroTable,
+        BitmapTileLayer,
+        CartoBasemap,
         GeoTIFF,
+        H3HexagonLayer,
+        Map,
+        MaplibreBasemap,
+        PolygonLayer,
         S3Store,
         Window,
         XarrayContext,
@@ -134,6 +160,7 @@ def _():
         duckdb,
         from_wkb,
         gzip,
+        infer_rows_per_chunk,
         math,
         matplotlib,
         mo,
@@ -145,6 +172,7 @@ def _():
         traitlets,
         udf,
         xr,
+        zlib,
     )
 
 
@@ -178,7 +206,7 @@ def _(anywidget, traitlets):
         state the camera could write: re-running it rebuilds the Map and throws the view
         away. A widget trait syncs straight to the browser instead.
 
-        THE RULER, AND WHY IT LIVES HERE. lonboard's view_state carries longitude,
+        THE RULER, PORTED FROM THE HFP NOTEBOOK. lonboard's view_state carries longitude,
         latitude and zoom but NOT the canvas size, so the kernel cannot know how much
         world the screen shows: VIEW_W/VIEW_H were assumed, and going fullscreen made
         that assumption visibly wrong (cells folded for a 620 px band inside a 1400 px
@@ -187,9 +215,7 @@ def _(anywidget, traitlets):
         page), measures its CSS size, and syncs it up as `view_wh`. Remeasured on window
         resize, on fullscreenchange (fullscreening an ELEMENT resizes no window, so a
         resize listener alone misses it), and via a ResizeObserver on the canvas itself
-        for layout changes that are neither. Ported from the HFP notebook, where the
-        fullscreen defect was found and the trait-type and shadow-DOM lessons were paid
-        for.
+        for layout changes that are neither.
         """
 
         _esm = """
@@ -209,8 +235,9 @@ def _(anywidget, traitlets):
           draw();
           model.on("change:value", draw);
           el.appendChild(line);
-          // The diagnostic line, off by default. Everything still measures and syncs;
-          // this only decides whether the browser-side reading is SHOWN.
+          // The diagnostic line, on while the fullscreen defect stays open in the HFP
+          // notebook. Everything still measures and syncs without it; this only decides
+          // whether the browser-side reading is SHOWN.
           el.appendChild(probe);
 
           let watched = null;
@@ -250,7 +277,7 @@ def _(anywidget, traitlets):
               }
               if (w > 0 && h > 0) {
                 probe.textContent = tag + w + "x" + h;
-                // A string, not a number list: the only trait types this notebook has
+                // A string, not a number list: the only trait types this repo has
                 // PROVEN to cross marimo's anywidget bridge are Unicode (value, down)
                 // and Bool (the Controls, up). The first ruler used List(Float) and
                 // the kernel never heard a word.
@@ -304,46 +331,25 @@ def _(anywidget, traitlets):
           check("show_divisions", "boundaries");
           check("division_fill", "boundary fill");
 
-          // The ranking trigger, HERE rather than lonboard's draw-box tool. A Bool
-          // toggle, not a counter: Bool is a trait type proven to cross marimo's
-          // anywidget bridge browser -> kernel, and the kernel observer fires on any
-          // change, so flipping the value is a click.
-          const btn = document.createElement("button");
-          btn.textContent = "rank what's in view";
-          btn.style.cssText =
-            "font:12px ui-sans-serif,system-ui,sans-serif;cursor:pointer;" +
-            "padding:.15rem .6rem;border-radius:4px;border:1px solid " +
-            "rgba(127,127,127,.45);background:transparent;color:inherit";
-          btn.onclick = () => {
-            model.set("rank_view", !model.get("rank_view"));
-            model.save_changes();
-          };
-          box.appendChild(btn);
-          el.appendChild(box);
+          const pwrap = document.createElement("label");
+          pwrap.style.cssText =
+            "display:inline-flex;align-items:center;gap:.35rem;cursor:pointer";
+          pwrap.appendChild(document.createTextNode("colour"));
+          const psel = document.createElement("select");
+          psel.style.cssText =
+            "font:12px ui-sans-serif,system-ui,sans-serif;padding:.05rem .2rem";
+          for (const [v, t] of [["deforest", "deforestation"], ["canopy", "canopy height"]]) {
+            const o = document.createElement("option");
+            o.value = v; o.textContent = t;
+            psel.appendChild(o);
+          }
+          psel.value = model.get("paint");
+          psel.onchange = () => { model.set("paint", psel.value); model.save_changes(); };
+          model.on("change:paint", () => { psel.value = model.get("paint"); });
+          pwrap.appendChild(psel);
+          box.appendChild(pwrap);
 
-          // HIDE LONBOARD'S DRAW-BOX TOOL. Its toolbar is rendered unconditionally in
-          // the bundled JS (lonboard 0.16): the Map's `controls` trait governs only
-          // fullscreen/navigation/scale, so there is no Python-side switch. The button
-          // lives in lonboard's shadow root, hence the same recurse-into-shadowRoots
-          // walk the Status ruler uses; an interval rather than a one-shot because the
-          // map mounts after this widget and can be rebuilt by a cell re-run.
-          const hideBbox = (root) => {
-            let hid = false;
-            root.querySelectorAll("button[aria-label]").forEach((b) => {
-              const a = b.getAttribute("aria-label");
-              if (a === "Select BBox" || a === "Cancel drawing" ||
-                  a === "Clear bounding box") {
-                const holder = b.closest("div[style*='absolute']") || b;
-                holder.style.display = "none";
-                hid = true;
-              }
-            });
-            root.querySelectorAll("*").forEach((n) => {
-              if (n.shadowRoot) hid = hideBbox(n.shadowRoot) || hid;
-            });
-            return hid;
-          };
-          setInterval(() => hideBbox(document), 1000);
+          el.appendChild(box);
         }
         export default { render };
         """
@@ -353,8 +359,11 @@ def _(anywidget, traitlets):
         # choropleth is what it produces, so shipping it behind an unticked box meant the
         # result was invisible unless you went looking for it.
         division_fill = traitlets.Bool(True).tag(sync=True)
-        # The ranking trigger. Value is meaningless; a CHANGE is a click.
-        rank_view = traitlets.Bool(False).tag(sync=True)
+        # Which quantity the hexagons encode. Unicode, one of the two trait types proven
+        # to cross marimo's anywidget bridge (see the ruler above). Canopy only exists
+        # above CANOPY_ZOOM; below it the switch shows a hint and the hexagons stay on
+        # deforestation.
+        paint = traitlets.Unicode("deforest").tag(sync=True)
 
     class Panel(anywidget.AnyWidget):
         """A block of HTML the kernel can rewrite, for the drawn-box ranking.
@@ -376,7 +385,7 @@ def _(anywidget, traitlets):
         """
         value = traitlets.Unicode("").tag(sync=True)
 
-    return
+    return Controls, Panel, Status
 
 
 @app.cell
@@ -466,13 +475,44 @@ def _(math):
     # floor up to z12, so these are floors for the zoom picker, not bands.
     SUB_MINZOOM = {"country": 2, "region": 4, "county": 8}
 
+    # ------------------------------------------------------------------ the canopy
+    # Meta/WRI High Resolution Canopy Height Maps: one BigTIFF per zoom-9 Web Mercator
+    # quadkey tile, 65,536 px square at ~1.19 m, uint8 metres, deflate + predictor 2,
+    # 1-row strips, NO overview pyramid. That last fact is the design: no pyramid means
+    # no free-fly, so the canopy reads per viewport above CANOPY_ZOOM only.
+    CHM_BUCKET = "dataforgood-fb-data"
+    CHM_BASE = "forests/v1/alsgedi_global_v6_float"
+    CHM_Z = 9
+    CHM_TILE = 65536
+
+    # EVERY 4TH PIXEL IN BOTH AXES. The mean over a cell needs a few dozen pixels, not
+    # hundreds; the stride pays in the DECODE (a row skipped is a strip never inflated),
+    # not the fetch, because KB-sized strips coalesce into one span regardless.
+    CAN_STRIDE = 4
+
+    # The strip span one view may fetch. Rows over dense forest run ~16 KB compressed
+    # (Paradise CA measured; 320 B is the archive-wide average), so a z13 viewport can
+    # span tens of MB; past this the read refuses with a note instead of stalling.
+    CANOPY_BUDGET = 160 * 1024 * 1024
+
+    # THE CANOPY LADDER CONTINUES WHERE THE DEFORESTATION LADDER CAPS, AND THE TWO
+    # RESOLUTIONS ARE DELIBERATELY DIFFERENT. The 100 m COG caps at res 8 (18 px per
+    # cell at L1); ~1 m pixels carry on: res 10 at z13, res 11 at z14.4, res 12 at
+    # z15.2 (307 m2, ~216 native px; the stride relaxes to 2 there so a cell still
+    # averages ~54). Res 13 would hold ~30 unstrided pixels and is possible, but res 12
+    # hexagons are already a few px on screen when they arrive; raise this only with a
+    # reason. The parent join in fold_canopy is what bridges the ladders: every fine
+    # canopy cell knows the deforested share of the res-8 cell it sits in.
+    CANOPY_ZOOM = 13.0
+    CAN_MAX_RES = 12
+
+    def can_res_for_zoom(z):
+        return max(MIN_RES, min(CAN_MAX_RES, BASE_RES + math.floor((z - ZOOM0) / PER_RES)))
+
     # ------------------------------------------------------------------ view
-    # The map's pixel size BEFORE the browser reports the real one. The Status widget
-    # measures the deck canvas (view_state has no width/height, so this cannot come from
-    # the camera) and overwrites HOLD["wh"]; these constants only cover the opening fold
-    # and any headless run, where no browser ever reports in. Fullscreen is the case that
-    # made the difference visible: a 620 px assumption inside a 1500 px screen folds a
-    # band, not the viewport.
+    # The map's pixel size, as a SEED. The Status widget rulers the real deck canvas
+    # (ported from the HFP notebook) and overwrites HOLD["wh"]; these constants only
+    # cover the opening fold and headless runs, where no browser ever reports in.
     VIEW_W, VIEW_H = 1400, 620
     PAD = 1.25
 
@@ -496,19 +536,33 @@ def _(math):
     # anything dramatic to say, and all three are in view from here.
     HOME = {"longitude": -20.0, "latitude": 0.0, "zoom": 2.4}
     return (
+        CAN_STRIDE,
+        CANOPY_BUDGET,
+        CANOPY_ZOOM,
+        CHM_BASE,
+        CHM_BUCKET,
+        CHM_TILE,
+        CHM_Z,
         COG,
+        DIVISION_LABEL,
+        can_res_for_zoom,
         FETCH_AT_ONCE,
         FILL_ALPHA,
         HOME,
         LEVEL_FOR_RES,
         LINE_ALPHA,
         MAX_RES,
+        PAD,
         PM_BUCKET,
         PM_PATH,
+        SETTLE,
         SOURCE_BUCKET,
         SUB_MINZOOM,
         TILE,
         TILE_BUDGET,
+        VIEW_H,
+        VIEW_W,
+        division_for_zoom,
         res_for_zoom,
     )
 
@@ -581,7 +635,41 @@ def _(matplotlib, np):
         (2.5e-1, "25%"),
         (5e-1, "50%+"),
     ]
-    return ramp, ramp_rgba
+
+    # THE CANOPY RAMP FOLLOWS THE HFP LESSON, NOT THE ONE ABOVE: ZERO IS INSIDE THE
+    # RAMP. The deforestation fold DROPS zero cells because there zero is overwhelmingly
+    # ocean; canopy zero is a real measurement (pavement, bare ground, grass, and
+    # freshly cleared forest, which is exactly what this pairing is for), the bottom of
+    # a continuum. No-data has no swatch at all here: an absent CHM tile simply folds no
+    # cells, so the hexagon is missing rather than grey. Linear, not log, because metres
+    # are on a human scale and 0-25 m is where the mass sits.
+    # A DIFFERENT COLOUR FAMILY, NOT JUST A DIFFERENT SCALE. Both quantities on cividis
+    # made the two modes indistinguishable at a glance: the whole point of the switch
+    # is lost if the map looks the same either way. So HUE names the dataset and
+    # LUMINANCE names the value in both: a yellow-topped cividis map is cleared share,
+    # a green map is standing canopy. Greens are Stephen's own pick and they are fine
+    # for his eyes: his colour issue is RED (protan-type), a mono-green luminance ramp
+    # reads normally, and no red-green pair appears anywhere. Tall runs DARK (deep
+    # green = deep forest); truncated so bare ground is pale green, not white glare.
+    CAN_HI = 25.0
+    _CAN_CMAP = matplotlib.colormaps["Greens"]
+
+    def ramp_canopy(v):
+        """Mean canopy metres -> uint8 RGB, linear over 0-25 m, pale -> deep green."""
+        v = np.asarray(v, dtype="float64")
+        t = np.clip(np.nan_to_num(v) / CAN_HI, 0.0, 1.0)
+        return (_CAN_CMAP(0.15 + t * 0.80)[..., :3] * 255).astype(np.uint8)
+
+    CAN_STOPS = [
+        (0.0, "0 m"),
+        (2.0, "2"),
+        (5.0, "5"),
+        (10.0, "10"),
+        (15.0, "15"),
+        (20.0, "20"),
+        (25.0, "25+"),
+    ]
+    return CAN_STOPS, STOPS, ramp, ramp_canopy, ramp_rgba
 
 
 @app.cell
@@ -591,10 +679,9 @@ def _():
     # its opening view_state and the camera would snap home on every pan. A plain dict is
     # invisible to the dataflow graph.
     HOLD = {
-        "wh": (1400.0, 620.0),  # the real canvas size, measured by Status; this is the seed
         "fold": None,  # the SQL fold, set by the read cell
         "zonal": None,  # cells -> division means, set by the read cell
-        "rank": None,  # view box -> divisions ranked, set by the read cell
+        "rank": None,  # drawn box -> divisions ranked, set by the read cell
         "res": None,  # H3 resolution currently on screen
         "box": None,  # padded degree box the current cells cover
         "div": None,  # division subtype currently on screen
@@ -604,6 +691,10 @@ def _():
         # previous place, and the instant path then matches and never refetches them.
         "divbox": None,
         "cache": {},  # res -> [box, layer table, raw fold]
+        "canfold": None,  # box -> canopy layer, set by the read cell
+        "can": None,  # [box, res, layer table] of the canopy cells last folded
+        "mode": "deforest",  # which quantity the cells layer is showing right now
+        "wh": None,  # measured canvas (w, h); the ruler writes it, view_to_bbox reads it
         "divpair": None,  # (fill-on table, fill-off table) currently on the division layer
         # The status line in two halves, so a camera move that reads nothing can still
         # refresh the zoom readout without throwing away what the last read said. Zooming IN
@@ -631,6 +722,7 @@ def _(
     np,
     pa,
     ramp,
+    ramp_canopy,
     ramp_rgba,
 ):
     def cells_to_layer(tbl):
@@ -655,6 +747,37 @@ def _(
                     # the tooltip is the one place the number is stated outright.
                     "deforested %": pa.array(np.round(portion * 100, 4)),
                     "pixels": tbl["px_total"],
+                }
+            )
+        )
+
+    def canopy_cells_to_layer(tbl):
+        """Folded canopy cells, each with its parent's deforested share, as a layer table.
+
+        Same shape as cells_to_layer; the colour is the canopy ramp and the deforested
+        share rides along for the tooltip, which is where the pairing is stated:
+        "12.4 m standing, on ground 8% cleared 2002-2022".
+        """
+        tbl = tbl.combine_chunks()
+        can = np.asarray(tbl["canopy"], dtype="float64")
+        # to_numpy(zero_copy_only=False), not np.asarray: the parent share is NULLABLE.
+        # The deforestation fold drops zero cells, so a canopy cell over untouched
+        # ground has no parent row, and that must surface as null ("nothing measured"),
+        # never as 0%.
+        por = np.asarray(
+            tbl["portion"].combine_chunks().to_numpy(zero_copy_only=False),
+            dtype="float64",
+        )
+        return ArroTable.from_arrow(
+            pa.table(
+                {
+                    "hex": tbl["hex"],
+                    "color": pa.FixedSizeListArray.from_arrays(
+                        pa.array(ramp_canopy(can).ravel()), 3
+                    ),
+                    "canopy_m": pa.array(np.round(can, 1)),
+                    "deforested %": pa.array(np.round(por * 100, 4), from_pandas=True),
+                    "pixels": tbl["px"],
                 }
             )
         )
@@ -807,7 +930,13 @@ def _(
             ],
         )
 
-    return cells_to_layer, divisions_to_layer, seed_cells, seed_divisions
+    return (
+        canopy_cells_to_layer,
+        cells_to_layer,
+        divisions_to_layer,
+        seed_cells,
+        seed_divisions,
+    )
 
 
 @app.cell
@@ -1370,7 +1499,216 @@ async def _(
 
 @app.cell
 def _(
+    CAN_STRIDE,
+    CANOPY_BUDGET,
+    CHM_BASE,
+    CHM_BUCKET,
+    CHM_TILE,
+    CHM_Z,
+    S3Store,
+    asyncio,
+    math,
+    np,
+    obstore,
+    pa,
+    struct,
+    zlib,
+):
+    # THE CANOPY READER. Hand-rolled for the same reason the PMTiles reader is: the
+    # object being read is simple and hostile in one specific way no library flag fixes.
+    # Each CHM tile is a BigTIFF of 65,536 ONE-ROW strips, deflate with predictor 2, no
+    # overview pyramid, so the only defensible read is a strided window at deep zoom.
+    # Ported unchanged from the parked fire-risk fork (archive/, see
+    # docs/canopy-firerisk-notes.md for the recon record).
+    #
+    # THE MSK SIDECARS ARE IGNORED, AND THAT IS MEASURED, NOT ASSUMED. GDAL mask
+    # semantics say 0 = invalid, yet the Paradise CA tile's mask reads ALL ZERO across
+    # rows carrying real 40 m heights, and ~10k of the 56k chm tiles have no sidecar at
+    # all. A mask that flags live data invalid is worse than none. No-data is therefore
+    # an ABSENT TILE (ocean, unimaged), which folds no cells at all.
+    _chm_store = S3Store(CHM_BUCKET, region="us-east-1", skip_signature=True)
+    _csem = asyncio.Semaphore(12)
+
+    async def _chm_range(path, a, b):
+        """Inclusive byte range [a, b], like the PMTiles reader's."""
+        async with _csem:
+            return bytes(
+                memoryview(
+                    await obstore.get_range_async(_chm_store, path, start=a, end=b + 1)
+                )
+            )
+
+    def _quadkey(tx, ty):
+        """Tile x, y at CHM_Z -> the base-4 quadkey string the objects are named by."""
+        return "".join(
+            str((((ty >> (CHM_Z - 1 - i)) & 1) << 1) | ((tx >> (CHM_Z - 1 - i)) & 1))
+            for i in range(CHM_Z)
+        )
+
+    _ifds = {}  # quadkey -> {tag: value}, or None where the tile does not exist
+
+    async def _chm_ifd(qk):
+        """The tags that matter from one tile's IFD, fetched once, kept forever.
+
+        BigTIFF: 16-byte header with a u64 IFD offset, then a u64 entry count and
+        20-byte entries. Everything this reader needs (the strip offset and byte-count
+        ARRAY offsets, compression, predictor) fits or points within the u64 value
+        slot, so entries are read as (tag, value) and the types are ignored.
+        """
+        if qk in _ifds:
+            return _ifds[qk]
+        path = f"{CHM_BASE}/chm/{qk}.tif"
+        try:
+            head = await _chm_range(path, 0, 15)
+        except Exception:
+            # obstore surfaces a missing key as a generic error, and an absent quadkey
+            # is a NORMAL answer here (ocean, unimaged): cached so it is asked once.
+            _ifds[qk] = None
+            return None
+        assert head[:2] == b"II" and struct.unpack("<H", head[2:4])[0] == 43, (
+            "not a little-endian BigTIFF"
+        )
+        off = struct.unpack("<Q", head[8:16])[0]
+        buf = await _chm_range(path, off, off + 8 + 20 * 24 - 1)
+        n = struct.unpack("<Q", buf[:8])[0]
+        tags = {}
+        for k in range(min(n, 24)):
+            tag, _typ, _cnt = struct.unpack_from("<HHQ", buf, 8 + 20 * k)
+            (tags[tag],) = struct.unpack_from("<Q", buf, 8 + 20 * k + 12)
+        assert tags.get(259) == 8, "not deflate"
+        assert tags.get(256) == CHM_TILE and tags.get(278, 1) == 1, "not 1-row strips"
+        _ifds[qk] = tags
+        return tags
+
+    class _TooBig(Exception):
+        pass
+
+    async def _tile_window(qk, lr, lc):
+        """Strided local rows x columns of one tile, as float32 metres, or None.
+
+        The fetch is the whole strip span in ~8 MB pieces. The strips wanted are a
+        stride-CAN_STRIDE comb over that span, but each is KB-sized, so any range
+        coalescing refetches the gaps anyway and one contiguous span is the honest
+        request. The stride pays off in the DECODE, where three strips in four are
+        never inflated, and a strip that IS inflated is decompressed full width
+        whatever the column window wants: that is what 1-row strips cost.
+        """
+        t = await _chm_ifd(qk)
+        if t is None:
+            return None, 0.0
+        path = f"{CHM_BASE}/chm/{qk}.tif"
+        r0, r1 = int(lr[0]), int(lr[-1]) + 1
+        oo, cc = await asyncio.gather(
+            _chm_range(path, t[273] + 8 * r0, t[273] + 8 * r1 - 1),
+            _chm_range(path, t[279] + 8 * r0, t[279] + 8 * r1 - 1),
+        )
+        oo = np.frombuffer(oo, "<u8")
+        cc = np.frombuffer(cc, "<u8")
+        lo, hi = int(oo[0]), int(oo[-1] + cc[-1])
+        if hi - lo > CANOPY_BUDGET:
+            raise _TooBig(f"{(hi - lo) / 1e6:.0f} MB")
+        piece = 8 << 20
+        parts = await asyncio.gather(
+            *(_chm_range(path, a, min(a + piece, hi) - 1) for a in range(lo, hi, piece))
+        )
+        blob = b"".join(parts)
+        out = np.empty((lr.size, lc.size), np.float32)
+        pred = t.get(317, 1)
+        for j, r in enumerate(lr):
+            i = int(r) - r0
+            raw = zlib.decompress(blob[int(oo[i]) - lo : int(oo[i] + cc[i]) - lo])
+            row = np.frombuffer(raw, np.uint8)
+            if pred == 2:
+                # Predictor 2 is horizontal differencing; uint8 cumsum wraps mod 256,
+                # which is exactly its inverse.
+                row = np.cumsum(row, dtype=np.uint8)
+            out[j] = row[lc]
+        return out, (hi - lo) / 1e6
+
+    async def read_canopy(box, stride=CAN_STRIDE):
+        """CHM pixels covering `box`, strided, as (lat, lng, v) Arrow rows plus a note.
+
+        `stride` is per call because the ladder's top rung needs a finer comb: res 12
+        cells hold ~13 pixels under the default stride, ~54 under stride 2.
+
+        Web Mercator both ways is closed form (the HFP notebook needed a Newton solve
+        for Mollweide; this is the easy CRS): rows map to latitude through the inverse
+        Gudermannian and columns to longitude linearly. Pixel CENTRES, hence the +0.5,
+        same as every fold in this repo.
+        """
+        w, s, e, n = box
+        N = CHM_TILE << CHM_Z
+
+        def _gy(la):
+            la = min(85.05, max(-85.05, la))
+            yf = (
+                1.0
+                - math.log(
+                    math.tan(math.radians(la)) + 1.0 / math.cos(math.radians(la))
+                )
+                / math.pi
+            ) / 2.0
+            return min(N - 1, max(0, int(yf * N)))
+
+        gx0 = max(0, int((w + 180.0) / 360.0 * N))
+        gx1 = min(N, int(math.ceil((e + 180.0) / 360.0 * N)))
+        gy0, gy1 = _gy(n), _gy(s) + 1
+        if gx1 <= gx0 or gy1 <= gy0:
+            return None, "off-grid"
+        rows = np.arange(gy0, gy1, stride)
+        cols = np.arange(gx0, gx1, stride)
+        tys = range(gy0 // CHM_TILE, (gy1 - 1) // CHM_TILE + 1)
+        txs = range(gx0 // CHM_TILE, (gx1 - 1) // CHM_TILE + 1)
+        if len(tys) * len(txs) > 4:
+            # Unreachable from the canopy band (a z13 view is ~13 km against a 78 km
+            # tile), so this only guards a future caller with a wider ambition.
+            return None, "view too wide"
+
+        vals = np.full((rows.size, cols.size), np.nan, np.float32)
+        mb, hit = 0.0, 0
+        try:
+            for ty in tys:
+                rsel = np.nonzero(rows // CHM_TILE == ty)[0]
+                if rsel.size == 0:
+                    continue
+                lr = rows[rsel] - ty * CHM_TILE
+                for tx in txs:
+                    csel = np.nonzero(cols // CHM_TILE == tx)[0]
+                    if csel.size == 0:
+                        continue
+                    lc = cols[csel] - tx * CHM_TILE
+                    data, nb = await _tile_window(_quadkey(tx, ty), lr, lc)
+                    if data is None:
+                        continue
+                    vals[np.ix_(rsel, csel)] = data
+                    mb += nb
+                    hit += 1
+        except _TooBig as exc:
+            return None, f"skipped ({exc})"
+        if hit == 0:
+            return None, "no CHM tile"
+
+        lat = np.degrees(np.arctan(np.sinh(np.pi * (1.0 - 2.0 * (rows + 0.5) / N))))
+        lng = (cols + 0.5) / N * 360.0 - 180.0
+        vv = vals.ravel()
+        keep = np.isfinite(vv)
+        tbl = pa.table(
+            {
+                "lat": np.repeat(lat, cols.size)[keep],
+                "lng": np.tile(lng, rows.size)[keep],
+                "v": vv[keep].astype("float64"),
+            }
+        )
+        return tbl, f"{mb:.0f} MB"
+
+    return (read_canopy,)
+
+
+@app.cell
+def _(
     BitmapTileLayer,
+    CANOPY_ZOOM,
+    CAN_STOPS,
     CartoBasemap,
     Controls,
     DIVISION_LABEL,
@@ -1388,6 +1726,7 @@ def _(
     VIEW_H,
     VIEW_W,
     asyncio,
+    can_res_for_zoom,
     cells_to_layer,
     division_for_zoom,
     from_wkb,
@@ -1395,6 +1734,7 @@ def _(
     multipolygon,
     np,
     ramp,
+    ramp_canopy,
     res_for_zoom,
     seed_cells,
     seed_divisions,
@@ -1416,7 +1756,7 @@ def _(
         stroked=False,
         high_precision=True,
         coverage=1,
-        opacity=0.5,
+        opacity=0.7,
         pickable=True,
     )
 
@@ -1461,7 +1801,7 @@ def _(
         tile_size=512,
         max_zoom=19,
         min_zoom=0,
-        opacity=0.6,
+        opacity=0.8,
         pickable=False,
     )
 
@@ -1481,9 +1821,10 @@ def _(
             HOLD[_t].cancel()
         HOLD[_t] = None
     HOLD["busy"], HOLD["pending"] = False, None
-    HOLD["wh"] = (float(VIEW_W), float(VIEW_H))
     HOLD["res"], HOLD["box"], HOLD["div"] = None, None, None
     HOLD["divpair"], HOLD["divbox"], HOLD["vs"] = None, None, None
+    HOLD["can"], HOLD["mode"] = None, "deforest"
+    HOLD["wh"] = (float(VIEW_W), float(VIEW_H))
     HOLD["head"], HOLD["tail"] = "", ""
     HOLD["cache"].clear()
 
@@ -1494,10 +1835,10 @@ def _(
         span is that scaled by the aspect ratio and by cos(latitude), because a degree of
         longitude narrows toward the poles.
 
-        The size comes from HOLD["wh"], which is the MEASURED canvas, not the old
-        VIEW_W/VIEW_H guess: view_state has no width or height in it, so the Status
-        widget rulers the deck canvas in the browser and syncs it up. Fullscreen was
-        where the guess failed visibly.
+        The size comes from HOLD["wh"], the MEASURED canvas, not the VIEW_W/VIEW_H
+        guess: view_state has no width or height in it, so the Status widget rulers the
+        deck canvas in the browser and syncs it up. Fullscreen is where the guess
+        failed visibly in the HFP notebook, and this fork ports its fix.
         """
         import math as _m
 
@@ -1547,13 +1888,6 @@ def _(
         Kept separate from the read because most camera moves read nothing, and the zoom
         readout still has to move: zooming IN always lands inside the box the last read
         covered, so without this the line would freeze exactly when the map is busiest.
-
-        THE VIEWPORT DIAGNOSTICS ARE ENABLED, matching the HFP notebook, where the
-        fullscreen defect has been seen again since the ruler landed and is not yet
-        closed. The px readout below is the kernel's half (1400x620 that never moves
-        means the browser has not reported in); el.appendChild(probe) in Status._esm is
-        the browser's half, no kernel involved. The two disagreeing names the broken
-        leg. Comment both out once the defect is closed.
         """
         status.value = (
             f"{HOLD['head']}{HOLD['tail']} · zoom {vs.zoom:.1f}"
@@ -1594,8 +1928,22 @@ def _(
             # A whole re-push, not an accessor assignment. See divisions_to_layer.
             if HOLD["divpair"] is not None:
                 put_divisions(HOLD["divpair"])
+        elif name == "paint":
+            # The same path a camera event takes: everything answerable from memory is
+            # answered in _instant (both switch directions keep their last layer table),
+            # and only a genuinely missing canopy fold spawns a read.
+            vs = HOLD["vs"]
+            if vs is None:
+                return
+            if HOLD["busy"]:
+                HOLD["pending"] = vs
+            elif not _instant(vs):
+                HOLD["task"] = _spawn(refresh(vs))
 
-    controls.observe(_on_controls, names=["show_cells", "show_divisions", "division_fill"])
+    controls.observe(
+        _on_controls,
+        names=["show_cells", "show_divisions", "division_fill", "paint"],
+    )
 
     def _on_wh(change):
         """The canvas changed size: fullscreen, a window resize, a layout shift.
@@ -1641,15 +1989,45 @@ def _(
         res, sub = res_for_zoom(vs.zoom), division_for_zoom(vs.zoom)
         seen = view_to_bbox(vs)
         div_ok = sub is None or (sub == HOLD["div"] and _covers(HOLD["divbox"], seen))
-        if res == HOLD["res"] and sub == HOLD["div"] and div_ok and _covers(HOLD["box"], seen):
+        # CANOPY MODE FIRST. The hexagons must be canopy cells at this zoom's CANOPY
+        # resolution covering this view. The last canopy fold is kept whole, so both
+        # switch directions and any pan inside its box are dict lookups here, never
+        # a wait; only a genuinely unfolded view falls through to the read.
+        if controls.paint == "canopy" and vs.zoom >= CANOPY_ZOOM:
+            c = HOLD["can"]
+            if (
+                c is not None
+                and c[1] == can_res_for_zoom(vs.zoom)
+                and _covers(c[0], seen)
+                and sub == HOLD["div"]
+                and div_ok
+            ):
+                if HOLD["mode"] != "canopy":
+                    put_cells(c[2])
+                    HOLD["mode"] = "canopy"
+                    HOLD["head"] = (
+                        f"<b>canopy res {c[1]}</b> · {c[2].num_rows:,} cells · cached"
+                    )
+                set_status(vs)
+                return True
+            return False
+        if (
+            HOLD["mode"] == "deforest"
+            and res == HOLD["res"]
+            and sub == HOLD["div"]
+            and div_ok
+            and _covers(HOLD["box"], seen)
+        ):
             set_status(vs)
             return True
         # A resolution folded before that still covers the screen. This is the whole
         # zoom-out case: coming back up to a level already visited lands on the frame it is
-        # asked for rather than a second later.
+        # asked for rather than a second later. It is also the canopy -> deforestation
+        # switch, which lands here because the deforestation layer table is still cached.
         hit = HOLD["cache"].get(res)
         if hit and sub == HOLD["div"] and div_ok and _covers(hit[0], seen):
             put_cells(hit[1])
+            HOLD["mode"] = "deforest"
             HOLD["res"], HOLD["box"] = res, hit[0]
             HOLD["head"] = f"<b>res {res}</b> · {hit[1].num_rows:,} cells · cached"
             set_status(vs)
@@ -1680,7 +2058,10 @@ def _(
 
         tbl = cells_to_layer(raw)
         HOLD["cache"][res] = [want, tbl, raw]
-        put_cells(tbl)
+        can_want = controls.paint == "canopy" and vs.zoom >= CANOPY_ZOOM
+        if not can_want:
+            put_cells(tbl)
+            HOLD["mode"] = "deforest"
         HOLD["res"], HOLD["box"] = res, want
 
         HOLD["head"] = (
@@ -1688,7 +2069,35 @@ def _(
             f"{'tiles cached' if fetched == 0 else f'{fetched} tiles'}"
             f"{f' · {skipped} sparse' if skipped else ''}"
         )
+        if controls.paint == "canopy" and not can_want:
+            HOLD["head"] += f" · canopy needs zoom {CANOPY_ZOOM:g}+"
         set_status(vs)
+
+        # THE CANOPY, OVER THE SAME FOLD. The deforestation fold above still ran: the
+        # divisions below are zonal means of it whatever the hexagons show, and each
+        # canopy cell carries its parent's deforested share into the tooltip. Only the
+        # hexagon PAINT is swapped.
+        if can_want:
+            cres = can_res_for_zoom(vs.zoom)
+            HOLD["head"] = f"<b>reading canopy…</b> res {cres}"
+            set_status(vs)
+            can_tbl, can_note = await HOLD["canfold"](want, cres, raw, res)
+            if can_tbl is None:
+                # No CHM tile here, or the read refused: the deforestation cells stand
+                # in, and the note says why the switch did not take.
+                put_cells(tbl)
+                HOLD["mode"] = "deforest"
+                HOLD["head"] = (
+                    f"<b>res {res}</b> · {raw.num_rows:,} cells · canopy {can_note}"
+                )
+            else:
+                put_cells(can_tbl)
+                HOLD["can"] = [want, cres, can_tbl]
+                HOLD["mode"] = "canopy"
+                HOLD["head"] = (
+                    f"<b>canopy res {cres}</b> · {can_tbl.num_rows:,} cells · {can_note}"
+                )
+            set_status(vs)
 
         # THE DIVISIONS, AFTER THE CELLS. The cells are the expensive read and the thing
         # the user is waiting to see; the zonal join depends on them, so it goes out second
@@ -1786,19 +2195,19 @@ def _(
 
     deck.observe(_on_camera, names="view_state")
 
-    # ---------------------------------------------------------------- the ranking
-    # Press "rank what's in view" in the controls and the divisions on screen come back
-    # ranked, below. This is the one place the join produces a NUMBER rather than a
-    # colour. The box is the view itself, but the READ is still an explicit ask: it goes
-    # one level FINER than the screen and it names the divisions outright.
+    # ---------------------------------------------------------------- the drawn box
+    # Draw a box with the ▢ button at the lower right of the map and the divisions inside it
+    # come back ranked, below. This is the one place the join produces a NUMBER rather than a
+    # colour, and it is deliberately not tied to the camera: the box is an explicit ask, so
+    # it reads one level FINER than the screen and it names the divisions outright.
     RANK_N = 25
 
     def rank_html(out):
         if out is None:
             return (
                 "<div style='font:12.5px ui-monospace,SFMono-Regular,Menlo,monospace;"
-                "opacity:.75;padding:.5rem 0'>No division in view caught a cell centre. "
-                "Zoom out for larger divisions, or in for finer cells.</div>"
+                "opacity:.75;padding:.5rem 0'>No division in that box caught a cell centre. "
+                "Draw a larger box, or zoom in first.</div>"
             )
         sub, res, tbl, n_small = out
         names = tbl["name"].to_pylist()
@@ -1830,7 +2239,7 @@ def _(
                 f"</tr>"
             )
         head = (
-            f"<b>{len(names):,} {DIVISION_LABEL[sub]} in view</b>, ranked by mean share "
+            f"<b>{len(names):,} {DIVISION_LABEL[sub]} in the box</b>, ranked by mean share "
             f"deforested 2002-2022, measured at H3 res {res}"
             + (
                 f" · <span style='color:#E69F00'>{n_small} too small to measure</span>"
@@ -1850,24 +2259,14 @@ def _(
             "<table style='border-collapse:collapse'>" + "".join(rows) + "</table></div>"
         )
 
-    def _on_rank_view(change):
-        """The ranking, for WHAT IS ON SCREEN. Replaces lonboard's draw-box tool.
-
-        The drawn box asked the user to describe a region twice: once with the camera
-        and again with a rectangle. The button keeps the camera as the only statement
-        of intent: the ranked box is exactly the view, through the same view_to_bbox
-        the fold uses. The Bool's value carries nothing; any change is a click.
-        """
-        vs = HOLD["vs"]
-        if vs is None:
-            # No camera event yet: the map still shows HOME, so rank that.
-            from types import SimpleNamespace
-
-            vs = SimpleNamespace(**HOME)
-        box = view_to_bbox(vs)
+    def _on_select(change):
+        b = change["new"]
+        if not b:
+            return  # a fresh Map resets selected_bounds to None
+        box = tuple(float(v) for v in b)
         ranking.value = (
             "<div style='font:12.5px ui-monospace,SFMono-Regular,Menlo,monospace;"
-            "opacity:.7;padding:.5rem 0'><b>ranking</b> the divisions in view…</div>"
+            "opacity:.7;padding:.5rem 0'><b>ranking</b> the divisions in that box…</div>"
         )
 
         async def go():
@@ -1883,7 +2282,7 @@ def _(
 
         HOLD["seltask"] = _spawn(go())
 
-    controls.observe(_on_rank_view, names="rank_view")
+    deck.observe(_on_select, names="selected_bounds")
 
     # The legend, built from the same `ramp` the layers use, so a colour on the map and a
     # colour in the key cannot drift apart. The division fill uses the same ramp at a lower
@@ -1895,13 +2294,23 @@ def _(
         f";outline:1px solid rgba(255,255,255,.18)'></span>{lab}</span>"
         for v, lab in STOPS
     )
+    _cw = "".join(
+        f"<span style='display:inline-flex;align-items:center;gap:.3rem;margin-right:.8rem'>"
+        f"<span style='width:14px;height:14px;border-radius:2px;background:rgb("
+        f"{','.join(str(int(c)) for c in ramp_canopy(np.array([v]))[0])})"
+        f";outline:1px solid rgba(255,255,255,.18)'></span>{lab}</span>"
+        for v, lab in CAN_STOPS
+    )
     legend = (
         "<div style=\"font:12px ui-sans-serif,system-ui,sans-serif;"
         "display:flex;flex-wrap:wrap;align-items:center;padding:.35rem 0\">"
         "<b style='margin-right:.7rem'>share of cell deforested 2002-2022</b>"
         f"{_sw}</div>"
+        "<div style=\"font:12px ui-sans-serif,system-ui,sans-serif;"
+        "display:flex;flex-wrap:wrap;align-items:center;padding:.1rem 0 .35rem\">"
+        f"<b style='margin-right:.7rem'>canopy height today (colour switch, zoom {CANOPY_ZOOM:g}+)</b>"
+        f"{_cw}</div>"
     )
-    
     return controls, deck, legend, ranking, refresh, status
 
 
@@ -1918,9 +2327,12 @@ async def _(
     SOURCE_BUCKET,
     TILE,
     TILE_BUDGET,
+    VIEW_W,
     Window,
     XarrayContext,
     asyncio,
+    canopy_cells_to_layer,
+    con,
     coordinates_to_cells,
     divisions_to_layer,
     fetch_divisions,
@@ -1930,6 +2342,7 @@ async def _(
     np,
     pa,
     polyfill,
+    read_canopy,
     refresh,
     res_for_zoom,
     udf,
@@ -2135,6 +2548,66 @@ async def _(
             skipped,
         )
 
+    # THE CANOPY FOLD, AND THE PARENT JOIN THAT MAKES IT A PAIRING. The reader hands
+    # back strided (lat, lng, metres) rows; the fold is the same UDF group-by as the
+    # raster fold above, minus xarray, because the pixels arrive already flattened.
+    # Each canopy cell then LEFT-joins the deforested share of the COARSER cell it
+    # sits in, via h3_cell_to_parent in DuckDB: geometry-free, but it is an H3 call,
+    # and Uber's C is the fast H3 in this repo, same reasoning as the polyfill. The
+    # LEFT matters twice over: the deforestation fold DROPS zero cells, so "no parent
+    # row" means "nothing measured here", and it must arrive as null, never 0%.
+    _can_mem = []  # [[box, res, layer table], ...], newest last
+    CAN_KEEP = 6
+
+    def _can_covers(outer, inner):
+        return (
+            outer[0] <= inner[0]
+            and outer[1] <= inner[1]
+            and outer[2] >= inner[2]
+            and outer[3] >= inner[3]
+        )
+
+    async def fold_canopy(box, cres, deforest_raw, pres):
+        """Canopy layer table for `box` at res `cres`, or (None, why not)."""
+        for ent in reversed(_can_mem):
+            if ent[1] == cres and _can_covers(ent[0], box):
+                _can_mem.remove(ent)
+                _can_mem.append(ent)
+                return ent[2], "cached"
+        # The ladder's top rung reads a finer comb; see CAN_MAX_RES for the arithmetic.
+        pix, note = await (read_canopy(box, 2) if cres >= 12 else read_canopy(box))
+        if pix is None:
+            return None, note
+        _register("canpix", pix)
+        can = ctx.sql(f"""
+            SELECT h3_latlng_to_cell(lat, lng, CAST({cres} AS INT)) AS hex,
+                   avg(v) AS canopy,
+                   count(*) AS px
+            FROM canpix
+            GROUP BY 1
+        """).to_arrow_table()
+        if can.num_rows == 0:
+            return None, "no canopy cells"
+        cantbl = can  # noqa: F841 - read by DuckDB's replacement scan, not by Python
+        pmap = con.sql(
+            f"SELECT hex, h3_cell_to_parent(hex, {int(pres)}) AS phex FROM cantbl"
+        ).to_arrow_table()
+        # No await from the register to the query, same rule as the zonal join below.
+        _register("can", can)
+        _register("canpar", pmap)
+        _register("dcells", deforest_raw)
+        joined = ctx.sql("""
+            SELECT k.hex AS hex, k.canopy AS canopy, k.px AS px, d.portion AS portion
+            FROM can k
+            LEFT JOIN canpar p ON k.hex = p.hex
+            LEFT JOIN dcells d ON p.phex = d.hex
+        """).to_arrow_table()
+        layer = canopy_cells_to_layer(joined)
+        _can_mem.append([box, cres, layer])
+        while len(_can_mem) > CAN_KEEP:
+            _can_mem.pop(0)
+        return layer, note
+
     # THE ZONAL JOIN, IN DATAFUSION.
     #
     # An equi-join on a UBIGINT plus a group-by. No geometry, no H3 call, nothing a query
@@ -2196,22 +2669,22 @@ async def _(
         )
 
     async def rank(box):
-        """Every division inside the ranked box, with its mean, for the panel below the map.
+        """Every division inside a drawn box, with its mean, for the ranking below the map.
 
         Returns (subtype, resolution, table, divisions with no number) or None.
 
         THREE THINGS THIS DOES NOT SHARE WITH THE CAMERA, AND WHY.
-        1. It reads ONE RESOLUTION FINER than the screen would. The button is an explicit
+        1. It reads ONE RESOLUTION FINER than the screen would. A drawn box is an explicit
            question about a specific place, so it is worth a read the camera would not
            spend, and the finer the cells the fewer divisions fall through the 'center' rule.
-        2. It derives that resolution from the BOX, not from the camera's zoom trait, so
-           the two cannot drift.
+        2. It derives that resolution from the BOX, not from the current zoom, so a small box
+           drawn on a wide view still gets measured properly.
         3. It falls back county -> region -> country. Overture has counties for 171 of 219
            countries, so a box over the other 48 would otherwise come back empty rather than
            answering at the finest level that exists there.
         """
         span = max(box[2] - box[0], 1e-9)
-        z = math.log2(360.0 * HOLD["wh"][0] / (512 * span))
+        z = math.log2(360.0 * VIEW_W / (512 * span))
         res = min(MAX_RES, res_for_zoom(z) + 1)
         raw, _fetched, _skipped = await fold(res, box)
         if raw is None or raw.num_rows == 0:
@@ -2228,6 +2701,7 @@ async def _(
     HOLD["fold"] = fold
     HOLD["zonal"] = zonal
     HOLD["rank"] = rank
+    HOLD["canfold"] = fold_canopy
     HOLD["loop"] = asyncio.get_running_loop()
 
     # The opening draw. force=True skips the settle: there is nothing to debounce yet.
@@ -2251,11 +2725,19 @@ def _(controls, deck, legend, mo, ranking, status):
             mo.md(
                 "Deforestation 2002-2022 as a share of each 100 m cell "
                 "(Vizzuality / LandGriffon, CC-BY 4.0). Boundaries: Overture Maps. "
+                "**Canopy**: Meta & WRI High Resolution Canopy Height Maps, ~1 m "
+                "(CC-BY 4.0). Above zoom 13 the `colour` switch repaints the hexagons "
+                "by canopy height at a FINER resolution than the deforestation fold "
+                "(the 1 m data supports res 10-12 where the 100 m data caps at res 8); "
+                "each canopy cell's tooltip carries the deforested share of the coarser "
+                "cell it sits in, so tall-and-cleared reads differently from "
+                "tall-and-intact. Canopy vintage is per Maxar acquisition (2018-2020 "
+                "mostly), so a fresh clearcut can still wear last year's trees. "
                 "A division's value is the mean over the H3 cells whose CENTRE falls "
                 "inside it, so divisions smaller than one cell at the current resolution "
                 "are drawn unfilled rather than given a number. "
-                "**Press \"rank what's in view\"** in the controls above to rank the "
-                "divisions on screen."
+                "**Draw a box** with the ▢ button at the lower right of the map to rank "
+                "the divisions inside it."
             ),
             ranking,
         ]
