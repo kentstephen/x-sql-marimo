@@ -5,7 +5,7 @@ Guidance for Claude Code working in this repository. Inherits the global rules i
 
 ## Repository layout
 
-**Four interactive notebooks are the repo**, plus one static one-shot. Everything else
+**Five interactive notebooks are the repo**, plus one static one-shot. Everything else
 is in `archive/`, kept for reference and not maintained.
 
 `xsql-firerisk-buildings.py` folds CarbonPlan's 30 m CONUS wildfire-risk **Zarr v3
@@ -145,6 +145,53 @@ Redwoods. Things to know before touching it:
   (measured max 57 m over real ~100 m redwoods).
 - It carries the HFP ruler, a `SessionContext` instead of XarrayContext (no raster
   windowing, so no xarray), and no DuckDB (no polyfill, no dissolve).
+
+`xsql-flood-buildings.py` (EXPERIMENTAL, working but with open defects, see below)
+draws FEMA NFHL flood zones from Carl Boettiger's PMTiles build and joins them onto
+Overture divisions zoomed out (share of each county/locality inside the 1% floodplain)
+and onto individual building footprints past zoom 13 (each coloured by the worst zone
+its cells touch). One-line pitch: the fire-risk buildings notebook's question asked of
+water instead of fire, with the raster replaced by vector polygons. Things to know:
+
+- **Data:** `cboettig/hazard/flood-hazard.pmtiles` on source.coop (FEMA S_FLD_HAZ_AR,
+  5.63M polygons, public domain, z0-13, layer `flood-hazard`, all attributes in the
+  tiles at every zoom incl. `fid`, the dissolve key). Geometry is simplified ~10 m
+  upstream, stated lossless at H3 res 10. The sibling `sea-level-rise.pmtiles` (NOAA
+  5 ft inundation, 147 MB, layer `sea-level-rise`, field `slr_ft`) is the planned
+  toggle; `HAZ_PATH`/`HAZ_LAYER` in the constants cell are the seam. Carl's
+  precomputed `flood-hazard/hex/` is a real res-10 polyfill (unlike the NWI point
+  index) but ships as 14 h0 partitions of ~850 MB each: kept as a correctness
+  cross-check, not the live read path.
+- **DuckDB is the ONLY engine**, a first for the repo. No raster means no fold, so
+  DataFusion/h3ronpy's winning regime never occurs; polyfill, seam dissolve and the
+  equi-joins are all duckdb-h3 + spatial. Three PMTiles archives (hazard, divisions,
+  buildings) go through ONE parameterised reader instead of the usual copy-per-archive.
+- **The joins run on two H3 ladders bridged by `h3_cell_to_parent`** (each cell has
+  exactly 7 children, so counts are exact). Divisions polyfill `center` at
+  `res_for_zoom`; zones fill `center` ONE step finer (`ZFINE = 1`; +2 exploded over
+  coastal Louisiana, half of which is SFHA). Buildings fill `overlap` at res 11
+  against zone cells at res 12, `MAX(zc)` = worst zone. `zc >= 2` is the SFHA line.
+  Classes: 3 V/VE (orange), 2 A-family (blue), 1 shaded-X 0.2% (slate), 0 D (gray),
+  -1 dropped at decode (X minimal, OPEN WATER, AREA NOT INCLUDED; painting "minimal
+  hazard" would paint the country). Explicit set membership, NOT startswith("A"):
+  FLD_ZONE's own vocabulary includes "AREA NOT INCLUDED".
+- **The map cell and the wiring cell are SPLIT**, unlike the older notebooks:
+  destroying a lonboard Map terminates deck's MODULE-LEVEL earcut worker pool, after
+  which every polygon layer on the page fails to init until the browser reloads. The
+  map cell depends only on imports/widget classes/seeds/HOLD and must never re-run;
+  the wiring cell re-runs freely, unobserving old handlers via `HOLD["h_*"]` refs
+  before re-observing. The camera survives edits (redraw targets `HOLD["vs"]`).
+- **A Photon geocoder** (lonboard 0.16 `GeocoderControl`, stdlib urllib on a thread,
+  camera-biased). Passing `controls` to `Map` REPLACES the default tuple, so
+  fullscreen/navigation/scale are restated alongside it. Photon's `extent` is
+  [minLon, maxLat, maxLon, minLat]; lonboard's bbox is (minx, miny, maxx, maxy).
+- **OPEN DEFECTS, unresolved at commit time:** (1) re-running after an edit can still
+  leave the map blank even after the cell split, mechanism not yet isolated; (2) data
+  disappears on zoom-in in some sequences (suspects: the `_instant` tile-zoom
+  fidelity check against `HOLD["ztz"]`, or a zone-memo coverage hit serving a stale
+  regime). Headless export passes both regimes; the defects are interactive-only.
+  Debug against the browser console; the earcut-pool cascade recorded above is what
+  a dead deck looks like and is NOT evidence about which layer is at fault.
 
 None of the notebooks import anything from `archive/`: their only dependencies are the
 third-party ones in their PEP 723 headers.
