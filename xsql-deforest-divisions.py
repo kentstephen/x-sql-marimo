@@ -11,7 +11,7 @@
 #     "geoarrow-rust-core",
 #     "obstore>=0.9.2",
 #     "async-geotiff>=0.4",
-#     "lonboard>=0.16.0",
+#     "lonboard[geotiff]>=0.16.0",
 #     "anywidget>=0.9",
 #     "numpy==2.5.1",
 #     "duckdb>=1.5.5",
@@ -68,6 +68,15 @@ magnitude (p1 7.3e-8, p50 2.1e-3, p99.9 0.45), so a linear 0-1 ramp paints a bla
 Zero takes its own dark swatch and the rest is log10 over 1e-4 to 0.5, which is p25 to
 p99.9. See the ramp cell for why zero is separated by luminance and not by hue.
 
+THE PAINT IS THE RASTER ITSELF (2026-08-14, not yet flown interactively). A lonboard
+RasterLayer serves the COG's own pyramid as PNG tiles coloured by the same ramp, so the
+map shows pixels rather than cell means; the H3 hexagon layer is commented out in the map
+cell, not deleted. The fold is untouched, because the divisions join and the ranking eat
+its cells. Zero and NaN pixels are both transparent, matching the fold's
+`HAVING avg(v) > 0`. The layer is built directly rather than via
+RasterLayer.from_geotiff, for two reasons recorded at the construction site: from_geotiff's
+fetch is not sparse-aware, and its zoom clamp ships commented out.
+
 PRESS THE BUTTON AND THE JOIN BECOMES A NUMBER. "rank what's in view", in the controls
 under the map, ranks every division in the current view by its mean share deforested. It
 reads one H3 resolution finer than the screen does, sizes that resolution from the view
@@ -96,6 +105,7 @@ app = marimo.App(width="full")
 def _():
     import asyncio
     import gzip
+    import io
     import math
     import struct
 
@@ -112,19 +122,33 @@ def _():
     import xarray as xr
     from arro3.core import Array as ArroArray, Table as ArroTable
     from async_geotiff import GeoTIFF, Window
+    from async_geotiff.tms import generate_tms
     from datafusion import udf
     from geoarrow.rust.core import from_wkb, multipolygon
     from h3ronpy.vector import coordinates_to_cells
     from obstore.store import S3Store
     from xarray_sql import XarrayContext
+    from matplotlib import image as mpl_image
     from lonboard import Map, H3HexagonLayer, PolygonLayer, BitmapTileLayer
+    from lonboard import RasterLayer
+    from lonboard.raster import EncodedImage
     from lonboard.basemap import CartoBasemap, MaplibreBasemap
+    from lonboard._geoarrow.ops import Bbox
     from lonboard._serialization import infer_rows_per_chunk
 
     return (
         ArroArray,
         ArroTable,
+        Bbox,
+        BitmapTileLayer,
+        CartoBasemap,
+        EncodedImage,
         GeoTIFF,
+        H3HexagonLayer,
+        Map,
+        MaplibreBasemap,
+        PolygonLayer,
+        RasterLayer,
         S3Store,
         Window,
         XarrayContext,
@@ -133,10 +157,14 @@ def _():
         coordinates_to_cells,
         duckdb,
         from_wkb,
+        generate_tms,
         gzip,
+        infer_rows_per_chunk,
+        io,
         math,
         matplotlib,
         mo,
+        mpl_image,
         multipolygon,
         np,
         obstore,
@@ -300,7 +328,7 @@ def _(anywidget, traitlets):
             l.appendChild(document.createTextNode(label));
             box.appendChild(l);
           };
-          check("show_cells", "hexagons");
+          check("show_cells", "deforestation");
           check("show_divisions", "boundaries");
           check("division_fill", "boundary fill");
 
@@ -319,6 +347,48 @@ def _(anywidget, traitlets):
             model.save_changes();
           };
           box.appendChild(btn);
+
+          // BOUNDARY FILL OPACITY. A stepped slider (0.1-1.0 by 0.1) plus a free
+          // number box (any 0-1 float); both write the same Unicode trait, because
+          // Unicode is proven to cross marimo's bridge browser -> kernel (the Status
+          // ruler's "WxH" string). Commit on 'change', not 'input': every commit
+          // re-tints and re-pushes the divisions table, and Safari/Firefox fire
+          // 'change' DURING a drag anyway (terrain notebook lesson), so the 0.1
+          // steps are the real rate limiter.
+          const ow = document.createElement("span");
+          ow.style.cssText =
+            "display:inline-flex;align-items:center;gap:.35rem;opacity:.9";
+          ow.appendChild(document.createTextNode("fill opacity"));
+          const sl = document.createElement("input");
+          sl.type = "range";
+          sl.min = "0.1"; sl.max = "1"; sl.step = "0.1";
+          sl.style.width = "6rem";
+          const nb = document.createElement("input");
+          nb.type = "number";
+          // step 0.1 so the spinner arrows move in tenths (Stephen's spec); typed
+          // values are still any float, the step only drives the up/down buttons.
+          nb.min = "0"; nb.max = "1"; nb.step = "0.1";
+          nb.style.cssText =
+            "width:3.6rem;font:inherit;background:transparent;color:inherit;" +
+            "border:1px solid rgba(127,127,127,.45);border-radius:4px;" +
+            "padding:0 .2rem";
+          const seed0 = parseFloat(model.get("fill_alpha"));
+          sl.value = nb.value = String(Number.isNaN(seed0) ? 0.65 : seed0);
+          const commit = (v) => {
+            v = Math.min(1, Math.max(0, v));
+            sl.value = String(v);
+            nb.value = String(v);
+            model.set("fill_alpha", String(v));
+            model.save_changes();
+          };
+          sl.onchange = () => commit(parseFloat(sl.value));
+          nb.onchange = () => {
+            const v = parseFloat(nb.value);
+            if (!Number.isNaN(v)) commit(v);
+          };
+          ow.appendChild(sl);
+          ow.appendChild(nb);
+          box.appendChild(ow);
           el.appendChild(box);
 
           // HIDE LONBOARD'S DRAW-BOX TOOL. Its toolbar is rendered unconditionally in
@@ -353,6 +423,10 @@ def _(anywidget, traitlets):
         # choropleth is what it produces, so shipping it behind an unticked box meant the
         # result was invisible unless you went looking for it.
         division_fill = traitlets.Bool(True).tag(sync=True)
+        # Boundary fill opacity as a 0-1 float IN A STRING, per the proven-trait-types
+        # rule (Unicode crosses the bridge both ways; numeric traits never made it).
+        # "0.65" matches HOLD["fill_alpha"]'s 165 seed.
+        fill_alpha = traitlets.Unicode("0.65").tag(sync=True)
         # The ranking trigger. Value is meaningless; a CHANGE is a click.
         rank_view = traitlets.Bool(False).tag(sync=True)
 
@@ -376,7 +450,7 @@ def _(anywidget, traitlets):
         """
         value = traitlets.Unicode("").tag(sync=True)
 
-    return
+    return Controls, Panel, Status
 
 
 @app.cell
@@ -467,13 +541,9 @@ def _(math):
     SUB_MINZOOM = {"country": 2, "region": 4, "county": 8}
 
     # ------------------------------------------------------------------ view
-    # The map's pixel size BEFORE the browser reports the real one. The Status widget
-    # measures the deck canvas (view_state has no width/height, so this cannot come from
-    # the camera) and overwrites HOLD["wh"]; these constants only cover the opening fold
-    # and any headless run, where no browser ever reports in. Fullscreen is the case that
-    # made the difference visible: a 620 px assumption inside a 1500 px screen folds a
-    # band, not the viewport.
-    VIEW_W, VIEW_H = 1400, 620
+    # VIEW_W/VIEW_H and HOME moved INTO the map cell (2026-08-14, the cell split): a
+    # constants edit must never re-run the map cell, because destroying the Map kills
+    # deck's earcut pool. See the map cell.
     PAD = 1.25
 
     # SETTLE ONLY GUARDS A READ. Every camera event that can be answered from memory (a pan
@@ -483,32 +553,29 @@ def _(math):
     # object-store read at the end instead of a hundred along the way.
     SETTLE = 0.15
 
-    # The fill alpha for a division choropleth. Not 255: the hexagons stay legible underneath
-    # and the boundary layer reads as a wash over them rather than a lid on them.
-    FILL_ALPHA = 165
+    # The fill alpha moved to HOLD["fill_alpha"] (2026-08-14): the Controls slider writes
+    # it, and it must live somewhere no cell re-run can reset, which is HOLD's whole job.
 
     # The stroke alpha. Higher than the fill so the boundary still reads when the fill is
     # toggled off; the RGB underneath is the same ramp either way.
     LINE_ALPHA = 205
 
-    # Opens on the tropics, because that is where the data is: the Amazon, the Congo basin
-    # and insular southeast Asia are the three places a 2002-2022 deforestation layer has
-    # anything dramatic to say, and all three are in view from here.
-    HOME = {"longitude": -20.0, "latitude": 0.0, "zoom": 2.4}
     return (
         COG,
+        DIVISION_LABEL,
         FETCH_AT_ONCE,
-        FILL_ALPHA,
-        HOME,
         LEVEL_FOR_RES,
         LINE_ALPHA,
         MAX_RES,
+        PAD,
         PM_BUCKET,
         PM_PATH,
+        SETTLE,
         SOURCE_BUCKET,
         SUB_MINZOOM,
         TILE,
         TILE_BUDGET,
+        division_for_zoom,
         res_for_zoom,
     )
 
@@ -581,7 +648,7 @@ def _(matplotlib, np):
         (2.5e-1, "25%"),
         (5e-1, "50%+"),
     ]
-    return ramp, ramp_rgba
+    return STOPS, ramp, ramp_rgba
 
 
 @app.cell
@@ -592,6 +659,11 @@ def _():
     # invisible to the dataflow graph.
     HOLD = {
         "wh": (1400.0, 620.0),  # the real canvas size, measured by Status; this is the seed
+        # Boundary fill alpha, 0-255. The Controls slider/number box writes it (as a 0-1
+        # float, converted in _on_controls); divisions_to_layer reads it for every new
+        # pair. 165 is the old FILL_ALPHA constant: not 255, so the deforestation paint
+        # stays legible underneath and the fill reads as a wash rather than a lid.
+        "fill_alpha": 165,
         "fold": None,  # the SQL fold, set by the read cell
         "zonal": None,  # cells -> division means, set by the read cell
         "rank": None,  # view box -> divisions ranked, set by the read cell
@@ -625,7 +697,7 @@ def _():
 def _(
     ArroArray,
     ArroTable,
-    FILL_ALPHA,
+    HOLD,
     LINE_ALPHA,
     coordinates_to_cells,
     np,
@@ -718,7 +790,10 @@ def _(
             )
             return ArroTable.from_arrays([geom, col, line, *rest], names=names)
 
-        return build(FILL_ALPHA), build(0)
+        # HOLD["fill_alpha"], read at build time: a pair built after the slider moved
+        # carries the new alpha without any extra machinery. Pairs built BEFORE the move
+        # are re-tinted in place by _refill in the map cell.
+        return build(HOLD["fill_alpha"]), build(0)
 
     def seed_cells():
         """One hexagon at null island so the Map has a valid table at build time.
@@ -1369,56 +1444,182 @@ async def _(
 
 
 @app.cell
+async def _(
+    Bbox,
+    COG,
+    EncodedImage,
+    GeoTIFF,
+    RasterLayer,
+    S3Store,
+    SOURCE_BUCKET,
+    TILE,
+    generate_tms,
+    io,
+    mpl_image,
+    np,
+    ramp,
+):
+    # THE RASTER, DRAWN AS ITSELF. RasterLayer.from_geotiff would almost do this, but two
+    # of its choices are wrong for this COG, so the layer is constructed directly with the
+    # same private arguments from_geotiff passes (lonboard 0.16, pinned; the repo already
+    # reaches for lonboard._serialization, so this is house style):
+    #
+    #   1. Its fetch is not sparse-aware. 73.6% of full-res tiles are unstored ocean, and
+    #      `fetch_tile` on one raises the same `Invalid range requested, start: 0 end: 0`
+    #      the fold cell documents. The fetch below consults `ifd.tile_byte_counts` first,
+    #      same fix as the fold: an absent tile is None, no request at all.
+    #   2. Its min_zoom/max_zoom ship commented out, and the fetcher indexes
+    #      `images[len - 1 - z]`, so an overzoomed request wraps negative onto a COARSE
+    #      overview: wrong data, silently. max_zoom pins z to the pyramid (11 levels,
+    #      z0 = coarsest overview, z10 = the 100 m full res).
+    #
+    # This is a SECOND header-only open of the COG. It cannot share the fold cell's
+    # GeoTIFF: the fold cell depends on `refresh` from the wiring, which depends on the
+    # map cell, which needs this layer, so sharing would be a cycle. Headers are ~one
+    # ranged read; the pixel caches are separate and that is fine, the browser's tile
+    # cache is the one that matters here.
+    #
+    # The TMS is the COG's own grid in EPSG:4326; deck.gl-raster reprojects client-side,
+    # so there is no mercator warp and no resampling in the kernel.
+    _rstore = S3Store(SOURCE_BUCKET, region="us-west-2", skip_signature=True)
+    _rg = await GeoTIFF.open(COG, store=_rstore)
+    _rimgs = [_rg, *_rg.overviews]
+    _rpresent = []
+    for _rlv in _rimgs:
+        _rnty = -(-_rlv.shape[0] // TILE)
+        _rntx = -(-_rlv.shape[1] // TILE)
+        _rpresent.append(
+            np.asarray(_rlv.ifd.tile_byte_counts).reshape(_rnty, _rntx) > 0
+        )
+
+    async def _fetch(x, y, z):
+        li = len(_rimgs) - 1 - z
+        if not 0 <= li < len(_rimgs):
+            return None
+        p = _rpresent[li]
+        if not (0 <= y < p.shape[0] and 0 <= x < p.shape[1]) or not p[y, x]:
+            return None
+        # boundless=True, AND IT IS THE FIX FOR THE STREAKED WORLD VIEW (2026-08-14,
+        # seen on the first flight and misread as a projection bug). boundless=False
+        # clips edge tiles to the image, and deck stretches whatever PNG it gets across
+        # the FULL tile quad; at coarse levels nearly every tile is an edge tile (the
+        # coarsest is one 195x391 image in a 512 px tile), so a zoomed-out view was
+        # mostly tiles smeared ~2.6x vertically: horizontal streaks. boundless=True
+        # pads to 512x512; the padding arrives as 0.0 (measured, not NaN), which the
+        # render below already maps to alpha 0, so it costs nothing visible. If zero
+        # ever stops being transparent here, the padding must be masked instead.
+        return await _rimgs[li].fetch_tile(x, y, boundless=True)
+
+    # AN ABSENT TILE IS A TRANSPARENT IMAGE, NOT None. Second flight (2026-08-14,
+    # post-boundless): one smeared band survived over the Gulf at Cuba's latitude.
+    # deck's TileLayer keeps the stretched PARENT on screen until child content
+    # arrives, and a None child never arrives, so everywhere an ocean tile was
+    # sparse-skipped next to land, the coarser parent (which contains the land) stayed
+    # stretched over it. Serving a real fully-transparent PNG lets the child land and
+    # evict the ghost. 8x8, built once.
+    _rbuf = io.BytesIO()
+    mpl_image.imsave(_rbuf, np.zeros((8, 8, 4), np.uint8), format="png")
+    _rblank = EncodedImage(data=_rbuf.getvalue(), media_type="image/png")
+
+    def _render(tile):
+        # Exceptions in here are swallowed by the layer's task machinery, so keep it
+        # simple. `.array`, not `.data` (CLAUDE.md). Alpha 0 for NaN ocean AND for exact
+        # zero, matching the fold's `HAVING avg(v) > 0`: this map shows where
+        # deforestation IS, and the raster must not disagree with the hexagons it
+        # replaces by painting the 69.6% zero majority. matplotlib's PNG writer, so no
+        # new dependency.
+        if tile is None:
+            return _rblank
+        v = np.ma.filled(tile.array.as_masked()[0].astype("float64"), np.nan)
+        rgba = np.empty(v.shape + (4,), np.uint8)
+        rgba[..., :3] = ramp(v)
+        rgba[..., 3] = np.where(np.isfinite(v) & (v > 0), 255, 0)
+        buf = io.BytesIO()
+        mpl_image.imsave(buf, rgba, format="png")
+        return EncodedImage(data=buf.getvalue(), media_type="image/png")
+
+    _rb = _rg.bounds
+    raster = RasterLayer(
+        _tile_matrix_set=generate_tms(_rg),
+        _crs=_rg.crs,
+        _fetch_tile=_fetch,
+        _render_tile=_render,
+        _bounds=Bbox(_rb.left, _rb.bottom, _rb.right, _rb.top),
+        _center=((_rb.left + _rb.right) / 2, (_rb.bottom + _rb.top) / 2),
+        min_zoom=0,
+        max_zoom=len(_rimgs) - 1,
+        opacity=0.7,
+        pickable=False,
+        visible=True,
+    )
+    return (raster,)
+
+
+@app.cell
 def _(
     BitmapTileLayer,
     CartoBasemap,
     Controls,
-    DIVISION_LABEL,
-    H3HexagonLayer,
     HOLD,
-    HOME,
     Map,
     MaplibreBasemap,
-    PAD,
     Panel,
     PolygonLayer,
-    SETTLE,
-    STOPS,
     Status,
-    VIEW_H,
-    VIEW_W,
-    asyncio,
-    cells_to_layer,
-    division_for_zoom,
     from_wkb,
-    infer_rows_per_chunk,
     multipolygon,
-    np,
-    ramp,
-    res_for_zoom,
-    seed_cells,
     seed_divisions,
 ):
-    # Built exactly once. This cell depends on no control and on no state the camera can
-    # write, so nothing in the notebook can re-run it and throw the view away. Everything
-    # after this happens by trait assignment, which lonboard treats as independent of
-    # `view_state`.
+    # THE MAP CELL, AND WHY IT DEPENDS ON ALMOST NOTHING (split 2026-08-14, the flood
+    # notebook's pattern, after Stephen reported losing the boundary fill on re-runs).
+    # Destroying a lonboard Map terminates deck's earcut worker pool, which is
+    # MODULE-LEVEL in the page: after that every polygon layer on the page fails to
+    # initialize ("Cannot schedule pool tasks after terminate()") until the browser
+    # reloads. Hexagon/raster/bitmap layers survive, which is why it presented as
+    # "lost the fill" specifically. So this cell must never re-run on an ordinary
+    # edit: it depends only on imports, widget classes, seeds and HOLD. Everything
+    # editable (constants, ramp, handlers, the draw logic) lives in the WIRING cell
+    # below, which re-hooks onto these surviving widgets. The RasterLayer is NOT a
+    # dependency either; the wiring cell inserts it via `deck.layers`, so a ramp or
+    # constants edit rebuilds the raster layer and re-wires without touching the Map.
+    #
+    # EDITING THIS CELL ITSELF still tears the deck down: restart the kernel AND
+    # reload the browser page afterwards.
+    #
+    # VIEW_W/VIEW_H and HOME live here rather than in the constants cell for the same
+    # reason: a constants edit must not reach this cell. The size seeds HOLD["wh"]
+    # until the Status ruler reports the real canvas; HOME only seeds a fresh session
+    # (and headless runs), because on a wiring re-run the camera survives in
+    # HOLD["vs"] with the deck.
+    VIEW_W, VIEW_H = 1400, 620
+    # Opens on the tropics, because that is where the data is: the Amazon, the Congo
+    # basin and insular southeast Asia are the three places a 2002-2022 deforestation
+    # layer has anything dramatic to say, and all three are in view from here.
+    HOME = {"longitude": -20.0, "latitude": 0.0, "zoom": 2.4}
+
     status = Status(value="<b>loading…</b>")
     controls = Controls()
     ranking = Panel()
 
-    _seed = seed_cells()
-    cells = H3HexagonLayer(
-        table=_seed,
-        get_hexagon=_seed["hex"],
-        get_fill_color=_seed["color"],
-        extruded=False,
-        stroked=False,
-        high_precision=True,
-        coverage=1,
-        opacity=0.5,
-        pickable=True,
-    )
+    # H3 VIZ PARKED (2026-08-14). The RasterLayer draws the deforestation paint now, at
+    # pixel resolution instead of cell means; the fold still runs untouched because the
+    # divisions join eats its cells. To restore the hexagons: uncomment this block
+    # (H3HexagonLayer and seed_cells go back in this cell's signature), return `cells`,
+    # add it to `deck.layers` in the wiring cell, uncomment put_cells' body there, and
+    # repoint the Controls checkbox in _on_controls back at it. Then restart the kernel
+    # AND reload the page: this is the map cell.
+    # _seed = seed_cells()
+    # cells = H3HexagonLayer(
+    #     table=_seed,
+    #     get_hexagon=_seed["hex"],
+    #     get_fill_color=_seed["color"],
+    #     extruded=False,
+    #     stroked=False,
+    #     high_precision=True,
+    #     coverage=1.0,
+    #     opacity=0.3,
+    #     pickable=True,
+    # )
 
     # THE DIVISIONS. Permanently `filled=True`, and `get_fill_color` is ALWAYS a column of
     # the table on the layer, never a constant. Two rules, and the second is the one that
@@ -1465,27 +1666,70 @@ def _(
         pickable=False,
     )
 
+    # The raster layer is deliberately absent here; the wiring cell inserts it under
+    # the divisions via `deck.layers`, so this cell survives raster rebuilds.
     deck = Map(
-        [cells, divisions, labels],
+        [divisions, labels],
         basemap=MaplibreBasemap(style=CartoBasemap.DarkMatterNoLabels),
         view_state=HOME,
         height=VIEW_H,
         show_tooltip=True,
     )
 
-    # A NEW MAP INHERITS NOTHING ABOUT THE OLD ONE'S SCREEN. HOLD lives in a cell that
-    # cannot re-run, which is what lets the camera survive; the cost is that a re-run of
-    # THIS cell builds fresh layers while HOLD still describes the map that just went away.
+    # The HOLD state tied to the WIDGET's lifetime rather than the wiring's: the
+    # canvas seed (the ruler overwrites it) and the camera. Everything the wiring's
+    # caches describe is reset in the wiring cell instead.
+    HOLD["wh"] = (float(VIEW_W), float(VIEW_H))
+    HOLD["vs"] = None
+    return HOME, controls, deck, divisions, labels, ranking, status
+
+
+@app.cell
+def _(
+    ArroTable,
+    DIVISION_LABEL,
+    HOLD,
+    HOME,
+    PAD,
+    SETTLE,
+    STOPS,
+    asyncio,
+    cells_to_layer,
+    controls,
+    deck,
+    division_for_zoom,
+    divisions,
+    infer_rows_per_chunk,
+    labels,
+    np,
+    pa,
+    ramp,
+    ranking,
+    raster,
+    res_for_zoom,
+    status,
+):
+    # THE WIRING CELL: everything editable about how the map behaves. Re-runs on any
+    # edit to the constants, the ramp, the raster layer or the machinery; cancels the
+    # old work, unhooks the old observers (via the HOLD["h_*"] refs), and re-hooks
+    # onto the SURVIVING deck from the map cell above. The widget is never destroyed,
+    # so deck's shared earcut pool stays alive and the camera stays where the user
+    # left it. The screen-state keys are reset because the caches they describe were
+    # just rebuilt; wh and vs belong to the map cell and are left alone.
     for _t in ("task", "seltask"):
         if HOLD[_t] is not None:
             HOLD[_t].cancel()
         HOLD[_t] = None
     HOLD["busy"], HOLD["pending"] = False, None
-    HOLD["wh"] = (float(VIEW_W), float(VIEW_H))
     HOLD["res"], HOLD["box"], HOLD["div"] = None, None, None
-    HOLD["divpair"], HOLD["divbox"], HOLD["vs"] = None, None, None
+    HOLD["divpair"], HOLD["divbox"] = None, None
     HOLD["head"], HOLD["tail"] = "", ""
     HOLD["cache"].clear()
+
+    # The full layer stack, raster under divisions under labels. Assigned every
+    # wiring run: on a raster-cell re-run (a ramp or constants edit) this is what
+    # swaps the fresh RasterLayer widget into the surviving Map.
+    deck.layers = [raster, divisions, labels]
 
     def view_to_bbox(vs):
         """Camera -> [W, S, E, N], clamped to the world.
@@ -1561,14 +1805,17 @@ def _(
         )
 
     def put_cells(tbl):
-        cells._rows_per_chunk = max(1, infer_rows_per_chunk(tbl))
+        # H3 VIZ PARKED (2026-08-14): nothing is pushed to the browser. The callers and
+        # the cache keep working, so restoring the hexagons is uncommenting.
+        return
+        # cells._rows_per_chunk = max(1, infer_rows_per_chunk(tbl))
         # hold_sync so deck gets one message. Without it the new hexagons are drawn
         # against the old colour buffer for a frame.
-        with cells.hold_sync():
-            cells.table = tbl
-            cells.get_hexagon = tbl["hex"]
-            cells.get_fill_color = tbl["color"]
-            cells.visible = controls.show_cells
+        # with cells.hold_sync():
+        #     cells.table = tbl
+        #     cells.get_hexagon = tbl["hex"]
+        #     cells.get_fill_color = tbl["color"]
+        #     cells.visible = controls.show_cells
 
     def put_divisions(pair):
         """Push whichever of the two colour variants the fill switch is asking for."""
@@ -1584,18 +1831,65 @@ def _(
             divisions.pickable = bool(controls.division_fill)
         HOLD["divpair"] = pair
 
+    def _refill(tbl, alpha):
+        """Re-tint a finished filled-variant divisions table to a new fill alpha.
+
+        Whole-table `pa.table(tbl)`, not per-column: arro3 exposes the C-stream
+        protocol at TABLE level only (the terrain notebook's recolor lesson), and the
+        geoarrow extension metadata on the geometry column survives the round trip.
+        RGB is untouched; only the alpha plane is rewritten, so re-tints are
+        idempotent and cached pairs can be re-tinted any number of times.
+        """
+        pt = pa.table(tbl)
+        col = pt["color"].combine_chunks()
+        rgba = np.asarray(col.values).reshape(-1, 4).copy()
+        rgba[:, 3] = alpha
+        new = pa.FixedSizeListArray.from_arrays(pa.array(rgba.ravel()), 4)
+        return ArroTable.from_arrow(
+            pt.set_column(pt.schema.get_field_index("color"), "color", new)
+        )
+
     def _on_controls(change):
         name = change["name"]
         if name == "show_cells":
-            cells.visible = bool(change["new"])
+            # The checkbox now governs the raster paint (labelled "deforestation" in the
+            # Controls widget); it toggled the hexagons before they were parked.
+            raster.visible = bool(change["new"])
         elif name == "show_divisions":
             divisions.visible = bool(change["new"]) and HOLD["divpair"] is not None
         elif name == "division_fill":
             # A whole re-push, not an accessor assignment. See divisions_to_layer.
             if HOLD["divpair"] is not None:
                 put_divisions(HOLD["divpair"])
+        elif name == "fill_alpha":
+            # The string is the slider's or the number box's 0-1 float; anything
+            # unparseable is ignored rather than crashed on, because this runs inside
+            # a comm handler where exceptions are silent (the reverse-cmap defect).
+            try:
+                _a = float(change["new"])
+            except (TypeError, ValueError):
+                return
+            HOLD["fill_alpha"] = int(round(min(1.0, max(0.0, _a)) * 255))
+            if HOLD["divpair"] is not None:
+                put_divisions(
+                    (
+                        _refill(HOLD["divpair"][0], HOLD["fill_alpha"]),
+                        HOLD["divpair"][1],
+                    )
+                )
 
-    controls.observe(_on_controls, names=["show_cells", "show_divisions", "division_fill"])
+    # Re-hook, never stack: a wiring re-run must first unhook the handlers the LAST
+    # run registered on these surviving widgets, or every edit adds another listener
+    # and one click fans out N times. The try/except covers the one case the refs go
+    # stale: a map-cell re-run built fresh widgets the old handlers were never on.
+    _CTL_NAMES = ["show_cells", "show_divisions", "division_fill", "fill_alpha"]
+    if HOLD.get("h_ctl") is not None:
+        try:
+            controls.unobserve(HOLD["h_ctl"], names=_CTL_NAMES)
+        except ValueError:
+            pass
+    controls.observe(_on_controls, names=_CTL_NAMES)
+    HOLD["h_ctl"] = _on_controls
 
     def _on_wh(change):
         """The canvas changed size: fullscreen, a window resize, a layout shift.
@@ -1625,7 +1919,13 @@ def _(
         elif not _instant(vs):
             HOLD["task"] = _spawn(refresh(vs))
 
+    if HOLD.get("h_wh") is not None:
+        try:
+            status.unobserve(HOLD["h_wh"], names="view_wh")
+        except ValueError:
+            pass
     status.observe(_on_wh, names="view_wh")
+    HOLD["h_wh"] = _on_wh
 
     def _instant(vs):
         """Everything answerable without a read, done synchronously in the comm handler.
@@ -1784,7 +2084,13 @@ def _(
             return
         HOLD["task"] = _spawn(refresh(vs))
 
+    if HOLD.get("h_cam") is not None:
+        try:
+            deck.unobserve(HOLD["h_cam"], names="view_state")
+        except ValueError:
+            pass
     deck.observe(_on_camera, names="view_state")
+    HOLD["h_cam"] = _on_camera
 
     # ---------------------------------------------------------------- the ranking
     # Press "rank what's in view" in the controls and the divisions on screen come back
@@ -1883,7 +2189,13 @@ def _(
 
         HOLD["seltask"] = _spawn(go())
 
+    if HOLD.get("h_rank") is not None:
+        try:
+            controls.unobserve(HOLD["h_rank"], names="rank_view")
+        except ValueError:
+            pass
     controls.observe(_on_rank_view, names="rank_view")
+    HOLD["h_rank"] = _on_rank_view
 
     # The legend, built from the same `ramp` the layers use, so a colour on the map and a
     # colour in the key cannot drift apart. The division fill uses the same ramp at a lower
@@ -1898,11 +2210,10 @@ def _(
     legend = (
         "<div style=\"font:12px ui-sans-serif,system-ui,sans-serif;"
         "display:flex;flex-wrap:wrap;align-items:center;padding:.35rem 0\">"
-        "<b style='margin-right:.7rem'>share of cell deforested 2002-2022</b>"
+        "<b style='margin-right:.7rem'>share of ground deforested 2002-2022</b>"
         f"{_sw}</div>"
     )
-    
-    return controls, deck, legend, ranking, refresh, status
+    return legend, refresh
 
 
 @app.cell
@@ -2230,13 +2541,15 @@ async def _(
     HOLD["rank"] = rank
     HOLD["loop"] = asyncio.get_running_loop()
 
-    # The opening draw. force=True skips the settle: there is nothing to debounce yet.
+    # The opening draw, forced: nothing to debounce yet. On a WIRING re-run the camera
+    # survives with the deck, so the redraw targets wherever the user left it, not
+    # HOME; HOME only seeds a fresh session (and headless runs).
     class _VS:
         longitude = HOME["longitude"]
         latitude = HOME["latitude"]
         zoom = HOME["zoom"]
 
-    await refresh(_VS(), force=True)
+    await refresh(HOLD["vs"] or _VS(), force=True)
     return
 
 

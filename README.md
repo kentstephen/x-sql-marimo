@@ -16,6 +16,11 @@ uv run marimo edit xsql-hfp-divisions.py --sandbox
 
 # one static fold of the footprint over the lower 48, no camera machinery
 uv run marimo edit xsql-hfp-conus.py --sandbox
+
+# EXPERIMENTAL, use caution: worldwide Mapterhorn terrain as extruded H3 columns.
+# Open defects (res-to-zoom tuning, deep-zoom regional reads unflown); expect rough
+# edges and occasional refolds that cost real bandwidth.
+uv run marimo edit xsql-mapterhorn-explorer.py --sandbox
 ```
 
 All of them stream their raster straight out of object storage with

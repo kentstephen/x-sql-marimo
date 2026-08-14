@@ -9,9 +9,9 @@ requires-python = ">=3.13"
 # archived notebooks need a wider set; that lives in archive/pyproject.toml so this one
 # can stay honest about what is actually imported.
 #
-#   xsql-deforest-divisions.py   adds async-geotiff (the COG reader)
-#   xsql-firerisk-buildings.py   adds zarr          (the pyramid reader)
-#   xsql-terrain-3d.py           adds pillow        (the terrarium WebP decode)
+#   xsql-deforest-divisions.py   adds async-geotiff (the COG reader), duckdb,
+#                                geoarrow-rust-core
+#   xsql-mapterhorn-explorer.py           adds pillow        (the terrarium WebP decode)
 dependencies = [
     "anywidget>=0.9",
     "arro3-core",
@@ -20,7 +20,7 @@ dependencies = [
     "duckdb>=1.5.5",
     "geoarrow-rust-core>=0.6",
     "h3ronpy>=0.22.0",
-    "lonboard>=0.16.0",
+    "lonboard[geotiff]>=0.16.0",
     "marimo>=0.23.16",
     "matplotlib==3.11.1",
     "numpy==2.5.1",
@@ -29,5 +29,4 @@ dependencies = [
     "pyarrow>=25.0.0",
     "xarray",
     "xarray-sql>=0.3.2",
-    "zarr>=3.1",
 ]

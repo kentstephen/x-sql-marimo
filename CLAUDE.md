@@ -5,10 +5,137 @@ Guidance for Claude Code working in this repository. Inherits the global rules i
 
 ## Repository layout
 
-**Five interactive notebooks are the repo**, plus one static one-shot. Everything else
-is in `archive/`, kept for reference and not maintained.
+**Two interactive notebooks are the repo**: deforestation divisions and the terrain
+3D experiment. Everything else is in `archive/`, kept for reference and not
+maintained. (The HFP pair, the flood-buildings experiment, the canopy notebook and
+the fire-risk buildings notebook moved there on 2026-08-13, Stephen's call; their
+full sections live under the archive heading below, undiminished.)
 
-`xsql-firerisk-buildings.py` folds CarbonPlan's 30 m CONUS wildfire-risk **Zarr v3
+`xsql-deforest-divisions.py` folds a global deforestation COG to H3 and joins the cells
+onto Overture divisions for a zoomable choropleth plus a drawn-box ranking. The raster is
+Vizzuality / LandGriffon's `deforest_100m_cog.tif` (CC-BY 4.0) from the source.coop
+repository [`vizzuality/lg-land-carbon-data`](https://source.coop/vizzuality/lg-land-carbon-data),
+read from `s3://us-west-2.opendata.source.coop/vizzuality/lg-land-carbon-data/`. Divisions
+come from Overture's own PMTiles build of the pinned release
+(`overturemaps-extras-us-west-2/tiles/<release>/divisions.pmtiles`), NOT the GeoParquet:
+the GeoParquet layout makes geometry (99% of the bytes) unprunable, measured at ~190 MB
+per viewport against ~0.8 MB from tiles. The PMTiles reader is hand-rolled (ported from
+the parked terrain notebook), the MVT decode too; tile-clipped pieces are dissolved per
+`division_id` in DuckDB before drawing or the stroke shows tile seams. Full record in
+`docs/deforest-divisions-notes.md`.
+
+Since 2026-08-14 the deforestation PAINT is a lonboard RasterLayer serving the COG's own
+pyramid as ramp-coloured PNG tiles (kernel-side fetch/render callbacks; the layer is
+built directly, not via `from_geotiff`, because from_geotiff's fetch is not sparse-aware
+and its zoom clamp ships commented out in 0.16, wrapping overzoom onto coarse overviews).
+The H3 hexagon layer is COMMENTED OUT in the map cell, not deleted; the fold still runs
+because the divisions join and the ranking consume its cells. Zero and NaN pixels are
+both transparent, matching the fold's `HAVING avg(v) > 0`. Needs `lonboard[geotiff]`
+(morecantile) in the header and pyproject. First flight 2026-08-14: tiles render, but
+the world view was covered in horizontal streaks that read as a projection bug and are
+NOT one: `boundless=False` clips edge tiles and deck stretches the clipped PNG across
+the full tile quad, and at coarse levels nearly every tile is an edge tile. Fixed with
+`boundless=True` (padding arrives as 0.0, measured, which the zero-transparent render
+already hides); the fix is not yet reflown. Boundary fill opacity is now a Controls
+slider (stepped 0.1-1.0) plus a free 0-1 number box, crossing the bridge as a Unicode
+string per the proven-trait-types rule; the alpha lives in `HOLD["fill_alpha"]` (the
+old FILL_ALPHA constant is deleted), new division pairs read it at build time and the
+current pair is re-tinted in place (`_refill`, whole-table `pa.table(tbl)` per the
+terrain recolor lesson). The map/wiring CELL SPLIT is applied (2026-08-14, the flood
+notebook's pattern), closing the re-run-loses-the-fill report: the map cell builds
+widgets/layers/Map only and must never re-run (VIEW_W/VIEW_H and HOME moved into it so
+constants edits cannot reach it); the wiring cell re-runs freely, un-observing old
+handlers via HOLD["h_*"] refs. The RasterLayer is inserted via `deck.layers` FROM THE
+WIRING CELL, not passed to Map(), so a ramp or constants edit rebuilds the raster
+layer and rewires without destroying the Map. The split passes headless, unflown.
+OPEN DEFECT: the raster still stretches/smears at LOW ZOOMS ON ZOOM OUT (second
+flight; one band over the Gulf at Cuba's latitude). Absent tiles now render as a real
+transparent PNG instead of None (a None child never arrives, so deck keeps stretched
+neighbour-zoom tiles up), but that fix is UNPROVEN against the zoom-out case; next
+suspects and Stephen's NaN hunch are in the notes doc.
+
+`xsql-mapterhorn-explorer.py` (EXPERIMENTAL, open defects below) draws Mapterhorn terrain
+worldwide as extruded H3 columns: the DEM half of the parked
+`archive/xsql-duckdb-terrain-h3.py` standing alone, on the canopy notebook's chassis
+(ruler Status widget, camera machinery, `_instant`/`refresh`). No DuckDB, no pyproj;
+the fold is xarray-sql + the h3 UDF, `avg(elev)` per cell. Things to know:
+
+- **Two archive tiers, one reader.** `planet.pmtiles` (z0-12) serves everything up to
+  res 11; res 12 and 13 route to the regional `6-{x}-{y}.pmtiles` archives (z13-18,
+  z17 over flat country, 457 land-only files; an ocean key is an ABSENT OBJECT, not
+  an empty archive). The PMTiles client is the parked notebook's, generalised to
+  archive-per-path (`_pm_open`); a tile at z > 12 belongs to the regional archive at
+  `(x >> (z-6), y >> (z-6))`, opened lazily as a task per key. res 12 reads z14
+  (~23 px/hex), res 13 reads z15 (~13 px/hex).
+- **No bathymetry, measured.** Open-ocean tiles are absent from ~z6 up; where ocean
+  exists at coarse zooms it reads ~0 m (mid-Pacific z4: 99.7% of pixels within 1 m of
+  zero). The fold drops `|elev| <= 1` and `elev <= -500`; Death Valley (-86) and the
+  Dead Sea shore (-430) survive as signed metres.
+- **Pitch eats the padding AND the resolution.** `_pad` extends the fold box toward
+  the horizon along the bearing (anisotropic, unlike the parked notebook's symmetric
+  9x overread), and pitch >= 35 folds one H3 step coarser to pay for it. `_same_view`
+  includes pitch/bearing, and coverage is gated by `_cam_ok`, or tilting past the
+  folded trapezoid leaves a band of missing cells at the horizon (seen in fullscreen
+  over Tibet before the fix).
+- **The ladder** is BASE_RES 7 / ZOOM0 6.2 / PER_RES 1.4, MIN_RES 4, MAX_RES 13, plus
+  a `res offset` +/- 2 slider in the panel (commit debounced 350 ms after the thumb
+  stops, because Safari and Firefox fire `change` DURING a drag and every stop is a
+  refold; a dim warning beside it says each + step refolds ~7x the cells, and
+  MOVING THE MAP RESETS A RAISED OFFSET to 0: +1/+2 is a statement about the view
+  it was set on, negative offsets survive a move). The
+  scale opens at a FIXED 20x at every zoom: a continuous quadratic slider (half the
+  track covers 0-50) plus a typed number box that takes any non-negative float. The
+  AUTO FIT IS DELETED (2026-08-13, Stephen's call: it fit relief to ~25 px and read
+  flat next to the 20x default). HOME is THE WORLD, flat at zoom 1.6 (was the
+  pitched Alps; opening fold res 4 · ~84k cells · 14.7M px, measured headless).
+  The colormap is a panel DROPDOWN over the CB-safe shortlist (gist_heat, viridis,
+  cividis, magma, inferno, Greens, Blues; `RAMP["name"]` is only the seed), reverse serves
+  the matplotlib `_r` twin and DEFAULTS ON, RELATIVE COLORS (panel button) respends
+  the ramp on the p2-p98 of the ground in view with the legend following each
+  serve, and repaints are generation-counted (`RAMP["gen"]`) so stale cached tables
+  recolour lazily on serve. Any ramp change (flip, mode, cmap pick) repaints
+  through the ORDINARY SERVE PATH (recolour + `put_cells`), with the kernel-side
+  cost printed as `repaint N ms` in the status line.
+- **The "reverse cmap is slow / doesn't stick" defect had a found root cause**
+  (2026-08-13): a stale static copy of the legend HTML was rebuilt late in the map
+  cell and SHADOWED the HtmlLine legend widget, so `legend.value = ...` in the
+  observer hit a plain str and raised AttributeError inside a comm handler, where
+  exceptions are silent; the button died before its repaint line and the map only
+  caught up on the next fold. Both the shadow and the bespoke colours-only repaint
+  path are deleted. A SECOND layer surfaced on the first flight after that fix
+  ("TypeError: arro3.core._core.ChunkedArray is not a sequence"): `recolor()` had
+  never actually run, because it fed arro3 ChunkedArray columns into pyarrow's
+  `pa.table()`, which converts dict values as sequences and rejects them (arro3
+  exposes the C-stream protocol at table level only). `recolor` now converts the
+  whole arro3 table once via `pa.table(tbl)` and rebuilds from pyarrow columns;
+  measured ~1 ms for 50k rows kernel-side in reverse, relative, and both modes.
+- **OPEN DEFECTS AND NEXT WORK:** (1) The res-to-zoom ratio "isn't right, doesn't
+  look good yet"; the res offset slider is the manual override while it is tuned.
+  (2) res 12/13 regional reads are probed but not yet exercised interactively
+  (Mississippi deep zoom is the test case). (3) The 2026-08-13 rework (serve-path
+  repaint, relative colors, new scale controls, res-offset debounce) passes
+  headless but none of it has been flown; the `repaint N ms` readout is there to
+  decide whether relative colors is cheap enough to keep.
+
+None of the notebooks import anything from `archive/`: their only dependencies are the
+third-party ones in their PEP 723 headers.
+
+**The PMTiles reader and MVT decode are shared by copy, not by import.** The divisions
+notebook's version was ported from the parked terrain notebook, the buildings notebook's
+from the divisions one, and the HFP notebook is a whole-file fork of the divisions
+notebook (its diff is the raster side only: CRS, scaling, zero handling, ramp). A fix to
+the directory walk or the varint machinery in one of them should be carried to the others
+by hand.
+
+### What is in `archive/`, and what each one still proves
+
+The five sections below moved here whole on 2026-08-13 (fire-risk buildings, the
+HFP pair, flood, canopy);
+paths now carry `archive/` in front. They are the newest layer of the archive and
+their operational notes still apply wherever the maintained notebooks share code
+with them by copy.
+
+`archive/xsql-firerisk-buildings.py` folds CarbonPlan's 30 m CONUS wildfire-risk **Zarr v3
 pyramid** to H3 and joins the cells onto **Overture building footprints**, so the map says
 which real structures stand on high-risk ground. Full record in
 `docs/firerisk-buildings-notes.md`. Four things to know before touching it:
@@ -30,20 +157,7 @@ which real structures stand on high-risk ground. Full record in
 - **Zero cells are KEPT**, the opposite of the deforestation notebook. There zero was ocean;
   here it is ground that will not burn and it is exactly where the buildings are.
 
-`xsql-deforest-divisions.py` folds a global deforestation COG to H3 and joins the cells
-onto Overture divisions for a zoomable choropleth plus a drawn-box ranking. The raster is
-Vizzuality / LandGriffon's `deforest_100m_cog.tif` (CC-BY 4.0) from the source.coop
-repository [`vizzuality/lg-land-carbon-data`](https://source.coop/vizzuality/lg-land-carbon-data),
-read from `s3://us-west-2.opendata.source.coop/vizzuality/lg-land-carbon-data/`. Divisions
-come from Overture's own PMTiles build of the pinned release
-(`overturemaps-extras-us-west-2/tiles/<release>/divisions.pmtiles`), NOT the GeoParquet:
-the GeoParquet layout makes geometry (99% of the bytes) unprunable, measured at ~190 MB
-per viewport against ~0.8 MB from tiles. The PMTiles reader is hand-rolled (ported from
-the parked terrain notebook), the MVT decode too; tile-clipped pieces are dissolved per
-`division_id` in DuckDB before drawing or the stroke shows tile seams. Full record in
-`docs/deforest-divisions-notes.md`.
-
-`xsql-hfp-divisions.py` is the deforestation notebook's machinery pointed at Vizzuality's
+`archive/xsql-hfp-divisions.py` is the deforestation notebook's machinery pointed at Vizzuality's
 Global 100 m Terrestrial Human Footprint (HFP-100 v1.2, CC-BY 4.0, same source.coop
 account, `vizzuality/hfp-100/hfp_<year>_100m_v1-2_cog.tif`, years 2017-2021; `YEAR` in
 the constants cell is the seam a year slider would use). Full record in
@@ -109,7 +223,7 @@ the constants cell is the seam a year slider would use). Full record in
   ranking ladder starts at locality only when the box's own zoom is in that band, so a
   wide box never gets a towns-only answer.
 
-`xsql-hfp-conus.py` is the one-shot: the HFP fold with everything interactive cut away
+`archive/xsql-hfp-conus.py` is the one-shot: the HFP fold with everything interactive cut away
 (no camera, no divisions, no widgets, no cache), run once over a fixed `BOX` at res 7
 from L2 and drawn as one static H3HexagonLayer. It exists for screenshots and as the
 smallest runnable statement of the fold. `BOX` is the only knob and it scales hard: the
@@ -118,7 +232,7 @@ North-America box is ~760M pixels, 15-20 GB of RAM, 4.88M cells (both measured).
 fold cell is a straightened-out copy of the interactive notebook's read cell, so fixes
 to the sparse-tile check, the Mollweide pair or the fold SQL carry across by hand.
 
-`xsql-canopy-3d.py` draws Meta & WRI's High Resolution Canopy Height Maps (~1 m, uint8
+`archive/xsql-canopy-3d.py` draws Meta & WRI's High Resolution Canopy Height Maps (~1 m, uint8
 metres, CC-BY 4.0, `s3://dataforgood-fb-data/forests/v1/alsgedi_global_v6_float/`) as
 an extruded H3HexagonLayer: column height IS mean canopy metres times a stated 3x
 exaggeration, colour (matplotlib Greens) repeats it. One dataset, one encoding; it is
@@ -146,7 +260,7 @@ Redwoods. Things to know before touching it:
 - It carries the HFP ruler, a `SessionContext` instead of XarrayContext (no raster
   windowing, so no xarray), and no DuckDB (no polyfill, no dissolve).
 
-`xsql-flood-buildings.py` (EXPERIMENTAL, working but with open defects, see below)
+`archive/xsql-flood-buildings.py` (EXPERIMENTAL, working but with open defects, see below)
 draws FEMA NFHL flood zones from Carl Boettiger's PMTiles build and joins them onto
 Overture divisions zoomed out (share of each county/locality inside the 1% floodplain)
 and onto individual building footprints past zoom 13 (each coloured by the worst zone
@@ -193,58 +307,6 @@ water instead of fire, with the raster replaced by vector polygons. Things to kn
   Debug against the browser console; the earcut-pool cascade recorded above is what
   a dead deck looks like and is NOT evidence about which layer is at fault.
 
-`xsql-terrain-3d.py` (EXPERIMENTAL, open defects below) draws Mapterhorn terrain
-worldwide as extruded H3 columns: the DEM half of the parked
-`archive/xsql-duckdb-terrain-h3.py` standing alone, on the canopy notebook's chassis
-(ruler Status widget, camera machinery, `_instant`/`refresh`). No DuckDB, no pyproj;
-the fold is xarray-sql + the h3 UDF, `avg(elev)` per cell. Things to know:
-
-- **Two archive tiers, one reader.** `planet.pmtiles` (z0-12) serves everything up to
-  res 11; res 12 and 13 route to the regional `6-{x}-{y}.pmtiles` archives (z13-18,
-  z17 over flat country, 457 land-only files; an ocean key is an ABSENT OBJECT, not
-  an empty archive). The PMTiles client is the parked notebook's, generalised to
-  archive-per-path (`_pm_open`); a tile at z > 12 belongs to the regional archive at
-  `(x >> (z-6), y >> (z-6))`, opened lazily as a task per key. res 12 reads z14
-  (~23 px/hex), res 13 reads z15 (~13 px/hex).
-- **No bathymetry, measured.** Open-ocean tiles are absent from ~z6 up; where ocean
-  exists at coarse zooms it reads ~0 m (mid-Pacific z4: 99.7% of pixels within 1 m of
-  zero). The fold drops `|elev| <= 1` and `elev <= -500`; Death Valley (-86) and the
-  Dead Sea shore (-430) survive as signed metres.
-- **Pitch eats the padding AND the resolution.** `_pad` extends the fold box toward
-  the horizon along the bearing (anisotropic, unlike the parked notebook's symmetric
-  9x overread), and pitch >= 35 folds one H3 step coarser to pay for it. `_same_view`
-  includes pitch/bearing, and coverage is gated by `_cam_ok`, or tilting past the
-  folded trapezoid leaves a band of missing cells at the horizon (seen in fullscreen
-  over Tibet before the fix).
-- **The ladder** is BASE_RES 7 / ZOOM0 6.2 / PER_RES 1.4, MIN_RES 4, MAX_RES 13, plus
-  a `res` +/- 2 slider offset in the panel. The scale opens at a FIXED 20x at every
-  zoom; the auto button fits relief to ~1.5 hexagon edges (the parked rule) and the
-  same button resets to 20. `RAMP["name"]` in the ramp cell is the one-word colormap
-  seam; reverse serves the matplotlib `_r` twin, and repaints are generation-counted
-  (`RAMP["gen"]`) so stale cached tables recolour lazily on serve.
-- **OPEN DEFECTS AND NEXT WORK, dictated at session end:** (1) reverse cmap is STILL
-  extremely slow even after the colours-only/lazy rework; the recolor design "doesn't
-  add value"; candidate fix is deleting it in favour of the ordinary serve path (or
-  the button entirely), and nobody has profiled where the time actually goes.
-  (2) The res-to-zoom ratio "isn't right, doesn't look good yet". (3) Auto scale
-  fits to ~25 px of relief and reads flat next to the 20x default. (4) Planned next:
-  RELATIVE COLOURS, the ramp normalised to what's in view; requires (1) solved,
-  since it repaints every fold. (5) res 12/13 regional reads are probed but not yet
-  exercised interactively. (6) The res offset slider is "a little glitchy" (his
-  words); the stepped-stops pattern here fires on change with a live caption, so
-  suspect the caption/thumb sync or the refold landing mid-drag.
-
-None of the notebooks import anything from `archive/`: their only dependencies are the
-third-party ones in their PEP 723 headers.
-
-**The PMTiles reader and MVT decode are shared by copy, not by import.** The divisions
-notebook's version was ported from the parked terrain notebook, the buildings notebook's
-from the divisions one, and the HFP notebook is a whole-file fork of the divisions
-notebook (its diff is the raster side only: CRS, scaling, zero handling, ramp). A fix to
-the directory walk or the varint machinery in one of them should be carried to the others
-by hand.
-
-### What is in `archive/`, and what each one still proves
 
 - `xsql-nlcd-zoom.py` folds and dissolves Annual NLCD entirely in DataFusion + h3ronpy.
 - `xsql-duckdb-nlcd-h3.py` keeps the DataFusion fold and moves the dissolve to DuckDB's
@@ -283,15 +345,14 @@ in front.
 
 ## Current project
 
-`xsql-canopy-3d.py`, described above, and the stated next step is pairing it with
-**imagery or a DEM**: canopy columns are heights ABOVE ground, so a terrain base
-(Mapterhorn PMTiles, reader already proven in the parked terrain notebook) would put
-them at their true elevation, and imagery under the columns has the BitmapTileLayer
-lessons in "Imagery, and why it is a tile layer" plus the Sentinel-2 data path in
-`docs/imagery-and-terrain-notes.md`. Re-read the parked-terrain section before
-building either; every deck.gl trap listed there applies.
+`xsql-mapterhorn-explorer.py`, described above: the worldwide Mapterhorn DEM as extruded H3.
+Its open items are in its own section's "OPEN DEFECTS AND NEXT WORK" bullet, and
+the 2026-08-13 rework is waiting on an interactive flight. (The canopy notebook,
+the previous current project, went to `archive/` on 2026-08-13; the pairing ideas
+that were queued for it, terrain base under the columns, imagery underneath, are
+recorded in its archived section and in `docs/imagery-and-terrain-notes.md`.)
 
-Before that, `xsql-deforest-divisions.py`. The shape of it, in one line: **free-fly
+Also live: `xsql-deforest-divisions.py`. The shape of it, in one line: **free-fly
 the planet**, and everywhere the camera lands, the mean share of ground deforested
 2002-2022 as H3 hexagons and as a number per administrative division.
 
@@ -443,10 +504,10 @@ luminance ramps (viridis is already the choice in `s1m_viewer.py`) and lean on
 
 ```bash
 # Dev (full venv)
-uv run marimo edit xsql-firerisk-buildings.py
+uv run marimo edit xsql-mapterhorn-explorer.py
 
 # Shareable sandbox (PEP 723 inline deps in the notebook header)
-uv run marimo edit xsql-firerisk-buildings.py --sandbox
+uv run marimo edit xsql-mapterhorn-explorer.py --sandbox
 
 # Headless smoke test (runs every cell, no browser)
 uv run marimo export html xsql-deforest-divisions.py -o /tmp/out.html
@@ -457,7 +518,8 @@ uv run --project archive marimo edit archive/xsql-nlcd-imagery.py
 
 **Two pyprojects, deliberately.** The root `pyproject.toml` is the union of the two
 maintained notebooks' PEP 723 headers and nothing more, so it stays honest about what is
-actually imported (`async-geotiff` for the COG reader, `zarr` for the pyramid reader). `archive/pyproject.toml` is the union of every archived
+actually imported (`async-geotiff` for the COG reader, `pillow` for the terrarium WebP
+decode). `archive/pyproject.toml` is the union of every archived
 notebook's header (adds `aiohttp`, `arro3-io`, `geoarrow-rust-io`, `geopy`, `morecantile`,
 `palettable`, `pillow`, `planetary-computer`, `pyproj`, `pystac-client`, `shapely`) and
 is pinned, because a frozen environment is the point of an archive. Keep each notebook's
