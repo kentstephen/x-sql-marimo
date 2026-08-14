@@ -59,7 +59,7 @@ the fold is xarray-sql + the h3 UDF, `avg(elev)` per cell. Things to know:
   flat next to the 20x default). HOME is THE WORLD, flat at zoom 1.6 (was the
   pitched Alps; opening fold res 4 · ~84k cells · 14.7M px, measured headless).
   The colormap is a panel DROPDOWN over the CB-safe shortlist (gist_heat, viridis,
-  cividis, magma, inferno, Greens; `RAMP["name"]` is only the seed), reverse serves
+  cividis, magma, inferno, Greens, Blues; `RAMP["name"]` is only the seed), reverse serves
   the matplotlib `_r` twin and DEFAULTS ON, RELATIVE COLORS (panel button) respends
   the ramp on the p2-p98 of the ground in view with the legend following each
   serve, and repaints are generation-counted (`RAMP["gen"]`) so stale cached tables

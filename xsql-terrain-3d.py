@@ -364,7 +364,7 @@ def _(anywidget, traitlets):
           // THE CMAP DROPDOWN: the CB-safe shortlist only (luminance-monotonic,
           // no red-green pair). The kernel treats a pick exactly like a ramp
           // flip: gen bump, serve-path repaint. Composes with reverse (_r twin).
-          const CMAPS = ["gist_heat", "viridis", "cividis", "magma", "inferno", "Greens"];
+          const CMAPS = ["gist_heat", "viridis", "cividis", "magma", "inferno", "Greens", "Blues"];
           const sel = document.createElement("select");
           sel.style.cssText =
             "font:inherit;padding:.15rem .3rem;cursor:pointer;border-radius:4px;" +
