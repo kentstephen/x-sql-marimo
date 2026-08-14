@@ -9,10 +9,12 @@ requires-python = ">=3.13"
 #
 #     uv run --project archive marimo edit archive/xsql-nlcd-imagery.py
 #
-# The root pyproject.toml is trimmed to what xsql-deforest-divisions.py actually imports.
-# That is the only notebook that is maintained; everything here is reference. Where two
-# notebooks disagree on a constraint the pin wins (matplotlib, numpy, geopy), because a
-# frozen environment is the point of an archive.
+# The root pyproject.toml is trimmed to what the two maintained notebooks (deforest
+# divisions, terrain 3D) actually import; everything here is reference. The 2026-08-13
+# arrivals (fire-risk buildings, the HFP pair, flood buildings, canopy 3D) need
+# nothing beyond this union, so they added no entries. Where two notebooks disagree on
+# a constraint the pin wins (matplotlib, numpy, geopy), because a frozen environment
+# is the point of an archive.
 dependencies = [
     "aiohttp>=3.10",
     "anywidget>=0.9",
