@@ -6,7 +6,8 @@ Guidance for Claude Code working in this repository. Inherits the global rules i
 ## Repository layout
 
 **Two interactive notebooks are the repo**: deforestation divisions and the terrain
-3D experiment. Everything else is in `archive/`, kept for reference and not
+3D experiment, plus one maintained one-shot (`xsql-deforest-conus-counties.py`, the
+deforestation fold as a static CONUS county choropleth, below). Everything else is in `archive/`, kept for reference and not
 maintained. (The HFP pair, the flood-buildings experiment, the canopy notebook and
 the fire-risk buildings notebook moved there on 2026-08-13, Stephen's call; their
 full sections live under the archive heading below, undiminished.)
@@ -36,7 +37,7 @@ the world view was covered in horizontal streaks that read as a projection bug a
 NOT one: `boundless=False` clips edge tiles and deck stretches the clipped PNG across
 the full tile quad, and at coarse levels nearly every tile is an edge tile. Fixed with
 `boundless=True` (padding arrives as 0.0, measured, which the zero-transparent render
-already hides); the fix is not yet reflown. Boundary fill opacity is now a Controls
+already hides); that fix flew and held. Boundary fill opacity is now a Controls
 slider (stepped 0.1-1.0) plus a free 0-1 number box, crossing the bridge as a Unicode
 string per the proven-trait-types rule; the alpha lives in `HOLD["fill_alpha"]` (the
 old FILL_ALPHA constant is deleted), new division pairs read it at build time and the
@@ -48,11 +49,41 @@ constants edits cannot reach it); the wiring cell re-runs freely, un-observing o
 handlers via HOLD["h_*"] refs. The RasterLayer is inserted via `deck.layers` FROM THE
 WIRING CELL, not passed to Map(), so a ramp or constants edit rebuilds the raster
 layer and rewires without destroying the Map. The split passes headless, unflown.
-OPEN DEFECT: the raster still stretches/smears at LOW ZOOMS ON ZOOM OUT (second
-flight; one band over the Gulf at Cuba's latitude). Absent tiles now render as a real
-transparent PNG instead of None (a None child never arrives, so deck keeps stretched
-neighbour-zoom tiles up), but that fix is UNPROVEN against the zoom-out case; next
-suspects and Stephen's NaN hunch are in the notes doc.
+OPEN DEFECT, STILL OPEN AFTER THE TRANSPARENT-PNG FIX: the raster still
+stretches/smears at LOW ZOOMS ON ZOOM OUT (Stephen: the "splatter"). Absent tiles
+render as a real transparent PNG instead of None (a None child never arrives, so deck
+keeps stretched neighbour-zoom tiles up); that fix has now been FLOWN (2026-08-14)
+and DID NOT close the smear, so the absent-tile theory is dead as the whole story.
+Next suspects and Stephen's NaN hunch are in the notes doc.
+
+`xsql-deforest-conus-counties.py` (2026-08-14) is the deforestation fold as a ONE-SHOT
+on the xsql-hfp-conus chassis: no camera, no widgets, one CONUS box, one L2 read folded
+to res 7 (~32 px/cell, the ladder's own row), Overture counties from the divisions
+PMTiles at z8 (their minzoom; ~1,008 tiles), DuckDB dissolve + center polyfill,
+DataFusion zonal join, one static PolygonLayer choropleth (log-cividis ramp with the
+zero swatch; Stephen turned the stroke OFF). Flown and committed. Things to know:
+
+- **The clip to CONUS is the join itself.** County pieces are filtered at decode
+  (country US, is_land, region not AK/HI) and the polyfill is 'center'-ruled, so cells
+  centred in Canada/Mexico/water are in no county and drop out; nothing else is drawn.
+  No country-polygon clip step exists.
+- **Zero cells are KEPT** (no `HAVING avg(v) > 0`), a deliberate departure from the
+  interactive fold: that filter is a hexagon-render economy, and a county's mean share
+  must include ground that lost nothing or it is a different, inflated number.
+- **DuckDB's replacement scan DOES NOT WORK from marimo cell bodies**: marimo mangles
+  underscore-prefixed cell locals to cell-private names, so the frame name never
+  matches the SQL name and DuckDB reports the table missing. Both geometry steps use
+  `con.register(...)` explicitly. (The interactive notebooks get away with the scan
+  because their SQL runs inside nested functions over non-underscore locals.)
+- Measured: 16,114x6,986 px window, 2.10M res-7 cells (6.4 s), 6,815 pieces -> 3,108
+  counties (7.6 s), 1.48M filled cells, ALL 3,108 counties catch a centre (1.1 s).
+  Headline numbers: CONUS mean 1.8%, median county 0.68%, top of the table is the
+  Hurricane Michael panhandle trio (Calhoun FL 31%, Gulf, Bay) then the GA pine belt.
+- **marimo `export html` runs the cells but the lonboard map does NOT render in the
+  exported page** (Stephen: "map doesn't load"), so export is a smoke test, not a
+  screenshot pipeline; screenshots come from the live notebook. A pretty title/legend/
+  stats export layer was built 2026-08-14 and REVERTED at Stephen's direction (his
+  notes before the revert: fit one screen, no rounded corners).
 
 `xsql-mapterhorn-explorer.py` (EXPERIMENTAL, open defects below) draws Mapterhorn terrain
 worldwide as extruded H3 columns: the DEM half of the parked
