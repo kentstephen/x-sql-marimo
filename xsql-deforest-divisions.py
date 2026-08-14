@@ -365,7 +365,9 @@ def _(anywidget, traitlets):
           sl.style.width = "6rem";
           const nb = document.createElement("input");
           nb.type = "number";
-          nb.min = "0"; nb.max = "1"; nb.step = "any";
+          // step 0.1 so the spinner arrows move in tenths (Stephen's spec); typed
+          // values are still any float, the step only drives the up/down buttons.
+          nb.min = "0"; nb.max = "1"; nb.step = "0.1";
           nb.style.cssText =
             "width:3.6rem;font:inherit;background:transparent;color:inherit;" +
             "border:1px solid rgba(127,127,127,.45);border-radius:4px;" +
@@ -1508,6 +1510,17 @@ async def _(
         # ever stops being transparent here, the padding must be masked instead.
         return await _rimgs[li].fetch_tile(x, y, boundless=True)
 
+    # AN ABSENT TILE IS A TRANSPARENT IMAGE, NOT None. Second flight (2026-08-14,
+    # post-boundless): one smeared band survived over the Gulf at Cuba's latitude.
+    # deck's TileLayer keeps the stretched PARENT on screen until child content
+    # arrives, and a None child never arrives, so everywhere an ocean tile was
+    # sparse-skipped next to land, the coarser parent (which contains the land) stayed
+    # stretched over it. Serving a real fully-transparent PNG lets the child land and
+    # evict the ghost. 8x8, built once.
+    _rbuf = io.BytesIO()
+    mpl_image.imsave(_rbuf, np.zeros((8, 8, 4), np.uint8), format="png")
+    _rblank = EncodedImage(data=_rbuf.getvalue(), media_type="image/png")
+
     def _render(tile):
         # Exceptions in here are swallowed by the layer's task machinery, so keep it
         # simple. `.array`, not `.data` (CLAUDE.md). Alpha 0 for NaN ocean AND for exact
@@ -1516,7 +1529,7 @@ async def _(
         # replaces by painting the 69.6% zero majority. matplotlib's PNG writer, so no
         # new dependency.
         if tile is None:
-            return None
+            return _rblank
         v = np.ma.filled(tile.array.as_masked()[0].astype("float64"), np.nan)
         rgba = np.empty(v.shape + (4,), np.uint8)
         rgba[..., :3] = ramp(v)

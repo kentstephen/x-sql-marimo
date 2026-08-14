@@ -48,6 +48,11 @@ constants edits cannot reach it); the wiring cell re-runs freely, un-observing o
 handlers via HOLD["h_*"] refs. The RasterLayer is inserted via `deck.layers` FROM THE
 WIRING CELL, not passed to Map(), so a ramp or constants edit rebuilds the raster
 layer and rewires without destroying the Map. The split passes headless, unflown.
+OPEN DEFECT: the raster still stretches/smears at LOW ZOOMS ON ZOOM OUT (second
+flight; one band over the Gulf at Cuba's latitude). Absent tiles now render as a real
+transparent PNG instead of None (a None child never arrives, so deck keeps stretched
+neighbour-zoom tiles up), but that fix is UNPROVEN against the zoom-out case; next
+suspects and Stephen's NaN hunch are in the notes doc.
 
 `xsql-mapterhorn-explorer.py` (EXPERIMENTAL, open defects below) draws Mapterhorn terrain
 worldwide as extruded H3 columns: the DEM half of the parked

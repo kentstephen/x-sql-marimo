@@ -650,3 +650,17 @@ ValueError for the map-cell-rebuilt case. The fold cell's opening draw now targe
 HOLD["vs"] or HOME, so a wiring re-run redraws where the user left the camera.
 `Map.layers` trait reassignment verified headless on 0.16. Headless export passes;
 the split has not been flown.
+
+## Open: raster stretch at low zooms, on zoom out (second flight, 2026-08-14)
+
+After the boundless fix the world paint reads correctly, but one smeared band survived
+over the Gulf at Cuba's latitude, and Stephen reports the stretch happens ON ZOOM OUT,
+at low zooms, and that he has seen this class of artifact before OUTSIDE this repo
+(possibly NaN-related, his suggestion: "maybe not a number"). One candidate change is
+in: an absent (sparse-skipped) tile now renders as a real 8x8 fully-transparent PNG
+instead of None, because deck's TileLayer keeps stretched neighbours-in-zoom on screen
+until replacement content actually arrives, and a None never arrives. UNPROVEN against
+the zoom-out case; if the band persists, next suspects are how deck treats the custom
+4326 TMS when underzoomed (`extent` is not set on the layer; from_pmtiles sets it,
+from_geotiff does not) and NaN handling in the coarse overviews. lonboard 0.16 exposes
+no refinement-strategy trait to turn the stretching off directly.
