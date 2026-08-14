@@ -51,7 +51,7 @@ far outside the epsilon and far above DEM_FLOOR.
 Data: Mapterhorn planet.pmtiles, us-west-2.opendata.source.coop/mapterhorn/mapterhorn,
       terrarium encoding (R*256 + G + B/256) - 32768, verified on decode (the Rainier
       tile tops at 4,391.6 m against a true 4,392).
-Run:  uv run marimo edit xsql-terrain-3d.py --sandbox
+Run:  uv run marimo edit xsql-mapterhorn-explorer.py --sandbox
 """
 
 import marimo

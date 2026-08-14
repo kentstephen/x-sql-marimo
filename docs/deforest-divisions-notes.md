@@ -544,3 +544,109 @@ Itenez, which is in BOLIVIA, across the border. Brazil has no county-subtype
 divisions in Overture at all; its municipalities are not mapped to that subtype. The
 fallback was the notebook behaving correctly on data that is genuinely absent, which
 is the same story as the 48 countries with no counties anywhere.
+
+## The paint is the raster now (2026-08-14): RasterLayer, hexagons parked
+
+Stephen's call: keep H3 for the divisions join, draw the COG itself. The hexagon layer
+is commented out in the map cell (construction, put_cells body, its slot in the Map
+list); the fold, the cache, the zonal join and the ranking are untouched, because the
+cells are their input. The Controls checkbox that toggled the hexagons now toggles the
+raster and is labelled "deforestation".
+
+The layer is lonboard 0.16's RasterLayer: kernel-side fetch and render callbacks, tiles
+served to deck as PNGs over the anywidget bridge, one TMS generated from the COG's own
+pyramid (async_geotiff.tms.generate_tms, EPSG:4326; deck.gl-raster reprojects
+client-side, so no Mollweide/mercator work in the kernel). Eleven levels, z0 the
+coarsest overview, z10 the 100 m full res.
+
+Built DIRECTLY with the private constructor arguments from_geotiff passes, not via
+from_geotiff, for two reasons measured against the installed 0.16.0 source:
+
+- from_geotiff's fetch calls `image.fetch_tile` blind, and 73.6% of full-res tiles are
+  unstored ocean: same `Invalid range requested, start: 0 end: 0` crash the fold cell
+  documents. The layer's fetch consults `ifd.tile_byte_counts` first (the fold's own
+  fix); an absent tile returns None and the render callback passes the None through, no
+  request issued.
+- from_geotiff ships `min_zoom`/`max_zoom` commented out while its fetcher indexes
+  `images[len - 1 - z]`, so overzoom wraps NEGATIVE onto a coarse overview: wrong data,
+  silently. `max_zoom=10` pins it.
+
+Render: `tile.array.as_masked()[0]` (`.array`, not `.data`), the shared `ramp` for RGB,
+alpha 0 for NaN AND exact zero. Zero-transparent is a semantic decision, not a
+convenience: the fold's `HAVING avg(v) > 0` already drops zero cells, so the map's
+promise ("shows where deforestation IS") survives the paint swap; painting the 69.6%
+zero majority with the legend's dark swatch would have covered the ocean too, because
+the averaged overviews turn unstored ocean into stored 0.0 at coarse levels (measured:
+the coarsest level is one tile, only 6.2% NaN). PNG encode is matplotlib's writer
+(`matplotlib.image.imsave`), so no new imaging dependency; morecantile IS new
+(`lonboard[geotiff]` in the header and root pyproject), pulled in by generate_tms.
+
+The RasterLayer cell opens the COG a SECOND time (headers only). It cannot share the
+fold cell's instance: fold depends on `refresh`, refresh on the map cell, the map cell
+on this layer; sharing would be a dependency cycle. The pixel caches are therefore
+separate too, which is fine, the browser's tile cache is the one doing the work for the
+raster.
+
+Status: headless export passes; NOT yet flown interactively. Watch for: the anywidget
+bridge under marimo carrying the layer's custom tile messages (the repo has only proven
+Unicode and Bool traits across that bridge, and this path uses on_msg dispatch), and
+per-tile render latency in the status-line feel (one PNG encode per tile, ~250 ms
+measured cold for a 195x391 tile including the S3 read).
+
+## First raster flight (2026-08-14): the streaks are not a projection bug
+
+Stephen's screenshot zoomed out over North America showed horizontal smears across land
+and ocean and read as a CRS problem. It is tile geometry, not projection: the fetch used
+`boundless=False`, which CLIPS edge tiles to the image bounds, and deck stretches
+whatever PNG it receives across the full tile quad. At coarse levels nearly every tile
+is an edge tile; the coarsest is one 195x391 image declared as a 512 px tile, so it
+drew stretched ~2.6x vertically, and parents shown while children load did the same.
+Fix: `boundless=True`. The padding arrives as 0.0 (measured on the coarsest tile: NaN
+count identical clipped vs padded, so padding is stored zero, not mask), and the render
+maps zero to alpha 0 anyway, so the padding is invisible. If zero ever stops being
+transparent in this render, the padding must be masked explicitly. Fix passes headless,
+not yet reflown.
+
+## Boundary fill opacity control (2026-08-14)
+
+A stepped slider (0.1-1.0 by 0.1, Stephen's spec) plus a free number box (any 0-1
+float) in the Controls widget, both writing one Unicode trait (`fill_alpha`), because
+Unicode is the trait type proven to cross marimo's bridge browser -> kernel (the Status
+ruler's "WxH" string). Commit on `change`, not `input`; the 0.1 steps rate-limit the
+re-pushes and Safari/Firefox fire `change` during drags regardless.
+
+Kernel side: the alpha moved from the FILL_ALPHA constant (deleted) into
+`HOLD["fill_alpha"]` (0-255, seed 165), so no cell re-run resets it.
+`divisions_to_layer` reads it when building each new pair; the pair already on screen
+is re-tinted by `_refill` in the map cell: whole-table `pa.table(tbl)` (arro3 exposes
+the C stream at table level only, the terrain recolor lesson), rewrite the alpha plane
+of `color`, rebuild via `set_column`. The geoarrow extension metadata on the geometry
+column survives the round trip; verified against PolygonLayer's table validation
+headless, including a second re-tint (idempotent, RGB untouched). The handler parses
+inside a try: it runs in a comm handler where exceptions are silent.
+
+## Open: re-running cells loses the boundary fill until reload (reported 2026-08-14)
+
+Stephen reports edits/re-runs can leave the boundary fill gone until a restart. This is
+the flood notebook's recorded failure mechanism: destroying a lonboard Map terminates
+deck's MODULE-LEVEL earcut worker pool, after which every polygon layer on the page
+fails to init until the browser reloads; hexagon and bitmap layers survive, which is
+why it presents as "lost the fill" specifically. This notebook has ONE giant map cell
+(widgets + layers + Map + all handlers + refresh), so ANY edit to a handler re-runs it
+and rebuilds the Map. The fix on file is the flood notebook's cell split: a map cell
+that never re-runs (imports/widget classes/seeds/HOLD only) and a wiring cell that
+re-runs freely, un-observing old handlers via HOLD refs. Not yet applied here; it is a
+structural refactor of the big cell, not a one-liner.
+
+Update, same day: the split IS applied, per Stephen's go-ahead. Shape of it, matching
+the flood notebook: the map cell holds widgets, seeds, the two always-alive layers
+(divisions, labels) and the Map, plus HOLD["wh"]/HOLD["vs"] only; VIEW_W/VIEW_H and
+HOME moved into it so a constants edit cannot reach it. The wiring cell cancels old
+tasks, resets the screen-state HOLD keys, assigns `deck.layers = [raster, divisions,
+labels]` (the raster is NOT a Map() argument, so raster rebuilds from ramp/constants
+edits swap in through the surviving Map), defines every handler, and re-hooks with
+unobserve-then-observe through HOLD["h_ctl"/"h_wh"/"h_cam"/"h_rank"], try/except
+ValueError for the map-cell-rebuilt case. The fold cell's opening draw now targets
+HOLD["vs"] or HOME, so a wiring re-run redraws where the user left the camera.
+`Map.layers` trait reassignment verified headless on 0.16. Headless export passes;
+the split has not been flown.

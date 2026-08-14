@@ -24,7 +24,32 @@ the parked terrain notebook), the MVT decode too; tile-clipped pieces are dissol
 `division_id` in DuckDB before drawing or the stroke shows tile seams. Full record in
 `docs/deforest-divisions-notes.md`.
 
-`xsql-terrain-3d.py` (EXPERIMENTAL, open defects below) draws Mapterhorn terrain
+Since 2026-08-14 the deforestation PAINT is a lonboard RasterLayer serving the COG's own
+pyramid as ramp-coloured PNG tiles (kernel-side fetch/render callbacks; the layer is
+built directly, not via `from_geotiff`, because from_geotiff's fetch is not sparse-aware
+and its zoom clamp ships commented out in 0.16, wrapping overzoom onto coarse overviews).
+The H3 hexagon layer is COMMENTED OUT in the map cell, not deleted; the fold still runs
+because the divisions join and the ranking consume its cells. Zero and NaN pixels are
+both transparent, matching the fold's `HAVING avg(v) > 0`. Needs `lonboard[geotiff]`
+(morecantile) in the header and pyproject. First flight 2026-08-14: tiles render, but
+the world view was covered in horizontal streaks that read as a projection bug and are
+NOT one: `boundless=False` clips edge tiles and deck stretches the clipped PNG across
+the full tile quad, and at coarse levels nearly every tile is an edge tile. Fixed with
+`boundless=True` (padding arrives as 0.0, measured, which the zero-transparent render
+already hides); the fix is not yet reflown. Boundary fill opacity is now a Controls
+slider (stepped 0.1-1.0) plus a free 0-1 number box, crossing the bridge as a Unicode
+string per the proven-trait-types rule; the alpha lives in `HOLD["fill_alpha"]` (the
+old FILL_ALPHA constant is deleted), new division pairs read it at build time and the
+current pair is re-tinted in place (`_refill`, whole-table `pa.table(tbl)` per the
+terrain recolor lesson). The map/wiring CELL SPLIT is applied (2026-08-14, the flood
+notebook's pattern), closing the re-run-loses-the-fill report: the map cell builds
+widgets/layers/Map only and must never re-run (VIEW_W/VIEW_H and HOME moved into it so
+constants edits cannot reach it); the wiring cell re-runs freely, un-observing old
+handlers via HOLD["h_*"] refs. The RasterLayer is inserted via `deck.layers` FROM THE
+WIRING CELL, not passed to Map(), so a ramp or constants edit rebuilds the raster
+layer and rewires without destroying the Map. The split passes headless, unflown.
+
+`xsql-mapterhorn-explorer.py` (EXPERIMENTAL, open defects below) draws Mapterhorn terrain
 worldwide as extruded H3 columns: the DEM half of the parked
 `archive/xsql-duckdb-terrain-h3.py` standing alone, on the canopy notebook's chassis
 (ruler Status widget, camera machinery, `_instant`/`refresh`). No DuckDB, no pyproj;
@@ -315,7 +340,7 @@ in front.
 
 ## Current project
 
-`xsql-terrain-3d.py`, described above: the worldwide Mapterhorn DEM as extruded H3.
+`xsql-mapterhorn-explorer.py`, described above: the worldwide Mapterhorn DEM as extruded H3.
 Its open items are in its own section's "OPEN DEFECTS AND NEXT WORK" bullet, and
 the 2026-08-13 rework is waiting on an interactive flight. (The canopy notebook,
 the previous current project, went to `archive/` on 2026-08-13; the pairing ideas
@@ -474,10 +499,10 @@ luminance ramps (viridis is already the choice in `s1m_viewer.py`) and lean on
 
 ```bash
 # Dev (full venv)
-uv run marimo edit xsql-terrain-3d.py
+uv run marimo edit xsql-mapterhorn-explorer.py
 
 # Shareable sandbox (PEP 723 inline deps in the notebook header)
-uv run marimo edit xsql-terrain-3d.py --sandbox
+uv run marimo edit xsql-mapterhorn-explorer.py --sandbox
 
 # Headless smoke test (runs every cell, no browser)
 uv run marimo export html xsql-deforest-divisions.py -o /tmp/out.html
