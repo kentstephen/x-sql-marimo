@@ -67,6 +67,7 @@ def _():
     import io
     import math
     import struct
+    import time
 
     import anywidget
     import traitlets
@@ -111,6 +112,7 @@ def _():
         obstore,
         pa,
         struct,
+        time,
         traitlets,
         udf,
         xr,
@@ -214,7 +216,8 @@ def _(anywidget, traitlets):
 @app.cell
 def _(anywidget, traitlets):
     class Controls(anywidget.AnyWidget):
-        """The elevation-scale strip under the map: a stepped slider and the auto button.
+        """The elevation-scale strip under the map: the scale slider and its typed
+        twin, the res-offset slider, and the view toggles.
 
         A widget rather than mo.ui, for the usual reason: an mo.ui control would make
         the map cell depend on it, and every click would rebuild the Map and reset the
@@ -235,46 +238,71 @@ def _(anywidget, traitlets):
             "font:12px ui-sans-serif,system-ui,sans-serif;" +
             "padding:.25rem 0 0;user-select:none;overflow:hidden";
 
-          // STOPS, NOT A RANGE, per the parked terrain notebook's lesson: a long
-          // linear range over a short track puts several values under every pixel.
-          // The stops are coarse at the top where 150 and 160 are the same map and
-          // fine at the bottom where each step visibly changes the relief.
-          const STOPS = [0, 2, 5, 10, 20, 35, 50, 75, 100, 150, 200];
-          const nearest = (v) => {
-            let best = 0;
-            for (let i = 1; i < STOPS.length; i++) {
-              if (Math.abs(STOPS[i] - v) < Math.abs(STOPS[best] - v)) best = i;
-            }
-            return best;
+          // THE SCALE: a continuous QUADRATIC slider plus a typed number. The old
+          // stepped stops died with the auto button (2026-08-13): eleven stops
+          // made 20 -> 35 the smallest move in the band that matters, and the fit
+          // it existed to bracket is gone. Quadratic because the low end is where
+          // a unit of exaggeration is visible: half the track covers 0-50, the
+          // rest runs out to 200. The number box takes ANY float or int (typed,
+          // wheel or arrows), so 12.5 or 300 are one edit away; the slider clamps
+          // to its own range, the typed value does not.
+          const SMAX = 200;
+          const toScale = (p) => {
+            const v = Math.pow(p / 100, 2) * SMAX;
+            return v < 1 ? Math.round(v * 100) / 100 : Math.round(v * 10) / 10;
           };
+          const toPos = (v) =>
+            Math.round(100 * Math.sqrt(Math.min(Math.max(v, 0), SMAX) / SMAX));
+          const val = () => Number(model.get("scale"));
 
           const cap = document.createElement("span");
           cap.style.cssText = "opacity:.7;white-space:nowrap";
-          const note = () => {
-            const n = model.get("note");
-            return n ? "  (" + n + ")" : "";
-          };
-          const val = () => Number(model.get("scale"));
-          const draw = () => { cap.textContent = "scale " + val() + note(); };
+          cap.textContent = "scale";
 
           const s = document.createElement("input");
           s.type = "range";
-          s.min = "0"; s.max = String(STOPS.length - 1); s.step = "1";
-          s.value = String(nearest(val()));
+          s.min = "0"; s.max = "100"; s.step = "1";
+          s.value = String(toPos(val()));
           s.style.cssText = "width:9rem;margin:0;cursor:pointer";
+          const num = document.createElement("input");
+          num.type = "number";
+          num.step = "any"; num.min = "0";
+          num.value = String(val());
+          num.style.cssText =
+            "font:inherit;width:3.6rem;padding:.1rem .25rem;border-radius:4px;" +
+            "border:1px solid #8886;background:transparent;color:inherit";
+          let sDrag = false;
           // LIVE, on input: the scale is one trait assignment on a layer that
           // already holds its data, so it can follow the drag.
           s.addEventListener("input", () => {
-            model.set("scale", String(STOPS[parseInt(s.value, 10)]));
+            const v = toScale(parseInt(s.value, 10));
+            num.value = String(v);
+            model.set("scale", String(v));
             model.save_changes();
           });
-          model.on("change:scale", () => { s.value = String(nearest(val())); draw(); });
-          model.on("change:note", draw);
+          s.addEventListener("pointerdown", () => { sDrag = true; });
+          s.addEventListener("pointerup", () => { sDrag = false; });
+          num.addEventListener("change", () => {
+            const v = Number(num.value);
+            if (Number.isFinite(v) && v >= 0) {
+              model.set("scale", String(v));
+              model.save_changes();
+            } else {
+              num.value = String(val());
+            }
+          });
+          model.on("change:scale", () => {
+            if (!sDrag) s.value = String(toPos(val()));
+            if (document.activeElement !== num) num.value = String(val());
+          });
 
-          // RES +/-: nudge the zoom ladder a step or two either way. Fires on
-          // CHANGE, not input, because every stop is a refold (a real read), unlike
-          // the scale slider which is one trait assignment. The caption tracks the
-          // drag in the meantime.
+          // RES +/-: nudge the zoom ladder a step or two either way. Every stop is
+          // a refold (a real read), unlike the scale slider's one trait assignment,
+          // so the commit is DEBOUNCED rather than tied to the change event: Safari
+          // and Firefox fire change DURING a drag, not just on release, which is
+          // how a refold could land mid-drag (the "glitchy" defect). The caption
+          // tracks the thumb live; the kernel hears about it 350 ms after the
+          // thumb last moved, and only if the value actually changed.
           const ROFFS = [-2, -1, 0, 1, 2];
           const rcap = document.createElement("span");
           rcap.style.cssText = "opacity:.7;white-space:nowrap";
@@ -286,43 +314,32 @@ def _(anywidget, traitlets):
           rs.min = "0"; rs.max = String(ROFFS.length - 1); rs.step = "1";
           rs.value = String(ROFFS.indexOf(roff()) < 0 ? 2 : ROFFS.indexOf(roff()));
           rs.style.cssText = "width:5rem;margin:0;cursor:pointer";
-          rs.addEventListener("input", () => rdraw(ROFFS[parseInt(rs.value, 10)]));
-          rs.addEventListener("change", () => {
-            model.set("res_off", String(ROFFS[parseInt(rs.value, 10)]));
-            model.save_changes();
-          });
+          let rT = null, rDrag = false;
+          const rCommit = () => {
+            const v = String(ROFFS[parseInt(rs.value, 10)]);
+            if (v !== model.get("res_off")) {
+              model.set("res_off", v);
+              model.save_changes();
+            }
+          };
+          const rKick = () => {
+            rdraw(ROFFS[parseInt(rs.value, 10)]);
+            clearTimeout(rT);
+            rT = setTimeout(rCommit, 350);
+          };
+          rs.addEventListener("input", rKick);
+          rs.addEventListener("change", rKick);
+          rs.addEventListener("pointerdown", () => { rDrag = true; });
+          rs.addEventListener("pointerup", () => { rDrag = false; });
           model.on("change:res_off", () => {
+            // The kernel's echo of a value the thumb already shows must not snap
+            // the thumb back mid-drag.
+            if (rDrag) return;
             const i = ROFFS.indexOf(roff());
             rs.value = String(i < 0 ? 2 : i);
             rdraw(roff());
           });
           rdraw(roff());
-
-          // ONE BUTTON, TWO JOBS. Off -> on arms the auto fit; on -> off is the
-          // reset, and the reset also puts the slider back to the fixed 20 HERE, in
-          // the same click, so the kernel never has to guess whether a scale change
-          // came from the slider or from the reset.
-          const btn = document.createElement("button");
-          btn.style.cssText =
-            "font:inherit;padding:.15rem .6rem;cursor:pointer;border-radius:4px;" +
-            "border:1px solid #8886;background:transparent;color:inherit";
-          const label = () => {
-            btn.textContent = model.get("auto_scale")
-              ? "reset scale to " + model.get("fixed")
-              : "auto scale (fit view)";
-          };
-          btn.addEventListener("click", () => {
-            if (model.get("auto_scale")) {
-              model.set("auto_scale", false);
-              model.set("scale", model.get("fixed"));
-            } else {
-              model.set("auto_scale", true);
-            }
-            model.save_changes();
-          });
-          model.on("change:auto_scale", () => { label(); draw(); });
-          label();
-          draw();
 
           // Plain pressed-state toggles: the background says which way the switch
           // sits, the kernel does the rest by trait assignment.
@@ -344,38 +361,72 @@ def _(anywidget, traitlets):
             return t;
           };
 
+          // THE CMAP DROPDOWN: the CB-safe shortlist only (luminance-monotonic,
+          // no red-green pair). The kernel treats a pick exactly like a ramp
+          // flip: gen bump, serve-path repaint. Composes with reverse (_r twin).
+          const CMAPS = ["gist_heat", "viridis", "cividis", "magma", "inferno", "Greens"];
+          const sel = document.createElement("select");
+          sel.style.cssText =
+            "font:inherit;padding:.15rem .3rem;cursor:pointer;border-radius:4px;" +
+            "border:1px solid #8886;background:transparent;color:inherit";
+          CMAPS.forEach((n) => {
+            const o = document.createElement("option");
+            o.value = n; o.textContent = n;
+            sel.appendChild(o);
+          });
+          sel.value = model.get("cmap");
+          sel.addEventListener("change", () => {
+            model.set("cmap", sel.value);
+            model.save_changes();
+          });
+          model.on("change:cmap", () => { sel.value = model.get("cmap"); });
+
+          // The res-offset warning: every step is a refold, and each step FINER
+          // multiplies the cells in view by ~7 (H3's children-per-cell), so +2 is
+          // ~49x the table. Dim, permanent, next to the thing it warns about.
+          const rwarn = document.createElement("span");
+          rwarn.style.cssText = "opacity:.45;white-space:nowrap;font-size:11px";
+          rwarn.textContent = "each + step refolds ~7x the cells";
+
           box.appendChild(cap);
           box.appendChild(s);
-          box.appendChild(btn);
+          box.appendChild(num);
           box.appendChild(rcap);
           box.appendChild(rs);
-          // FLAT is a view switch, not a scale of 0: the slider and the auto state
-          // keep their values, so leaving flat restores exactly the relief you had.
+          box.appendChild(rwarn);
+          // FLAT is a view switch, not a scale of 0: the slider keeps its value,
+          // so leaving flat restores exactly the relief you had.
           box.appendChild(toggle("flat", "flat"));
           // Place names are a separate Carto tile layer OVER the columns (the
           // basemap itself is label-free), so they read through tall terrain
           // strangely; off by default, one click to bring back.
           box.appendChild(toggle("labels", "labels"));
+          // RELATIVE COLOURS: the ramp normalised to the ground in view instead of
+          // the fixed 0-5,000 m stretch. The kernel repaints the served table and
+          // the legend follows with the view's own metres.
+          box.appendChild(toggle("relative", "relative colors"));
           // THE RAMP FLIP: the kernel recolours the tables in hand and the legend
-          // widget follows.
+          // widget follows. Opens PRESSED (reverse defaults true).
           box.appendChild(toggle("reverse", "reverse cmap"));
+          box.appendChild(sel);
           el.appendChild(box);
         }
         export default { render };
         """
         # The applied vertical exaggeration, as a string (see the trait-types note).
-        # The kernel parses it; the default here IS the "start at 20 for all" rule.
+        # The kernel parses it as a float; the default here IS the "start at 20 for
+        # all" rule. The number box accepts any non-negative float or int.
         scale = traitlets.Unicode("20").tag(sync=True)
-        # True while the fit-to-view rule owns the scale. The kernel refits on every
-        # fold while this is on; the slider value is ignored until the reset.
-        auto_scale = traitlets.Bool(False).tag(sync=True)
-        # Kernel -> panel only: what is actually applied right now ("auto 214x" while
-        # fitting, blank while fixed, where the slider's own number is the truth).
-        note = traitlets.Unicode("").tag(sync=True)
-        # The reset target, stated once in the kernel and read by the button label.
-        fixed = traitlets.Unicode("20").tag(sync=True)
-        # True while the ramp runs dark-high (magma_r). Bool, per the proven list.
-        reverse = traitlets.Bool(False).tag(sync=True)
+        # True while the ramp is normalised to the ground in view (relative
+        # colours) instead of the fixed 0-5,000 m hypsometric stretch.
+        relative = traitlets.Bool(False).tag(sync=True)
+        # True while the ramp runs the _r twin. DEFAULTS ON (Stephen's call,
+        # 2026-08-13): the reversed ramp is the wanted look, the toggle un-reverses.
+        reverse = traitlets.Bool(True).tag(sync=True)
+        # The colormap, by matplotlib name; the dropdown's options are the
+        # CB-safe shortlist (luminance-monotonic, no red-green pair; Greens is
+        # fine for Stephen's protan vision, mono-green ramps read clean).
+        cmap = traitlets.Unicode("gist_heat").tag(sync=True)
         # True while the extrusion is switched off entirely. The scale and auto
         # state survive underneath it, so flat is reversible in one click.
         flat = traitlets.Bool(False).tag(sync=True)
@@ -448,38 +499,11 @@ def _(math):
     }
     MAX_RES = 13
 
-    # Average H3 edge length in metres, used ONLY by the auto fit. res 5-11 are the
-    # parked notebook's; 2-4 are H3's published averages for the coarser rings.
-    EDGE_M = {
-        2: 158244.7,
-        3: 59810.9,
-        4: 22606.4,
-        5: 8544.4,
-        6: 3229.5,
-        7: 1220.6,
-        8: 461.4,
-        9: 174.4,
-        10: 65.9,
-        11: 24.9,
-        12: 9.4,
-        13: 3.6,
-    }
-
-    # THE AUTO FIT, carried whole from the parked notebook: all the relief in view
-    # stands about 1.5 hexagon edges tall, which is ~25 px on screen at any zoom,
-    # because res_for_zoom keeps a hexagon at a roughly constant pixel size. A view
-    # with under MIN_RELIEF_M of spread is treated as flat rather than dividing the
-    # scale toward infinity.
-    TARGET_EDGES = 1.5
-    MIN_RELIEF_M = 25.0
-
-    def elev_base_scale(res, relief_m):
-        """Metres of drawn height per metre of elevation, fitted to the view."""
-        return EDGE_M[res] * TARGET_EDGES / max(relief_m, MIN_RELIEF_M)
-
-    # THE OPENING SCALE, AND THE RESET TARGET. 20x for all zooms: a stated constant
-    # rather than a moving fit, so two screenshots at different zooms are comparable.
-    # The Controls button trades it for the fit and back.
+    # THE OPENING SCALE. 20x for all zooms: a stated constant rather than a moving
+    # fit, so two screenshots at different zooms are comparable. The auto-fit that
+    # used to trade against it is GONE (2026-08-13): it fit the relief to ~25 px and
+    # read flat next to this default, and Stephen called it; the scale is now the
+    # slider plus a typed number, nothing else.
     SCALE_FIXED = 20.0
 
     # ------------------------------------------------------------------ the ladder
@@ -528,13 +552,16 @@ def _(math):
 
     SETTLE = 0.2
 
-    # The Alps, pitched, mid-band: enough relief that the opening 20x reads as
-    # mountains immediately, and a familiar range to sanity-check against.
+    # THE WORLD (Stephen's call, 2026-08-13, was the pitched Alps): flat, whole
+    # planet in the frame at zoom 1.6 (360 degrees across ~1,400 px at 512 px
+    # tiles), latitude 20 so the landmass bulk sits centred rather than Antarctica.
+    # MIN_RES 4 makes this ~84k land cells from z3 tiles, the floor that measured
+    # fine. Unpitched, so the opening fold needs no horizon padding.
     HOME = {
-        "longitude": 8.4,
-        "latitude": 46.3,
-        "zoom": 6.5,
-        "pitch": 50,
+        "longitude": 10.0,
+        "latitude": 20.0,
+        "zoom": 1.6,
+        "pitch": 0,
         "bearing": 0,
     }
     return (
@@ -550,7 +577,6 @@ def _(math):
         SETTLE,
         VIEW_H,
         VIEW_W,
-        elev_base_scale,
         res_for_view,
     )
 
@@ -570,7 +596,9 @@ def _(matplotlib, np):
     # bottom recedes into the dark basemap, which those notebooks measured as a
     # feature: lowlands fade back, ranges stand forward.
     ELEV_HI = 5000.0
-    # THE ONE PLACE THE COLORMAP IS NAMED. Any matplotlib cmap drops in here ("name"):
+    # THE COLORMAP SEAM. "name" here is only the SEED: the panel's dropdown (the
+    # CMAPS list in Controls._esm) owns it at runtime, and the map cell copies the
+    # panel's choice in at build. Any matplotlib cmap drops into either place:
     # everything downstream is agnostic, because recolor() repaints the tables in hand
     # from their own elev_m column and the legend rebuilds from ramp_elev itself, and
     # the reverse button composes with any choice since matplotlib registers a "_r"
@@ -581,23 +609,44 @@ def _(matplotlib, np):
     # dark-low ramp, so a pale-low map will glow at sea level.
     # "gen" counts repaints: every ramp change bumps it, painted tables record the
     # gen they wore, and stale ones are recoloured LAZILY when they are next served.
-    # That is the fix for the reverse button being painfully slow (it used to
-    # eagerly rebuild and resend every cached resolution) and for the flip not
-    # sticking (a fold in flight across the click used to land wearing the old
-    # ramp and stay cached that way).
-    RAMP = {"name": "gist_heat", "rev": False, "gen": 0}
+    # "rel" is RELATIVE COLOURS (the panel's button): the ramp normalised to the
+    # p2-p98 of the table being painted instead of the fixed 0-5,000 m stretch, the
+    # colour twin of the relief floor. "lo"/"hi" are the metres the CURRENT legend
+    # describes; put_cells rewrites them on every serve while rel is on.
+    RAMP = {
+        "name": "gist_heat",
+        "rev": False,
+        "rel": False,
+        "gen": 0,
+        "lo": 0.0,
+        "hi": 5000.0,
+    }
+
+    def _cmap():
+        return matplotlib.colormaps[RAMP["name"] + ("_r" if RAMP["rev"] else "")]
 
     def ramp_elev(v):
-        """Mean elevation metres -> uint8 RGB, sqrt-stretched RAMP over 0-5,000 m.
+        """Mean elevation metres -> uint8 RGB.
 
-        Below-sea land (Death Valley, the Dead Sea shore) clamps to the bottom of the
-        ramp: it is the lowest ground there is, and the tooltip carries the signed
-        number. RAMP["rev"] serves the _r twin instead: pale lowlands, dark peaks.
+        Fixed mode: sqrt-stretched RAMP over 0-5,000 m, so a colour means the same
+        altitude everywhere on the planet. Below-sea land (Death Valley, the Dead
+        Sea shore) clamps to the bottom of the ramp: it is the lowest ground there
+        is, and the tooltip carries the signed number.
+
+        Relative mode: linear over the p2-p98 of THIS array, so the whole ramp is
+        spent on the ground actually in view. Linear rather than sqrt because the
+        sqrt exists to serve a planet-wide range and a viewport's range is narrow.
+        Single-value calls (legend swatches) always use the fixed stretch; the
+        relative legend samples the cmap directly instead.
         """
-        cmap = matplotlib.colormaps[RAMP["name"] + ("_r" if RAMP["rev"] else "")]
         v = np.asarray(v, dtype="float64")
-        t = np.sqrt(np.clip(np.nan_to_num(v) / ELEV_HI, 0.0, 1.0))
-        return (cmap(t)[..., :3] * 255).astype(np.uint8)
+        if RAMP["rel"] and v.size > 1:
+            lo, hi = np.percentile(np.nan_to_num(v), [2.0, 98.0])
+            hi = max(hi, lo + 1.0)
+            t = np.clip((np.nan_to_num(v) - lo) / (hi - lo), 0.0, 1.0)
+        else:
+            t = np.sqrt(np.clip(np.nan_to_num(v) / ELEV_HI, 0.0, 1.0))
+        return (_cmap()(t)[..., :3] * 255).astype(np.uint8)
 
     ELEV_STOPS = [
         (0.0, "0 m"),
@@ -608,19 +657,39 @@ def _(matplotlib, np):
     ]
 
     def legend_html():
-        """The legend, from the same ramp the layer uses, rebuilt on every flip so a
-        colour on the map and a colour in the key cannot drift apart."""
+        """The legend, from the same ramp the layer uses, rebuilt on every flip (and
+        on every serve while relative is on) so a colour on the map and a colour in
+        the key cannot drift apart.
+
+        Relative mode samples the cmap at fixed fractions and labels them with the
+        metres of the CURRENT view (RAMP["lo"/"hi"], written by put_cells from the
+        served table's own percentiles, the same numbers the paint used)."""
+        if RAMP["rel"]:
+            lo, hi = RAMP["lo"], RAMP["hi"]
+            stops = [
+                (
+                    (_cmap()(f)[:3]),
+                    f"{lo + f * (hi - lo):,.0f}" + (" m" if f == 0.0 else ""),
+                )
+                for f in (0.0, 0.25, 0.5, 0.75, 1.0)
+            ]
+            head = "elevation (in view)"
+        else:
+            stops = [
+                (ramp_elev(np.array([v]))[0] / 255.0, lab) for v, lab in ELEV_STOPS
+            ]
+            head = "elevation"
         sw = "".join(
             f"<span style='display:inline-flex;align-items:center;gap:.3rem;margin-right:.8rem'>"
             f"<span style='width:14px;height:14px;border-radius:2px;background:rgb("
-            f"{','.join(str(int(c)) for c in ramp_elev(np.array([v]))[0])})"
+            f"{','.join(str(int(c * 255)) for c in rgb)})"
             f";outline:1px solid rgba(255,255,255,.18)'></span>{lab}</span>"
-            for v, lab in ELEV_STOPS
+            for rgb, lab in stops
         )
         return (
             "<div style=\"font:12px ui-sans-serif,system-ui,sans-serif;"
             "display:flex;flex-wrap:wrap;align-items:center;padding:.35rem 0\">"
-            "<b style='margin-right:.7rem'>elevation</b>"
+            f"<b style='margin-right:.7rem'>{head}</b>"
             f"{sw}</div>"
         )
 
@@ -691,23 +760,32 @@ def _(ArroTable, HOLD, coordinates_to_cells, np, pa, ramp_elev):
     def recolor(tbl):
         """The same table wearing the ramp's CURRENT colours, from its own elev_m.
 
-        This is what makes the reverse button free: the fold and the read are both
-        untouched, only the colour column is rebuilt. elev_m is rounded to 0.1 m,
-        which moves a colour by well under one ramp step.
+        The fold and the read are both untouched, only the colour column is
+        rebuilt. elev_m is rounded to 0.1 m, which moves a colour by well under
+        one ramp step.
+
+        The pa.table(tbl) hop matters: `tbl` is an arro3 Table and its columns are
+        arro3 ChunkedArrays, which pyarrow's pa.table() rejects ("is not a
+        sequence": pyarrow converts dict values as sequences, and arro3 exposes
+        the C stream protocol only at table level). Converting the whole table
+        once gives pyarrow columns that pass straight through. Before 2026-08-13
+        this function had never actually run: the legend-shadow bug killed every
+        handler that could reach it first, so the TypeError stayed hidden.
         """
+        src = pa.table(tbl)
         return ArroTable.from_arrow(
             pa.table(
                 {
-                    "hex": tbl["hex"],
+                    "hex": src["hex"],
                     "color": pa.FixedSizeListArray.from_arrays(
                         pa.array(
-                            ramp_elev(np.asarray(tbl["elev_m"], dtype="float64")).ravel()
+                            ramp_elev(np.asarray(src["elev_m"], dtype="float64")).ravel()
                         ),
                         3,
                     ),
-                    "height": tbl["height"],
-                    "elev_m": tbl["elev_m"],
-                    "pixels": tbl["pixels"],
+                    "height": src["height"],
+                    "elev_m": src["elev_m"],
+                    "pixels": src["pixels"],
                 }
             )
         )
@@ -1034,7 +1112,6 @@ def _(
     BitmapTileLayer,
     CartoBasemap,
     Controls,
-    ELEV_STOPS,
     H3HexagonLayer,
     HOLD,
     HOME,
@@ -1049,24 +1126,25 @@ def _(
     VIEW_H,
     VIEW_W,
     asyncio,
-    elev_base_scale,
     infer_rows_per_chunk,
     legend_html,
     np,
-    ramp_elev,
     recolor,
     res_for_view,
     seed_cells,
+    time,
 ):
     # Built exactly once. This cell depends on no state the camera can write, so
     # nothing in the notebook can re-run it and throw the view away. Everything after
     # this happens by trait assignment on the live layer.
     status = Status(value="<b>loading…</b>")
-    controls = Controls(fixed=f"{SCALE_FIXED:g}", scale=f"{SCALE_FIXED:g}")
-    # A fresh Controls opens unreversed, so the ramp state follows it: a re-run of
-    # this cell clears the cache below, and the next fold paints from a RAMP that
-    # agrees with the panel.
+    controls = Controls(scale=f"{SCALE_FIXED:g}")
+    # A fresh Controls opens reversed (the wanted look), absolute, on the default
+    # cmap, and the ramp state follows it: a re-run of this cell clears the cache
+    # below, and the next fold paints from a RAMP that agrees with the panel.
     RAMP["rev"] = controls.reverse
+    RAMP["rel"] = controls.relative
+    RAMP["name"] = controls.cmap
     legend = HtmlLine(value=legend_html())
 
     _seed = seed_cells()
@@ -1122,31 +1200,18 @@ def _(
     def apply_scale():
         """Put the panel's scale on the layer. The ONLY place elevation_scale is set.
 
-        Fixed mode is the slider's number, applied as-is at every zoom (the opening
-        state: 20). Auto mode refits on every fold so the relief in view stands
-        about 1.5 hexagon edges tall whatever the resolution; before the first fold
-        there is nothing to fit to and the fixed number stands in. The note trait
-        tells the caption which number is actually applied.
+        The slider's number, applied as-is at every zoom (the opening state: 20).
+        The auto fit that used to live here is deleted (2026-08-13): it fit the
+        relief to ~25 px, read flat next to the 20x default, and the typed number
+        box now covers "some exact exaggeration".
 
-        OPEN ISSUE (2026-08-13, noted on request, not fixed): Stephen reports auto
-        "just flattens the hexagons". It is doing what it says, and that is the
-        problem: the fit targets ~25 px of total relief (TARGET_EDGES 1.5), which
-        next to the 20x default reads as flat, e.g. an Alps view at res 7 fits to
-        ~0.6x. If auto is to feel useful the target needs retuning (a larger
-        TARGET_EDGES, or fitting toward the fixed scale as a ceiling).
-
-        FLAT overrides everything: extrusion off, scale and auto state preserved
-        underneath, so the button is a view switch rather than a destructive reset.
+        FLAT overrides everything: extrusion off, scale preserved underneath, so
+        the button is a view switch rather than a destructive reset.
         """
-        if controls.auto_scale and HOLD["res"] is not None:
-            scale = elev_base_scale(HOLD["res"], HOLD["relief"])
-            controls.note = f"auto {scale:,.0f}x" if scale >= 1 else f"auto {scale:.2f}x"
-        else:
-            try:
-                scale = float(controls.scale)
-            except ValueError:
-                scale = SCALE_FIXED
-            controls.note = "fitting on next fold" if controls.auto_scale else ""
+        try:
+            scale = float(controls.scale)
+        except ValueError:
+            scale = SCALE_FIXED
         cells.elevation_scale = scale
         cells.extruded = (not controls.flat) and scale > 0
 
@@ -1159,21 +1224,38 @@ def _(
             ent[4] = RAMP["gen"]
 
     def _on_controls(change):
-        if change["name"] == "reverse":
-            # The flip repaints, it never refetches, and it resends COLOURS ONLY:
-            # the rows on screen are exactly the served entry's rows, so assigning
-            # get_fill_color ships one small accessor buffer instead of the whole
-            # table (hex ids, heights, tooltip columns) that made this painfully
-            # slow. Other cached resolutions are marked stale by the gen bump and
+        if change["name"] in ("reverse", "relative", "cmap"):
+            # A ramp change repaints, it never refetches, and it goes through the
+            # ORDINARY SERVE PATH: recolour the served entry and re-put the whole
+            # table, exactly what a zoom cache hit does, which is the one path
+            # proven fast. (The previous design resent a colours-only accessor
+            # buffer to a `legend` that a stale duplicate had shadowed into a str,
+            # so the handler died silently at legend.value and the map did not
+            # repaint until the next fold; both halves of that are gone.)
+            # Other cached resolutions are marked stale by the gen bump and
             # recoloured when next served; a view that has not folded yet has
-            # nothing to repaint and picks the ramp up on its first fold.
+            # nothing to repaint and picks the ramp up on its first fold. The
+            # repaint ms in the status line is the kernel-side cost (recolour +
+            # serialization); if a flip still drags with a small number there,
+            # the time is in the browser and that button should probably go.
             RAMP["rev"] = controls.reverse
+            RAMP["rel"] = controls.relative
+            RAMP["name"] = controls.cmap
             RAMP["gen"] += 1
-            legend.value = legend_html()
             hit = HOLD["cache"].get(HOLD["res"])
             if hit is not None:
+                _t0 = time.perf_counter()
                 _ensure_paint(hit)
-                cells.get_fill_color = hit[1]["color"]
+                put_cells(hit[1], hit[2])
+                _ms = (time.perf_counter() - _t0) * 1e3
+                HOLD["head"] = (
+                    f"{HOLD['head'].split(' · repaint')[0]} · repaint {_ms:.0f} ms"
+                )
+                if HOLD["vs"] is not None:
+                    set_status(HOLD["vs"])
+            # After put_cells so the relative legend wears the metres this serve
+            # just wrote into RAMP.
+            legend.value = legend_html()
             return
         if change["name"] == "labels":
             labels.visible = controls.labels
@@ -1189,16 +1271,11 @@ def _(
             elif not _instant(vs):
                 HOLD["task"] = _spawn(refresh(vs))
             return
-        # A slider drag while auto owns the scale is a manual override: auto yields.
-        # The reset button never lands here as a bare scale change, because its JS
-        # flips auto_scale in the same message.
-        if change["name"] == "scale" and controls.auto_scale:
-            controls.auto_scale = False
         apply_scale()
 
     controls.observe(
         _on_controls,
-        names=["scale", "auto_scale", "reverse", "flat", "res_off", "labels"],
+        names=["scale", "reverse", "relative", "cmap", "flat", "res_off", "labels"],
     )
     labels.visible = controls.labels
 
@@ -1331,10 +1408,8 @@ def _(
         HOLD["relief"] = relief
         cells._rows_per_chunk = max(1, infer_rows_per_chunk(tbl))
         # hold_sync so deck gets one message: hexagons, colours, heights AND the
-        # scale land as one update. The scale belongs in the batch because a
-        # resolution change under auto moves the hexagon size and the scale that
-        # compensates together; two messages would render one frame of new cells at
-        # the old exaggeration, a 2.65x jump in apparent relief at a band boundary.
+        # scale land as one update rather than one frame of new cells at a stale
+        # exaggeration or extrusion state.
         with cells.hold_sync():
             cells.table = tbl
             cells.get_hexagon = tbl["hex"]
@@ -1342,6 +1417,15 @@ def _(
             cells.get_elevation = tbl["height"]
             cells.visible = True
             apply_scale()
+        if RAMP["rel"]:
+            # The legend follows every serve in relative mode: recompute the same
+            # p2-p98 the paint used from the served table's own metres (identical
+            # arithmetic on the same column, so key and map cannot disagree).
+            _e = np.asarray(tbl["elev_m"], dtype="float64")
+            if _e.size > 1:
+                _lo, _hi = np.percentile(np.nan_to_num(_e), [2.0, 98.0])
+                RAMP["lo"], RAMP["hi"] = float(_lo), float(max(_hi, _lo + 1.0))
+            legend.value = legend_html()
 
     def _instant(vs):
         """Everything answerable without a read, done synchronously in the comm handler."""
@@ -1443,6 +1527,16 @@ def _(
         if _same_view(vs, HOLD["vs"]):
             return
         HOLD["vs"] = vs
+        # MOVING THE MAP RESETS A RAISED OFFSET (Stephen's ask, 2026-08-13): a +1
+        # or +2 offset is a statement about THIS view, and leaving it armed makes
+        # every subsequent pan refold at ~7x or ~49x the cells it should. Assigning
+        # the trait fires _on_controls' res_off branch, which folds the new view at
+        # the reset ladder itself, so this handler stops here rather than spawning
+        # a second refold. Negative offsets stay: coarser is cheaper everywhere and
+        # reads as a deliberate preference rather than a zoom-in probe.
+        if _res_off() > 0:
+            controls.res_off = "0"
+            return
         if HOLD["busy"]:
             HOLD["pending"] = vs
             return
@@ -1476,21 +1570,13 @@ def _(
 
     status.observe(_on_wh, names="view_wh")
 
-    # The legend, built from the same ramp the layer uses, so a colour on the map and
-    # a colour in the key cannot drift apart.
-    _sw = "".join(
-        f"<span style='display:inline-flex;align-items:center;gap:.3rem;margin-right:.8rem'>"
-        f"<span style='width:14px;height:14px;border-radius:2px;background:rgb("
-        f"{','.join(str(int(c)) for c in ramp_elev(np.array([v]))[0])})"
-        f";outline:1px solid rgba(255,255,255,.18)'></span>{lab}</span>"
-        for v, lab in ELEV_STOPS
-    )
-    legend = (
-        "<div style=\"font:12px ui-sans-serif,system-ui,sans-serif;"
-        "display:flex;flex-wrap:wrap;align-items:center;padding:.35rem 0\">"
-        "<b style='margin-right:.7rem'>elevation</b>"
-        f"{_sw}</div>"
-    )
+    # NO second `legend` here. A static copy of the legend HTML used to be rebuilt
+    # at this point and it SHADOWED the HtmlLine widget from the top of the cell,
+    # so every `legend.value = ...` in the observers hit a plain str and raised
+    # AttributeError inside a comm handler, where exceptions are silent: the ramp
+    # buttons died before their repaint line and the map only caught up on the
+    # next fold. That was most of the "reverse cmap is slow / does not stick"
+    # defect. The HtmlLine IS the legend; the UI cell renders the widget.
     return controls, deck, legend, refresh, status
 
 
@@ -1592,7 +1678,7 @@ def _(controls, deck, legend, mo, status):
         [
             deck,
             status,
-            mo.Html(legend),
+            legend,
             controls,
             mo.md(
                 "Mean elevation per H3 cell, worldwide: Mapterhorn terrain "
@@ -1603,13 +1689,15 @@ def _(controls, deck, legend, mo, status):
                 "Hold Ctrl (or right-drag) to tilt and orbit; a tilted view folds "
                 "one H3 step coarser and pads toward the horizon, so the far field "
                 "stays filled. **scale** applies a constant vertical exaggeration "
-                "at every zoom (opens at 20x); **auto scale** refits on every move "
-                "so the relief in view always stands about 25 px tall, and the same "
-                "button resets to the fixed 20x. **flat** switches the extrusion "
+                "at every zoom (opens at 20x): drag the slider or type any number "
+                "in the box beside it. **flat** switches the extrusion "
                 "off without touching the scale; **labels** brings the place names "
-                "back over the columns; **res** nudges the hexagon resolution up to "
-                "two steps either way (res 12-13 read Mapterhorn's regional z13+ "
-                "archives); **reverse cmap** flips the ramp. The "
+                "back over the columns; **res offset** nudges the hexagon resolution "
+                "up to two steps either way (res 12-13 read Mapterhorn's regional "
+                "z13+ archives; each + step refolds ~7x the cells); **relative "
+                "colors** respends the whole ramp on the ground in view, with the "
+                "legend following the view's own metres; **reverse cmap** flips "
+                "the ramp (opens reversed) and the dropdown swaps the colormap. The "
                 "sea folds out: this archive has no bathymetry, so ocean is basemap, "
                 "and below-sea land (Death Valley, the Dead Sea shore) keeps its "
                 "signed metres."
