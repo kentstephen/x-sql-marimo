@@ -1,21 +1,13 @@
 # x-sql-marimo
 
-Fold a raster to H3 in SQL, then join it to something that has edges. Three notebooks do
-that with three different pairs, and nothing is read until the camera asks for it. A
-fourth is the fold alone, run once over a fixed box for a static map.
+Fold a raster to H3 in SQL, then join it to something that has edges. One notebook is
+the point of the repo: worldwide deforestation, streamed straight out of object storage,
+joined to administrative divisions everywhere the camera lands. A second, experimental
+notebook applies the same chassis to terrain.
 
 ```bash
 # where forest was lost 2002-2022, by administrative division, worldwide
 uv run marimo edit xsql-deforest-divisions.py --sandbox
-
-# which buildings stand on high wildfire-risk ground, CONUS
-uv run marimo edit xsql-firerisk-buildings.py --sandbox
-
-# the human footprint index, by administrative division, worldwide
-uv run marimo edit xsql-hfp-divisions.py --sandbox
-
-# one static fold of the footprint over the lower 48, no camera machinery
-uv run marimo edit xsql-hfp-conus.py --sandbox
 
 # EXPERIMENTAL, use caution: worldwide Mapterhorn terrain as extruded H3 columns.
 # Open defects (res-to-zoom tuning, deep-zoom regional reads unflown); expect rough
@@ -23,16 +15,13 @@ uv run marimo edit xsql-hfp-conus.py --sandbox
 uv run marimo edit xsql-mapterhorn-explorer.py --sandbox
 ```
 
-All of them stream their raster straight out of object storage with
-[obstore](https://developmentseed.org/obstore/), fold it into [H3](https://h3geo.org/) cells
-in SQL, join those cells to Overture geometry on the cell id, and draw the result with
+The deforestation notebook streams its raster with
+[obstore](https://developmentseed.org/obstore/), folds it into [H3](https://h3geo.org/)
+cells in SQL, joins those cells to Overture geometry on the cell id, and draws with
 [lonboard](https://developmentseed.org/lonboard/). No tile server, no STAC API, no pixels
-leave the bucket until the viewport asks for them.
-
-The first is written up in full below, because it is where the machinery was worked out.
-[The second](#the-second-notebook-which-structures-are-on-dangerous-ground) and
-[the third](#the-third-notebook-how-hard-people-press-on-the-ground) reuse it and only
-the differences are worth reading.
+leave the bucket until the viewport asks for them. The map paints the COG itself, served
+as ramp-coloured tiles from the kernel; H3 is the measurement layer underneath, where the
+per-division numbers come from.
 
 ## Deforestation by Overture division
 
@@ -64,6 +53,20 @@ one-line swap.
 Boundaries are [Overture Maps](https://overturemaps.org/) divisions, read from the pinned
 release's own PMTiles build.
 
+### What the map draws
+
+Two layers, one ramp:
+
+- **The raster itself**, as a lonboard `RasterLayer`: the COG's own pyramid served from
+  the kernel as ramp-coloured PNG tiles, so the paint is pixel-sharp at every zoom rather
+  than quantised to cell means. Exact zero and no-data are transparent; this map shows
+  where deforestation **is**, not where it is absent.
+- **Divisions**, as a choropleth: each region, county or locality coloured by the mean
+  share of its ground deforested, with a fill-opacity slider and a toggleable outline.
+
+The division numbers do not come from the paint. They come from an H3 fold that runs
+under it, which is the next section.
+
 ### Why H3 is not just a demo step
 
 The COG is in degrees, so **its pixels are not equal area**: a 100 m pixel at the equator
@@ -90,7 +93,7 @@ Getting this wrong is invisible on screen, which is the dangerous part.
 | **polyfill** division polygon to cells | DuckDB `h3` | the only engine with one, and it wraps Uber's C library |
 | **dissolve** tile-clipped pieces | DuckDB `spatial` | `ST_Union_Agg` per division id |
 | **join** cells to divisions | DataFusion | an integer equi-join and a group-by, no geometry involved. The cells are already there |
-| render | lonboard | |
+| render | lonboard | the raster as kernel-served tiles, the divisions as polygons |
 
 Shipping the cells over to DuckDB because DuckDB happens to hold the polygons would have
 been backwards. The geometry steps go where the geometry is; the join goes where the data
@@ -110,9 +113,9 @@ than the resolution grows.
 | 7 | 98,825,162 | 1.4 km | L2 (400 m) | 32 |
 | 8 | 691,776,122 | 0.5 km | L1 (200 m) | 18 |
 
-Res 4 draws the whole planet comfortably: 288 thousand cells, not 288 million. The world
-at res 4 is 15.7M pixels read in 821 ms plus a 282 ms fold, and 8 ms plus 211 ms the
-second time off the tile cache.
+Res 4 measures the whole planet comfortably: 288 thousand cells, not 288 million. The
+world at res 4 is 15.7M pixels read in 821 ms plus a 282 ms fold, and 8 ms plus 211 ms
+the second time off the tile cache.
 
 ### The COG is sparse and async-geotiff does not know it
 
@@ -125,8 +128,10 @@ TypeError: ValueError: Invalid range requested, start: 0 end: 0
 
 which names neither the tile nor the sparseness, so it reads like a corrupt file. Reading
 on the COG's own 512 px tile grid and consulting `tile_byte_counts` first turns that from
-a crash into a **speedup**: an absent tile is NaN with no request at all. This is the piece
-most worth stealing from this notebook, and the piece that looks most like boilerplate.
+a crash into a **speedup**: an absent tile is NaN with no request at all. The raster tile
+layer consults the same table, so an ocean tile costs nothing there either. This is the
+piece most worth stealing from this notebook, and the piece that looks most like
+boilerplate.
 
 ### Boundaries come from PMTiles, not GeoParquet
 
@@ -154,12 +159,14 @@ anything downstream sees them, or the stroke draws tile seams across the map.
 
 ### What the map answers
 
-- **Colour is the mean share deforested** across the cells in view, or across a division
-  once boundaries are on.
-- **Draw a box** with the ▢ button and the join becomes a number: every division inside
-  it, ranked by mean share deforested. It reads one H3 resolution finer than the screen,
-  sizes that resolution from the box rather than the current zoom, and falls back county
-  to region to country, because Overture has counties for only 171 of 219 countries.
+- **Colour is the share of ground deforested**, per pixel on the raster paint, and per
+  division once boundaries are on.
+- **Press "rank what's in view"** in the controls and the join becomes a number: every
+  division on screen, ranked by mean share deforested. It reads one H3 resolution finer
+  than the screen, sizes that resolution from the view rather than the current zoom, and
+  falls back county to region to country, because Overture has counties for only 171 of
+  219 countries. The camera is the only statement of intent; it replaced lonboard's
+  draw-box tool, which asked you to describe a region twice.
 - **The camera answers from memory first.** `view_state` fires on every frame of a drag,
   and any frame servable from what is already folded (a pan inside the current box, a zoom
   back to a resolution already visited) is answered synchronously in the comm handler. Only
@@ -179,7 +186,9 @@ measured rather than guessed: a flat neutral grey lands at luminance 0.313 and t
 stop of full-range cividis lands at 0.318, so "none" and "0.1%" came out as the same
 colour, which is the worst thing this legend could do given zero is the majority case.
 Hue cannot fix it, because the point of cividis is that hue carries nothing. So the ramp
-floor is lifted to the upper 75% of cividis and zero takes the dark end alone.
+floor is lifted to the upper 75% of cividis and zero takes the dark end alone. On the
+raster paint zero is simply transparent; the zero swatch survives in the division fill
+and the legend.
 
 | stop | RGB | luminance | deuteranope luminance |
 |---|---|---:|---:|
@@ -208,127 +217,36 @@ A ~30x to ~70x split in the right direction and roughly the right magnitude. If 
 were smearing neighbours together or dropping the area weighting, that contrast would
 collapse.
 
-## The second notebook: which structures are on dangerous ground
+## The terrain explorer (experimental, use caution)
 
-```bash
-uv run marimo edit xsql-firerisk-buildings.py --sandbox
-```
-
-Same machinery, different pair. The raster is
-[carbonplan/carbonplan-ocr](https://source.coop/carbonplan/carbonplan-ocr) on Source
-Cooperative (CarbonPlan's Open Climate Risk project, CC-BY 4.0), a Zarr v3 multiscale
-pyramid covering CONUS at 30 m. The vector side is Overture **building footprints** rather
-than divisions.
-
-The value is **RPS, Risk to Potential Structures**: burn probability times the conditional
-risk to a structure, were one there. That name is the reason for the join. RPS is computed
-without knowing whether anything is actually built, so joining it to real footprints turns
-"this ground is dangerous" into "this structure is on dangerous ground".
-
-Nothing in the docs says what `rps` means, so it was settled from the sibling Icechunk
-store, which publishes the factors separately: `corr(rps_2011, bp_2011 * crps_scott)` is
-1.000000 over 160k pixels, the USFS Wildfire Risk to Communities formula exactly.
-
-**Zarr turns out to be the easier side of the trade.** Three things the COG notebook builds
-by hand come free: the pyramid declares `"resampling_method": "mean"` in its metadata
-instead of having to be measured; absent chunks read as fill because that is in the spec,
-so the sparse-tile crash has no equivalent; and the coordinates are published arrays, so
-there is no geotransform to derive. obstore stays the transport either way.
-
-**Buildings have a minimum zoom, and the tiles are always z14.** Overture's tileset carries
-footprint geometry from z4, but Planetiler strips the *attributes* off everything below its
-top zoom:
-
-| | z13 features | `id` present | z14 features | `id` present |
-|---|---:|---:|---:|---:|
-| Paradise CA | 1,109 | **0** | 618 | 618 |
-| Downtown LA | 4,162 | **0** | 1,875 | 1,875 |
-
-`id` is both the dissolve key and the join key, so a z13 fetch returns thousands of
-anonymous polygons and nothing errors: the decode succeeds, the winding is right, the count
-is right, and every feature is unusable.
-
-**The polyfill runs in `overlap` mode, where the divisions notebook uses `center`,** and
-that inverts for a good reason. A division holds thousands of cells, so `center` assigns
-each cell to exactly one division and the map partitions. A building is 150-250 m² against
-a 2,150 m² cell: it contains no cell centre at all, and `center` returns nothing for it.
-Buildings are disjoint islands rather than a partition, so the double-counting objection
-that ruled `overlap` out for counties doesn't apply.
-
-Which leaves the honest limit, and the notebook says it on screen: a house is 10% of a
-res-11 cell, so its number is the cell's number. The 30 m raster does not resolve a house;
-it resolves the hillside it stands on.
-
-**Is it right?** A building's joined RPS against the raster value at its own centroid, read
-straight out of the Zarr window: `corr = 0.9803`, median ratio `1.002` over 3,735 buildings.
-That is the check that catches a mis-indexed read or a resolution mismatch, neither of which
-changes a single row count.
-
-`docs/firerisk-buildings-notes.md` has the rest, including why res 11 is the floor and what
-the Icechunk store would buy.
-
-## The third notebook: how hard people press on the ground
-
-```bash
-uv run marimo edit xsql-hfp-divisions.py --sandbox
-```
-
-The deforestation notebook's machinery pointed at Vizzuality's
-[Global 100 m Terrestrial Human Footprint](https://source.coop/vizzuality/hfp-100)
-(HFP-100 v1.2, CC-BY 4.0, same Source Cooperative account). The value is the **human
-footprint index**, 0-50: the summed pressure of built land, cropland, pasture,
-population, night lights, roads, railways and navigable rivers on each hectare. Years
-2017-2021 are published; `YEAR` in the constants cell is the seam a year slider would
-use. The diff against the deforestation notebook is the raster side only:
-
-- **The COG is World Mollweide, not EPSG:4326**, so the "no reprojection" simplification
-  is gone. Both directions are closed-form spherical formulas in the fold cell: forward
-  (viewport box to pixel window) is a Newton solve on the parametric angle, inverse
-  (pixel centres to lat/lng for the fold) is three arcsins. No pyproj.
-- **Zero cells are kept and sit inside the ramp**: 36.7% of land scores exactly 0 and
-  that is untouched ground, the bottom of a continuum, not dropped ocean. Ocean is NaN
-  here, so zero and no-data are distinguishable, which the deforestation COG never
-  offered.
-- **The zoom ladder is one step finer** (res 5-9, with res 9 reading the full-resolution
-  level), and the viewport size is **measured, not assumed**: a widget rulers the deck
-  canvas with a ResizeObserver and syncs it to the kernel, which is what keeps fullscreen
-  from folding a laptop-sized band across a cinema-sized screen.
-
-## The fourth notebook: the fold alone, once
-
-```bash
-uv run marimo edit xsql-hfp-conus.py --sandbox
-```
-
-`xsql-hfp-conus.py` is the HFP fold with everything interactive cut away: no camera, no
-divisions, no widgets, no cache. One bounding box, one read of one overview level, one
-fold to res 7, one static lonboard map. It exists for screenshots and as the smallest
-runnable statement of the fold.
-
-**A caution before widening the box.** `BOX` is the only knob and it scales hard. The
-default lower-48 box is a ~120M pixel window: about 2 GB of RAM through the fold, 1.85M
-cells, under 10 seconds on a fast connection. The commented North-America box next to it
-(Aleutians to Greenland) is ~760M pixels: it works, measured at 4.88M cells in 21.5
-seconds, but it peaks around 15-20 GB of RAM and hands lonboard a table 2.5x larger than
-anything else in this repo draws. Treat that one as a poster run for a big machine, not
-a default, and expect the browser to take its time on first paint.
+`xsql-mapterhorn-explorer.py` draws [Mapterhorn](https://mapterhorn.com/) terrain
+worldwide as extruded H3 columns: elevation folded per viewport from PMTiles DEM
+archives, with a colormap panel, an elevation scale, and a resolution-offset override.
+It shares this repo's chassis (the camera machinery, the canvas ruler, the PMTiles
+client) but it is an experiment with open defects: the res-to-zoom ladder is still
+being tuned, the deepest zoom levels are probed but unflown, and a raised res offset
+can make a single view refold millions of cells. Treat it as a demo to poke at, not a
+tool to lean on.
 
 ## Everything else
 
-`archive/` holds what was built on the way to these and is kept for reference, not maintained:
-the Annual NLCD zoom notebooks and their DataFusion-vs-DuckDB benchmark, the NLCD boundary
-over satellite imagery, the parked NLCD x terrain extrusion, and the NAIP, 3DEP and
-Overture GeoParquet helpers. None of the maintained notebooks imports any of it; their
-only dependencies are the third-party ones in their PEP 723 headers.
+`archive/` holds what was built on the way here and is kept for reference, not
+maintained: the fire-risk buildings notebook (CarbonPlan wildfire risk joined to
+Overture footprints), the human-footprint pair, the flood-exposure experiment, the
+canopy-height notebook, the Annual NLCD zoom notebooks and their DataFusion-vs-DuckDB
+benchmark, the NLCD boundary over satellite imagery, the parked NLCD x terrain
+extrusion, and the NAIP, 3DEP and Overture GeoParquet helpers. None of the maintained
+notebooks imports any of it; their only dependencies are the third-party ones in their
+PEP 723 headers.
 
 They still run. `archive/pyproject.toml` is the union of every archived notebook's header,
 pinned, so the root project can stay in sync with the notebooks that are maintained:
 
 ```bash
-uv run --project archive marimo edit archive/xsql-nlcd-imagery.py
+uv run --project archive marimo edit archive/xsql-firerisk-buildings.py
 # or, self-contained from the notebook's own PEP 723 header
-uv run marimo edit archive/xsql-nlcd-imagery.py --sandbox
+uv run marimo edit archive/xsql-firerisk-buildings.py --sandbox
 ```
 
 `docs/` has the full working record for each of them, including the measurements quoted
-above. `docs/deforest-divisions-notes.md` is the one for this notebook.
+above. `docs/deforest-divisions-notes.md` is the one for the deforestation notebook.
