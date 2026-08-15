@@ -131,11 +131,9 @@ def _():
 
 @app.cell(hide_code=True)
 def _(mo):
-    mo.md(
-        r"""
+    mo.md(r"""
     [![Open in molab](https://molab.marimo.io/molab-shield.svg)](https://molab.marimo.io/github/github.com/kentstephen/x-sql-marimo/blob/main/xsql-hrrr-counties.py)
-    """
-    )
+    """)
     return
 
 
@@ -1119,8 +1117,6 @@ async def _(
     return counties, county_stats
 
 
-
-
 @app.cell
 def _(
     ANALYSIS_BUCKET,
@@ -1176,11 +1172,30 @@ def _(
         f"{source_note} · grid {lat.shape[1]}x{lat.shape[0]} px · hourly {np.datetime_as_string(all_times[0])} "
         f"to {np.datetime_as_string(all_times[-1])} UTC ({all_times.size:,} steps) · open {_stime.perf_counter() - _st0:.1f}s"
     )
-    return all_times, cube_all, grid_x, grid_y, lat, lon, source_note, store_stats
+    return (
+        all_times,
+        cube_all,
+        grid_x,
+        grid_y,
+        lat,
+        lon,
+        source_note,
+        store_stats,
+    )
 
 
 @app.cell
-def _(DAILY_MAX_DAYS, DAYS, HOURLY_MAX_DAYS, SOURCE, all_times, film, json, mo, np):
+def _(
+    DAILY_MAX_DAYS,
+    DAYS,
+    HOURLY_MAX_DAYS,
+    SOURCE,
+    all_times,
+    film,
+    json,
+    mo,
+    np,
+):
     # THE WINDOW, resolved: the HUD's `window` trait once "load" has been pressed
     # (marimo re-runs this cell when the browser sets it), the last DAYS days before
     # that. Over the limit stops here with the reason instead of clamping silently
@@ -1239,7 +1254,18 @@ def _(DAILY_MAX_DAYS, DAYS, HOURLY_MAX_DAYS, SOURCE, all_times, film, json, mo, 
 
 
 @app.cell
-def _(RES, con, coordinates_to_cells, counties, grid_x, grid_y, lat, lon, np, pa):
+def _(
+    RES,
+    con,
+    coordinates_to_cells,
+    counties,
+    grid_x,
+    grid_y,
+    lat,
+    lon,
+    np,
+    pa,
+):
     # PIXEL -> CELL -> COUNTY, ONCE. The grid never moves, so this static lookup is what
     # every frame joins against. Cell per pixel from the store's own lat/lon (h3ronpy,
     # sub-second for 1.9M points); county cells by DuckDB polyfill, 'center' rule, so
@@ -1383,7 +1409,15 @@ def _(PIVOT, SPAN, con, counties, county_hour, np, slice_mode):
         f"{frames.shape[0]} frames x {frames.shape[1]} counties ({slice_mode.replace('_', ' ')}) · "
         f"ramp {ramp_lo:.1f} / {ramp_mid:.1f} / {ramp_hi:.1f}"
     )
-    return frame_kind, frame_labels, frame_stats, frames, ramp_hi, ramp_lo, ramp_mid
+    return (
+        frame_kind,
+        frame_labels,
+        frame_stats,
+        frames,
+        ramp_hi,
+        ramp_lo,
+        ramp_mid,
+    )
 
 
 @app.cell
