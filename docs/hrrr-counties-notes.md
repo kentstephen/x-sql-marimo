@@ -183,3 +183,58 @@ for k in sorted(mods):
 - Also seen on that flight, cause not yet isolated: marimo's `Error: Model not found
   for key: <id>` in the console. Likely the widget model dying with the import error;
   if it persists after the pin fix it is a separate defect.
+
+## Second build pass (2026-08-15, evening)
+
+Stephen's asks after the first flight (map rendered, film played, esm.sh pin fixed):
+more map controls, live stats, custom date range with limits, click did nothing,
+fullscreen for the map (deck's element, not marimo's), and then "the dashboard
+should all be on the map with a way to hide, this all full screen".
+
+- HUD overlays inside the deck element (title, legend + buttons, transport, left
+  drawer with stats / series / warmest-coolest / settings), ⊟/H hides, ⛶/F is
+  `mapEl.requestFullscreen()`. Deck polls canvas size each frame, so fullscreen
+  needs no resize handler; the inline 620 px height is overridden by
+  `.map:fullscreen { height: 100vh !important }`.
+- Stats are per-frame in JS from the Float32 matrix: sort the frame's finite values
+  once (cached per frame index) for median, p10/p90, warmest/coolest 8, share over
+  the pivot; county mean per frame precomputed once per film for the chart's
+  no-selection envelope. hyparquet/hightable were considered and not used: the
+  matrix is already a typed array in the page and hightable is a React component.
+- Explicit picking on pointerup (`deck.pickObject`, 4 px drag threshold, prefix
+  layerIds) replaces deck's `onClick`, which did not fire on the first flight.
+- Window form: `mo.ui.date_range` + mode dropdown in a `.batch().form()`, so
+  nothing refetches until "load window". Limits hourly 14 days / daily 92 days
+  (`mo.stop` with the reason). Fold memoised on the window in `HOLD`.
+- Forecast source: lead offsets are rewritten to valid times on `t`, so labels read
+  as clock time and the same frames cell serves both sources.
+- Headless: 159 h (7 UTC days to the newest hour) in 19.0 s, 494,013 rows.
+
+## Third pass: minimal (2026-08-15, night)
+
+The fuller HUD flew: map and film fine, but the top-right buttons (hide / home /
+fullscreen) "freeze the notebook and exit fullscreen", the hide button was not on the
+panel it hides, and the drawer was "dizzying". Stephen: "want minimal".
+
+What was cut: the drawer (stats tiles, warmest/coolest lists, settings), the home
+button, opacity/lines/labels/loop toggles, the `clicked` trait. What stays: one panel
+(title, legend, county mean, clicked county's line, hide toggle ON the panel), the
+transport bar (with fps and fullscreen).
+
+Diagnosis of the freeze, best guess: button presses also reached the pointerup pick
+handler, selected the county under the button, and `model.set("clicked")` +
+`save_changes()` went to the kernel; marimo re-runs cells that reference a displayed
+widget whose value changed, and that pulled the fullscreen element out of the DOM
+and rebuilt deck. Two fixes regardless of whether that is the whole story: no trait
+ever crosses back from the widget, and a press that starts on the HUD is not a pick.
+Also fixed: the hide toggle's selector (`.cf .hidden` matched nothing; `.cf.hidden`).
+Data volume is not a suspect: the whole film is 2 MB.
+
+**Found it (same night):** the freeze on "hide" was the class name. The toggle put a
+class literally called `hidden` on the widget root; marimo's page CSS is Tailwind,
+which defines `.hidden { display: none }`, and the widget is not isolated from page
+styles, so the whole widget went `display: none`: map gone, fullscreen element gone
+(the browser exits fullscreen), notebook "frozen". Both flights that froze had that
+class. The `Model not found for key` console line is present from page load and is
+unrelated. Fix: every widget class is now `cf-` prefixed and the states are
+`cf-collapsed` / `cf-picked`.

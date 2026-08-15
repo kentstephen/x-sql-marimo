@@ -28,8 +28,11 @@ county per hour for the last DAYS days. That table is small (3,108 counties x ho
 so the WHOLE FILM is shipped to the browser once and the browser owns the clock: a
 bespoke anywidget with deck.gl + @geoarrow/deck.gl-layers (the same layers lonboard
 renders with) draws the counties from one GeoArrow IPC table and recolours them per
-frame from a Float32Array, with play/pause, a scrub slider, fps, a hover readout and a
-click-to-series chart, all client side. The kernel is idle while it plays.
+frame from a Float32Array. The HUD is minimal and ON THE MAP (one hideable panel:
+title, legend, county mean, a clicked county's line; one transport bar), so the deck
+element's own browser fullscreen carries it. Nothing crosses back to the kernel while
+it plays; a submit form above the map (UTC date range + hourly / daily mean / daily
+max, with per-mode limits) is the only thing that reaches back for data.
 
 RES 7 IS FINER THAN THE DATA. A res 7 hex averages 5.16 km2 and an HRRR pixel is 9 km2,
 so the "fold" is a relabel (measured: 1,905,141 cells for 1,905,141 pixels, 1.00 px
@@ -119,7 +122,12 @@ def _():
     SOURCE = "analysis"
     VAR = "temperature_2m"  # degC in the store; any (time, y, x) variable works
     UNITS = "°C"
-    DAYS = 7  # analysis window: the last DAYS days ending at the newest hour
+    DAYS = 7  # opening window: the last DAYS days ending at the newest hour
+    # Window form limits per frame mode. Hourly frames are the film; 14 days is 336
+    # frames. Daily modes roll hourly up in DuckDB, so their limit is the READ: a
+    # 90-day window is one full store chunk deep (2,160 h, measured 149 s).
+    HOURLY_MAX_DAYS = 14
+    DAILY_MAX_DAYS = 92
 
     ANALYSIS_BUCKET = "dynamical-noaa-hrrr"
     ANALYSIS_PREFIX = "noaa-hrrr-analysis/v0.2.0.icechunk"
@@ -157,10 +165,12 @@ def _():
         ANALYSIS_PREFIX,
         BOX,
         COUNTY_Z,
+        DAILY_MAX_DAYS,
         DAYS,
         FORECAST_BUCKET,
         FORECAST_PREFIX,
         FPS,
+        HOURLY_MAX_DAYS,
         MAP_HEIGHT,
         NOT_CONUS,
         PIVOT,
@@ -188,15 +198,29 @@ def _(duckdb):
 @app.cell
 def _(anywidget, traitlets):
     class CountyFilm(anywidget.AnyWidget):
-        """deck.gl + @geoarrow/deck.gl-layers, browser-side clock.
+        """deck.gl + @geoarrow/deck.gl-layers, browser-side clock, minimal HUD.
 
-        Kernel -> browser: `counties` (one GeoArrow IPC stream: geometry, name, state,
-        with interleaved coords, the layout the JS layers want), `frames` (Float32Array
+        Kernel -> browser only: `counties` (one GeoArrow IPC stream: geometry, name,
+        state, interleaved coords, the layout the JS layers want), `frames` (Float32Array
         of F x N values, frame-major, NaN = no data) and `config` (JSON: labels, ramp
-        bounds, fps, units, height). Browser -> kernel: `clicked` (the row index of the
-        last county clicked, as a string; Unicode is the proven trait type across
-        marimo's bridge). Bytes traits kernel -> browser are how lonboard ships its
-        tables, so that direction is proven too.
+        bounds, stops, fps, units, height, title). NOTHING crosses back: the first HUD
+        synced the clicked county to a trait and marimo answered a widget value change
+        by re-running the cells that reference the widget, which pulled the fullscreen
+        element out of the DOM and rebuilt deck (Stephen: buttons "freeze the notebook
+        and exit fullscreen"). Bytes traits kernel -> browser are how lonboard ships
+        its tables, so that direction is proven.
+
+        The HUD is inside the map element so the ELEMENT's own browser fullscreen (⛶
+        or F, `mapEl.requestFullscreen()`, not marimo's) carries it: one panel top-left
+        (title, legend, county mean for the frame, and a clicked county's line only
+        after a click) with its own hide toggle, and the transport across the bottom
+        (step / play / step, slider with UTC-day ticks, timestamp, fps, fullscreen).
+        Space plays, arrows step, H hides. Deck polls its canvas size every frame, so
+        the fullscreen resize needs no handler.
+
+        Clicks are picked EXPLICITLY on pointerup with `deck.pickObject` (a press that
+        starts on the HUD or moves more than 4 px is not a click) rather than through
+        deck's onClick, which did nothing on the first flight inside marimo's shadow DOM.
 
         Every esm.sh import pins its `?deps` so that all of them resolve to ONE
         @deck.gl/core module (esm.sh hashes the variant by the deps list; two cores
@@ -204,7 +228,7 @@ def _(anywidget, traitlets):
         package is pinned to the same version, the newest, because esm.sh resolves the
         packages' own caret ranges (geo-layers -> mesh-layers@^9.1.0) to the newest
         release: pinned at 9.1.14 the first flight died on mesh-layers 9.3 asking core
-        9.1 for `phongMaterial`. The whole module graph was crawled (203 modules) and
+        9.1 for `phongMaterial`. The whole module graph was crawled (200 modules) and
         holds exactly one core, one luma set, one geo-layers; re-crawl if any version
         moves (docs/hrrr-counties-notes.md has the crawler).
         """
@@ -217,25 +241,46 @@ def _(anywidget, traitlets):
         import * as arrow from "https://esm.sh/apache-arrow@18.1.0";
 
         const CSS = `
-          .cf { font: 12px/1.35 system-ui, sans-serif; color: #d6d9de; background: #0f1216; }
-          .cf .map { position: relative; width: 100%; }
-          .cf .bar { display: flex; align-items: center; gap: .6rem; padding: .45rem .6rem; flex-wrap: wrap; }
-          .cf button { background: #262b33; color: #e6e8eb; border: 1px solid #3a404a; padding: .25rem .7rem; cursor: pointer; font: inherit; }
-          .cf button:hover { background: #313741; }
-          .cf input[type=range] { flex: 1 1 14rem; min-width: 10rem; }
-          .cf select { background: #262b33; color: #e6e8eb; border: 1px solid #3a404a; font: inherit; }
-          .cf .lbl { min-width: 12rem; font-variant-numeric: tabular-nums; }
-          .cf .dim { color: #8b929c; }
-          .cf .legend { display: flex; align-items: center; gap: .5rem; padding: 0 .6rem .4rem; }
-          .cf .grad { height: .7rem; flex: 0 0 14rem; border: 1px solid #3a404a; }
-          .cf .chart { display: block; width: 100%; height: 130px; background: #12161b; border-top: 1px solid #262b33; }
-          .cf .info { padding: .25rem .6rem .5rem; min-height: 1.2em; font-variant-numeric: tabular-nums; }
+          .cf { --panel:rgba(15,18,22,.84); --ink:#dfe3e8; --dim:#8b929c; --accent:#e6c14a;
+                font: 12px/1.35 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--ink); background: #0f1216; }
+          .cf * { box-sizing: border-box; }
+          .cf .cf-num { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+          .cf .cf-map { position: relative; width: 100%; background: #0b0d10; overflow: hidden; }
+          .cf .cf-map:fullscreen { height: 100vh !important; width: 100vw; }
+          .cf .cf-hud { position: absolute; z-index: 5; }
+          .cf .cf-hud.cf-tl { top: .6rem; left: .6rem; width: 21rem; max-width: calc(100% - 1.2rem); }
+          .cf .cf-hud.cf-bl { left: .6rem; right: .6rem; bottom: .6rem; }
+          .cf .cf-card { background: var(--panel); border: 1px solid rgba(255,255,255,.08); backdrop-filter: blur(6px); padding: .5rem .65rem; }
+          .cf .cf-panel .cf-head { display: flex; align-items: baseline; justify-content: space-between; gap: .5rem; }
+          .cf .cf-panel .cf-ttl { font-weight: 600; }
+          .cf .cf-panel .cf-sub { color: var(--dim); display: block; margin-top: .1rem; }
+          .cf .cf-legend { display: flex; align-items: center; gap: .45rem; margin-top: .5rem; }
+          .cf .cf-grad { height: .55rem; flex: 1; border: 1px solid rgba(255,255,255,.12); }
+          .cf .cf-row { display: flex; justify-content: space-between; align-items: baseline; gap: .6rem; margin-top: .45rem; }
+          .cf .cf-row .cf-v { font-size: 16px; }
+          .cf .cf-row .cf-k { color: var(--dim); }
+          .cf .cf-county { margin-top: .4rem; display: none; }
+          .cf.cf-picked .cf-county { display: block; }
+          .cf .cf-chart { display: block; width: 100%; height: 96px; margin-top: .3rem; cursor: crosshair; }
+          .cf.cf-collapsed .cf-body { display: none; }
+          .cf .cf-toggle, .cf .cf-clear { background: none; border: 0; color: var(--dim); cursor: pointer; font: inherit; padding: 0 .1rem; }
+          .cf .cf-toggle:hover, .cf .cf-clear:hover { color: var(--ink); }
+          .cf .cf-transport { display: flex; align-items: center; gap: .55rem; }
+          .cf .cf-stamp { font-size: 15px; min-width: 11.5rem; }
+          .cf .cf-stamp small { display: block; font-size: 10px; color: var(--dim); letter-spacing: .04em; text-transform: uppercase; }
+          .cf .cf-track { flex: 1 1 10rem; position: relative; padding-top: 6px; }
+          .cf .cf-ticks { position: absolute; left: 0; right: 0; top: 0; height: 6px; }
+          .cf .cf-ticks i { position: absolute; top: 0; width: 1px; height: 6px; background: var(--dim); }
+          .cf input[type=range] { width: 100%; margin: 0; accent-color: var(--accent); }
+          .cf button.cf-b, .cf select { background: #22282f; color: var(--ink); border: 1px solid #343b45; padding: .22rem .5rem; cursor: pointer; font: inherit; line-height: 1.2; min-width: 2rem; }
+          .cf button.cf-b:hover, .cf select:hover { background: #2b323b; }
+          .cf button:focus-visible, .cf select:focus-visible, .cf input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+          .cf .cf-dim { color: var(--dim); }
+          .cf .cf-ruler { position: absolute; right: .6rem; top: .6rem; color: var(--dim); z-index: 5; }
+          @media (max-width: 720px) { .cf .cf-stamp { min-width: 0; } .cf .cf-hud.cf-tl { width: calc(100% - 1.2rem); } }
         `;
 
-        function hexToRgb(h) {
-          const n = parseInt(h.slice(1), 16);
-          return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
-        }
+        function hexToRgb(h) { const n = parseInt(h.slice(1), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; }
         function buildLut(stops) {
           const rgb = stops.map(hexToRgb), lut = new Uint8Array(256 * 3);
           for (let i = 0; i < 256; i++) {
@@ -251,36 +296,56 @@ def _(anywidget, traitlets):
           if (v.buffer) return new Uint8Array(v.buffer, v.byteOffset ?? 0, v.byteLength);
           return null;
         }
+        const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
         function render({model, el}) {
           el.innerHTML = "";
           const root = document.createElement("div"); root.className = "cf";
-          const style = document.createElement("style"); style.textContent = CSS;
-          root.appendChild(style);
-          root.innerHTML += `
-            <div class="map"></div>
-            <div class="bar">
-              <button class="play">play</button>
-              <input class="frame" type="range" min="0" max="0" value="0" step="1">
-              <span class="lbl"></span>
-              <span class="dim">fps</span>
-              <select class="fps"><option>2</option><option>4</option><option>6</option><option>8</option><option>12</option><option>24</option></select>
-              <span class="dim ruler"></span>
-            </div>
-            <div class="legend"><span class="lo"></span><div class="grad"></div><span class="hi"></span><span class="dim mid"></span></div>
-            <canvas class="chart" height="130"></canvas>
-            <div class="info dim">click a county for its series · hover for the number</div>`;
+          root.innerHTML = `<style>${CSS}</style>
+            <div class="cf-map">
+              <div class="cf-hud cf-tl"><div class="cf-card cf-panel">
+                <div class="cf-head"><span><span class="cf-ttl"></span><span class="cf-sub"></span></span><button class="cf-toggle" title="hide / show (H)">hide</button></div>
+                <div class="cf-body">
+                  <div class="cf-legend"><span class="cf-num cf-lo"></span><div class="cf-grad"></div><span class="cf-num cf-hi"></span></div>
+                  <div class="cf-row"><span class="cf-k">county mean</span><span class="cf-num cf-v cf-mean">–</span></div>
+                  <div class="cf-county">
+                    <div class="cf-row"><span class="cf-k cf-cname">–</span><span><span class="cf-num cf-v cf-cval">–</span> <button class="cf-clear" title="clear">×</button></span></div>
+                    <canvas class="cf-chart" height="96"></canvas>
+                  </div>
+                  <div class="cf-dim cf-hint">click a county for its line · space plays · ← → step</div>
+                </div>
+              </div></div>
+              <span class="cf-ruler cf-num"></span>
+              <div class="cf-hud cf-bl"><div class="cf-card cf-transport">
+                <button class="cf-b cf-prev" title="step back (←)">‹</button>
+                <button class="cf-b cf-play" title="play / pause (space)">▶</button>
+                <button class="cf-b cf-next" title="step forward (→)">›</button>
+                <div class="cf-track"><div class="cf-ticks"></div><input class="cf-frame" type="range" min="0" max="0" value="0" step="1" aria-label="frame"></div>
+                <div class="cf-stamp cf-num"><small class="cf-stampk">frame</small><span class="cf-stampv">–</span></div>
+                <select class="cf-fps" title="frames per second"><option>2</option><option>4</option><option>6</option><option>8</option><option>12</option><option>24</option></select>
+                <button class="cf-b cf-full" title="fullscreen (F)">⛶</button>
+              </div></div>
+            </div>`;
           el.appendChild(root);
           const q = s => root.querySelector(s);
-          const mapEl = q(".map"), playBtn = q(".play"), slider = q(".frame"), lbl = q(".lbl"),
-                fpsSel = q(".fps"), grad = q(".grad"), loEl = q(".lo"), hiEl = q(".hi"), midEl = q(".mid"),
-                chart = q(".chart"), infoEl = q(".info"), ruler = q(".ruler");
+          const mapEl = q(".cf-map"), playBtn = q(".cf-play"), slider = q(".cf-frame"), ticks = q(".cf-ticks"),
+                stampV = q(".cf-stampv"), stampK = q(".cf-stampk"), fpsSel = q(".cf-fps"), grad = q(".cf-grad"),
+                loEl = q(".cf-lo"), hiEl = q(".cf-hi"), chart = q(".cf-chart"), ruler = q(".cf-ruler"),
+                ttl = q(".cf-ttl"), sub = q(".cf-sub"), meanEl = q(".cf-mean"), cname = q(".cf-cname"), cval = q(".cf-cval");
 
           let table = null, N = 0, F = 0, frames = null, colors = null, names = [], states = [];
           let cfg = {}, frame = 0, playing = false, timer = null, deck = null, selected = -1, lut = null;
+          let order = null;  // per-frame cache: sorted indices for the current frame
+          let orderFrame = -1;
+          let means = null;  // county mean per frame, computed once per film
+          const HOME = {longitude: -96.5, latitude: 38.3, zoom: 3.8, minZoom: 2, maxZoom: 11};
 
           const fmt = v => Number.isFinite(v) ? v.toFixed(1) + (cfg.units || "") : "no data";
           const val = (f, i) => frames ? frames[f * N + i] : NaN;
+          const rgbAt = v => {
+            let t = (v - cfg.lo) / (cfg.hi - cfg.lo); t = t < 0 ? 0 : t > 1 ? 1 : t;
+            const i = Math.round(t * 255) * 3; return `rgb(${lut[i]},${lut[i+1]},${lut[i+2]})`;
+          };
 
           function loadTable() {
             const u8 = bytesOf(model.get("counties"));
@@ -290,41 +355,55 @@ def _(anywidget, traitlets):
             names = table.getChild("name").toArray();
             states = table.getChild("state").toArray();
           }
+          function recolor() {
+            if (!frames) return;
+            const a = 235;
+            colors = colors && colors.length === F * N * 4 ? colors : new Uint8Array(F * N * 4);
+            const lo = cfg.lo, hi = cfg.hi;
+            for (let k = 0; k < F * N; k++) {
+              const v = frames[k], o = k * 4;
+              if (!Number.isFinite(v)) { colors[o] = 40; colors[o + 1] = 44; colors[o + 2] = 50; colors[o + 3] = 70; continue; }
+              let t = (v - lo) / (hi - lo); t = t < 0 ? 0 : t > 1 ? 1 : t;
+              const i = Math.round(t * 255) * 3;
+              colors[o] = lut[i]; colors[o + 1] = lut[i + 1]; colors[o + 2] = lut[i + 2]; colors[o + 3] = a;
+            }
+          }
           function loadFrames() {
             try { cfg = JSON.parse(model.get("config") || "{}"); } catch (e) { cfg = {}; }
-            mapEl.style.height = (cfg.height || 620) + "px";
+            if (!document.fullscreenElement) mapEl.style.height = (cfg.height || 620) + "px";
             lut = buildLut(cfg.stops || ["#08306b", "#f2f0e6", "#d94801"]);
             const u8 = bytesOf(model.get("frames"));
             if (!u8 || !u8.length || !N) { frames = null; F = 0; return; }
             // copy: the DataView's buffer offset is not guaranteed 4-byte aligned
             frames = new Float32Array(u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength));
             F = Math.floor(frames.length / N);
-            const lo = cfg.lo, hi = cfg.hi, a = (cfg.alpha ?? 235) | 0;
-            colors = new Uint8Array(F * N * 4);
-            for (let k = 0; k < F * N; k++) {
-              const v = frames[k], o = k * 4;
-              if (!Number.isFinite(v)) { colors[o] = 40; colors[o + 1] = 44; colors[o + 2] = 50; colors[o + 3] = 60; continue; }
-              let t = (v - lo) / (hi - lo); t = t < 0 ? 0 : t > 1 ? 1 : t;
-              const i = Math.round(t * 255) * 3;
-              colors[o] = lut[i]; colors[o + 1] = lut[i + 1]; colors[o + 2] = lut[i + 2]; colors[o + 3] = a;
-            }
+            recolor();
+            means = new Float32Array(F);
+            for (let f = 0; f < F; f++) { let s = 0, n = 0; for (let i = 0; i < N; i++) { const v = frames[f * N + i]; if (Number.isFinite(v)) { s += v; n++; } } means[f] = n ? s / n : NaN; }
             slider.max = String(Math.max(0, F - 1));
             if (frame >= F) frame = 0;
+            orderFrame = -1;
             fpsSel.value = String(cfg.fps || 8);
             const stops = [];
             for (let i = 0; i <= 8; i++) { const j = Math.round(i / 8 * 255) * 3; stops.push(`rgb(${lut[j]},${lut[j+1]},${lut[j+2]}) ${i/8*100}%`); }
             grad.style.background = `linear-gradient(90deg, ${stops.join(",")})`;
-            loEl.textContent = fmt(lo); hiEl.textContent = fmt(hi);
-            midEl.textContent = `pivot ${fmt(cfg.mid)} · ${cfg.title || ""}`;
+            loEl.textContent = fmt(cfg.lo); hiEl.textContent = fmt(cfg.hi);
+            ttl.textContent = cfg.title || ""; sub.textContent = cfg.subtitle || "";
+            stampK.textContent = cfg.frame_kind || "frame";
+            // day ticks under the slider: one per label whose date part changes
+            const labels = cfg.labels || [];
+            let html = "";
+            for (let f = 1; f < labels.length; f++) {
+              const d0 = labels[f - 1].slice(0, 10), d1 = labels[f].slice(0, 10);
+              if (d0 !== d1) html += `<i class="cf-day" style="left:${(f / (F - 1) * 100).toFixed(2)}%"></i>`;
+            }
+            ticks.innerHTML = F > 1 && labels.length > 30 ? html : "";  // hourly films only; a daily film's frames ARE the days
           }
 
           function colorVector(f) {
             const sub = colors.subarray(f * N * 4, (f + 1) * N * 4);
             const child = arrow.makeData({type: new arrow.Uint8(), data: sub});
-            const data = arrow.makeData({
-              type: new arrow.FixedSizeList(4, new arrow.Field("c", new arrow.Uint8(), false)),
-              length: N, nullCount: 0, child,
-            });
+            const data = arrow.makeData({type: new arrow.FixedSizeList(4, new arrow.Field("c", new arrow.Uint8(), false)), length: N, nullCount: 0, child});
             return arrow.makeVector(data);
           }
           const tiles = (id, url, opacity) => new TileLayer({
@@ -348,77 +427,126 @@ def _(anywidget, traitlets):
                 _validate: false,
               }));
             }
-            out.push(tiles("labels", "https://basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}.png", 0.55));
+            out.push(tiles("labels", "https://basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}.png", 0.6));
             return out;
           }
+
+          function stats() {
+            meanEl.textContent = means && F ? fmt(means[frame]) : "–";
+            if (selected >= 0) cval.textContent = fmt(val(frame, selected));
+          }
+
           function drawChart() {
-            const w = chart.clientWidth || 800, h = chart.height;
+            if (selected < 0 || !frames || F < 2) return;
+            const w = chart.clientWidth || 300, h = chart.height;
             if (chart.width !== w) chart.width = w;
             const g = chart.getContext("2d");
-            g.fillStyle = "#12161b"; g.fillRect(0, 0, w, h);
-            if (selected < 0 || !frames || F < 2) return;
-            const L = 46, R = 8, T = 10, B = 18;
+            g.clearRect(0, 0, w, h);
+            const L = 40, R = 4, T = 6, B = 14;
+            const X = f => L + (w - L - R) * f / (F - 1);
             let lo = Infinity, hi = -Infinity;
             for (let f = 0; f < F; f++) { const v = val(f, selected); if (Number.isFinite(v)) { lo = Math.min(lo, v); hi = Math.max(hi, v); } }
             if (!Number.isFinite(lo)) return;
             if (hi - lo < 1) { hi += .5; lo -= .5; }
-            const X = f => L + (w - L - R) * f / (F - 1), Y = v => T + (h - T - B) * (1 - (v - lo) / (hi - lo));
-            g.strokeStyle = "#2c323b"; g.lineWidth = 1;
-            g.beginPath(); g.moveTo(L, Y(lo)); g.lineTo(w - R, Y(lo)); g.moveTo(L, Y(hi)); g.lineTo(w - R, Y(hi)); g.stroke();
-            g.fillStyle = "#8b929c"; g.font = "11px system-ui, sans-serif"; g.textAlign = "right";
-            g.fillText(fmt(hi), L - 4, Y(hi) + 4); g.fillText(fmt(lo), L - 4, Y(lo) + 4);
-            g.textAlign = "left"; g.fillText(cfg.labels?.[0] || "", L, h - 4);
-            g.textAlign = "right"; g.fillText(cfg.labels?.[F - 1] || "", w - R, h - 4);
+            const Y = v => T + (h - T - B) * (1 - (v - lo) / (hi - lo));
+            axes(g, w, h, L, R, T, B, lo, hi, Y);
             g.strokeStyle = "#e6c14a"; g.lineWidth = 1.5; g.beginPath();
             let pen = false;
             for (let f = 0; f < F; f++) { const v = val(f, selected); if (!Number.isFinite(v)) { pen = false; continue; } pen ? g.lineTo(X(f), Y(v)) : g.moveTo(X(f), Y(v)); pen = true; }
             g.stroke();
+            cursor(g, X(frame), T, h - B);
             const cv = val(frame, selected);
-            if (Number.isFinite(cv)) { g.fillStyle = "#ffffff"; g.beginPath(); g.arc(X(frame), Y(cv), 3.5, 0, 6.283); g.fill(); }
-            g.fillStyle = "#d6d9de"; g.textAlign = "left";
-            g.fillText(`${names[selected]}, ${states[selected]}  ${fmt(cv)}`, L + 4, T + 10);
+            if (Number.isFinite(cv)) { g.fillStyle = "#ffffff"; g.beginPath(); g.arc(X(frame), Y(cv), 3, 0, 6.283); g.fill(); }
           }
+          function axes(g, w, h, L, R, T, B, lo, hi, Y) {
+            g.strokeStyle = "#262c35"; g.lineWidth = 1;
+            g.beginPath(); g.moveTo(L, Y(lo)); g.lineTo(w - R, Y(lo)); g.moveTo(L, Y(hi)); g.lineTo(w - R, Y(hi)); g.stroke();
+            g.fillStyle = "#8b929c"; g.font = "11px ui-monospace, Menlo, monospace"; g.textAlign = "right";
+            g.fillText(fmt(hi), L - 4, Y(hi) + 4); g.fillText(fmt(lo), L - 4, Y(lo) + 4);
+            g.font = "10px system-ui, sans-serif"; g.textAlign = "left"; g.fillText((cfg.labels?.[0] || "").slice(0, 10), L, h - 3);
+            g.textAlign = "right"; g.fillText((cfg.labels?.[F - 1] || "").slice(0, 10), w - R, h - 3);
+          }
+          function cursor(g, x, top, bottom) { g.strokeStyle = "rgba(230,193,74,.55)"; g.lineWidth = 1; g.beginPath(); g.moveTo(x, top); g.lineTo(x, bottom); g.stroke(); }
+          chart.addEventListener("click", ev => {
+            if (F < 2) return;
+            const r = chart.getBoundingClientRect(), L = 40, R = 4;
+            const t = ((ev.clientX - r.left) - L) / (r.width - L - R);
+            frame = Math.max(0, Math.min(F - 1, Math.round(t * (F - 1)))); update();
+          });
+
+          function select(i) {
+            if (!(i >= 0 && i < N)) return;
+            selected = i;
+            root.classList.add("cf-picked");
+            cname.textContent = `${names[i]}, ${states[i]}`;
+            stats(); drawChart();
+          }
+          q(".cf-clear").onclick = () => { selected = -1; root.classList.remove("cf-picked"); };
           function update() {
             if (!deck) return;
             deck.setProps({layers: layers()});
             slider.value = String(frame);
-            lbl.textContent = (cfg.labels && cfg.labels[frame]) ? cfg.labels[frame] : `frame ${frame}`;
-            drawChart();
+            stampV.textContent = (cfg.labels && cfg.labels[frame]) ? cfg.labels[frame] : `frame ${frame}`;
+            stats(); drawChart();
           }
           function setPlaying(p) {
-            playing = p; playBtn.textContent = p ? "pause" : "play";
+            playing = p; playBtn.textContent = p ? "❚❚" : "▶";
             if (timer) { clearInterval(timer); timer = null; }
-            if (p && F > 1) timer = setInterval(() => { frame = (frame + 1) % F; update(); }, 1000 / (parseFloat(fpsSel.value) || 8));
+            if (p && F > 1) timer = setInterval(() => {
+              frame = (frame + 1) % F; update();
+            }, 1000 / (parseFloat(fpsSel.value) || 8));
           }
+          const step = d => { if (F) { frame = (frame + d + F) % F; update(); } };
           playBtn.onclick = () => setPlaying(!playing);
+          q(".cf-prev").onclick = () => step(-1);
+          q(".cf-next").onclick = () => step(1);
           slider.oninput = () => { frame = parseInt(slider.value) || 0; update(); };
           fpsSel.onchange = () => { if (playing) setPlaying(true); };
+          const toggle = q(".cf-toggle");
+          // "cf-collapsed", not "hidden": marimo's page CSS (Tailwind) owns `.hidden { display: none }`
+          // and the widget shares the page's stylesheet, so a root class named "hidden" blanked the
+          // whole widget, kicked the browser out of fullscreen and read as a frozen notebook.
+          toggle.onclick = () => { root.classList.toggle("cf-collapsed"); toggle.textContent = root.classList.contains("cf-collapsed") ? "show" : "hide"; };
+          q(".cf-full").onclick = () => { if (document.fullscreenElement) document.exitFullscreen(); else mapEl.requestFullscreen?.(); };
+          mapEl.addEventListener("fullscreenchange", () => { if (!document.fullscreenElement) mapEl.style.height = (cfg.height || 620) + "px"; });
+          root.tabIndex = 0;
+          root.addEventListener("keydown", ev => {
+            if (ev.target.tagName === "INPUT" || ev.target.tagName === "SELECT" || ev.target.tagName === "BUTTON") return;
+            if (ev.key === " ") { ev.preventDefault(); setPlaying(!playing); }
+            else if (ev.key === "ArrowLeft") { ev.preventDefault(); step(-1); }
+            else if (ev.key === "ArrowRight") { ev.preventDefault(); step(1); }
+            else if (ev.key === "f" || ev.key === "F") { q(".cf-full").click(); }
+            else if (ev.key === "h" || ev.key === "H") { toggle.click(); }
+          });
 
           function boot() {
             loadTable(); loadFrames();
             deck = new Deck({
               parent: mapEl,
-              initialViewState: {longitude: -96.5, latitude: 38.3, zoom: 3.8, minZoom: 2, maxZoom: 11},
+              initialViewState: HOME,
               controller: true,
               layers: layers(),
-              getTooltip: info => (info.picked && info.index >= 0 && info.layer && info.layer.id.startsWith("counties"))
+              getTooltip: info => (info.picked && info.index >= 0 && info.layer && String(info.layer.id).startsWith("counties"))
                 ? {text: `${names[info.index]}, ${states[info.index]}\n${fmt(val(frame, info.index))}`} : null,
-              onClick: info => {
-                if (info.picked && info.index >= 0 && info.layer && info.layer.id.startsWith("counties")) {
-                  selected = info.index;
-                  model.set("clicked", String(selected)); model.save_changes();
-                  infoEl.textContent = `${names[selected]}, ${states[selected]}: series below`;
-                  drawChart();
-                }
-              },
               onError: e => { ruler.textContent = "deck: " + (e && e.message ? e.message : e); },
             });
-            ruler.textContent = `${N} counties · ${F} frames`;
+            // explicit pick on pointerup: deck's onClick did nothing on the first flight
+            let down = null;
+            mapEl.addEventListener("pointerdown", ev => { down = ev.target.closest(".cf-hud") ? null : [ev.clientX, ev.clientY]; }, true);
+            mapEl.addEventListener("pointerup", ev => {
+              if (!down) return;
+              const moved = Math.hypot(ev.clientX - down[0], ev.clientY - down[1]); down = null;
+              if (moved > 4 || !deck) return;
+              const r = mapEl.getBoundingClientRect();
+              const info = deck.pickObject({x: ev.clientX - r.left, y: ev.clientY - r.top, radius: 3, layerIds: ["counties"]});
+              if (info && info.index >= 0) select(info.index);
+            }, true);
+            ruler.textContent = `${N.toLocaleString()} counties · ${F} frames`;
             update();
             if (cfg.autoplay) setPlaying(true);
           }
-          model.on("change:counties", () => { loadTable(); loadFrames(); ruler.textContent = `${N} counties · ${F} frames`; update(); });
-          model.on("change:frames", () => { loadFrames(); ruler.textContent = `${N} counties · ${F} frames`; update(); });
+          model.on("change:counties", () => { loadTable(); loadFrames(); ruler.textContent = `${N.toLocaleString()} counties · ${F} frames`; update(); });
+          model.on("change:frames", () => { loadFrames(); ruler.textContent = `${N.toLocaleString()} counties · ${F} frames`; update(); });
           model.on("change:config", () => { loadFrames(); update(); });
           try { boot(); } catch (e) { ruler.textContent = "boot: " + e.message; console.error(e); }
           return () => { setPlaying(false); if (deck) deck.finalize(); };
@@ -428,7 +556,6 @@ def _(anywidget, traitlets):
         counties = traitlets.Bytes(b"").tag(sync=True)
         frames = traitlets.Bytes(b"").tag(sync=True)
         config = traitlets.Unicode("{}").tag(sync=True)
-        clicked = traitlets.Unicode("").tag(sync=True)
 
     return (CountyFilm,)
 
@@ -796,7 +923,6 @@ async def _(
 def _(
     ANALYSIS_BUCKET,
     ANALYSIS_PREFIX,
-    DAYS,
     FORECAST_BUCKET,
     FORECAST_PREFIX,
     S3Store,
@@ -805,9 +931,11 @@ def _(
     np,
     xr,
 ):
-    # THE STORE. Opened lazily; nothing but metadata and the 2-D lat/lon (8 MB each)
-    # is read here. The analysis is icechunk (its own reader over S3, anonymous); the
-    # forecast is plain Zarr v3 through obstore, like every other read in this repo.
+    # THE STORE, opened once. Nothing but metadata and the 2-D lat/lon (8 MB each) is
+    # read here; the window is cut in the fold cell. The analysis is icechunk (its own
+    # reader over S3, anonymous); the forecast is plain Zarr v3 through obstore, like
+    # every other read in this repo. NO DASK: chunks=None leaves the store lazily
+    # indexed and xarray-sql cuts it into blocks itself (see the fold cell).
     import time as _stime
 
     _st0 = _stime.perf_counter()
@@ -818,21 +946,9 @@ def _(
             bucket=ANALYSIS_BUCKET, prefix=ANALYSIS_PREFIX, region="us-west-2", anonymous=True
         )
         _sess = icechunk.Repository.open(_storage).readonly_session("main")
-        # NO DASK: chunks=None leaves the store lazily indexed and xarray-sql cuts it
-        # into blocks itself (`cube_chunks`, one block per 45x45 store column over the
-        # whole window), which DataFusion pulls in parallel; measured identical to a
-        # dask-backed open (20.9 s for 168 h) and one dependency lighter. The block
-        # must cover the whole time window: a block grid narrower than the window
-        # decodes each 2,160 h store chunk once per block it touches (measured 111.7 s
-        # for the same window with 168 h blocks laid unaligned over the axis).
-        _hours = int(DAYS * 24)
         _ds = xr.open_zarr(_sess.store, consolidated=False, chunks=None)
-        cube = _ds[[VAR]].isel(time=slice(-_hours, None)).rename({"time": "t"})
-        cube_chunks = {"t": _hours, "y": 45, "x": 45}
-        times = cube["t"].values.astype("datetime64[m]")
-        source_note = (
-            f"HRRR analysis, last {DAYS} days ending {np.datetime_as_string(times[-1])} UTC"
-        )
+        cube_all = _ds[[VAR]].rename({"time": "t"})
+        source_note = "HRRR analysis"
     else:
         from zarr.storage import ObjectStore as _ZStore
 
@@ -842,22 +958,99 @@ def _(
         )
         _ds = xr.open_zarr(_zs, consolidated=True, chunks=None)
         _init = _ds["init_time"].values[-1]
-        cube = (
+        cube_all = (
             _ds[[VAR]].isel(init_time=-1).drop_vars("init_time", errors="ignore").rename({"lead_time": "t"})
         )
-        cube_chunks = {"t": 49, "y": 265, "x": 300}
-        times = (_init + _ds["lead_time"].values).astype("datetime64[m]")
-        source_note = f"HRRR 48 h forecast, init {np.datetime_as_string(_init.astype('datetime64[m]'))} UTC"
+        # lead offsets -> valid times, so the frame labels read as clock time
+        cube_all = cube_all.assign_coords(t=(_init + _ds["lead_time"].values).astype("datetime64[ns]"))
+        source_note = f"HRRR 48 h forecast, init {np.datetime_as_string(_init.astype('datetime64[m]'))}Z"
 
+    all_times = cube_all["t"].values.astype("datetime64[m]")
     lat = _ds["latitude"].values.astype("float64")
     lon = _ds["longitude"].values.astype("float64")
     grid_y = _ds["y"].values
     grid_x = _ds["x"].values
     store_stats = (
-        f"{source_note} · grid {lat.shape[1]}x{lat.shape[0]} px · {times.size} hourly steps · "
-        f"open {_stime.perf_counter() - _st0:.1f}s"
+        f"{source_note} · grid {lat.shape[1]}x{lat.shape[0]} px · hourly {np.datetime_as_string(all_times[0])} "
+        f"to {np.datetime_as_string(all_times[-1])} UTC ({all_times.size:,} steps) · open {_stime.perf_counter() - _st0:.1f}s"
     )
-    return cube, cube_chunks, grid_x, grid_y, lat, lon, store_stats, times
+    return all_times, cube_all, grid_x, grid_y, lat, lon, source_note, store_stats
+
+
+@app.cell
+def _(DAILY_MAX_DAYS, DAYS, HOURLY_MAX_DAYS, all_times, mo):
+    # THE WINDOW FORM. A form, not live controls: every submit is a fold (~20 s for the
+    # analysis), so nothing runs until "load window". Dates are UTC days, inclusive; the
+    # end day is clipped to the newest hour in the store. Limits per mode keep the
+    # frame count and the read honest: hourly is capped at HOURLY_MAX_DAYS (336 frames
+    # at 14), daily at DAILY_MAX_DAYS (a 90-day window is one full store chunk deep,
+    # measured 149 s).
+    import datetime as _dt
+
+    _last = all_times[-1].astype("datetime64[D]").astype(_dt.date)
+    _first = all_times[0].astype("datetime64[D]").astype(_dt.date)
+    window_form = (
+        mo.md("{dates} &nbsp;&nbsp; {mode}")
+        .batch(
+            dates=mo.ui.date_range(
+                start=_first,
+                stop=_last,
+                value=(_last - _dt.timedelta(days=DAYS - 1), _last),
+                label="window (UTC days, inclusive)",
+            ),
+            mode=mo.ui.dropdown(
+                options={
+                    f"hourly, as it comes (max {HOURLY_MAX_DAYS} days)": "hourly",
+                    f"daily mean (max {DAILY_MAX_DAYS} days)": "daily_mean",
+                    f"daily max (max {DAILY_MAX_DAYS} days)": "daily_max",
+                },
+                value=f"hourly, as it comes (max {HOURLY_MAX_DAYS} days)",
+                label="frames",
+            ),
+        )
+        .form(submit_button_label="load window", bordered=False)
+    )
+    window_form
+    return (window_form,)
+
+
+@app.cell
+def _(DAILY_MAX_DAYS, DAYS, HOURLY_MAX_DAYS, SOURCE, all_times, mo, np, window_form):
+    # THE WINDOW, resolved: the form's value once submitted, the last DAYS days before
+    # that. Over the limit stops here with the reason instead of clamping silently.
+    import datetime as _wdt
+
+    _last = all_times[-1].astype("datetime64[D]").astype(_wdt.date)
+    if window_form.value is None:
+        _d0, _d1 = _last - _wdt.timedelta(days=DAYS - 1), _last
+        slice_mode = "hourly"
+    else:
+        _d0, _d1 = window_form.value["dates"]
+        slice_mode = window_form.value["mode"]
+    if _d1 < _d0:
+        _d0, _d1 = _d1, _d0
+    n_days = (_d1 - _d0).days + 1
+    _limit = HOURLY_MAX_DAYS if slice_mode == "hourly" else DAILY_MAX_DAYS
+    mo.stop(
+        n_days > _limit,
+        mo.md(
+            f"**{n_days} days is over the {_limit}-day limit for {slice_mode.replace('_', ' ')}.** "
+            f"Shorten the window or switch to a daily mode (limit {DAILY_MAX_DAYS} days)."
+        ),
+    )
+    t0 = np.datetime64(_d0.isoformat()).astype("datetime64[ns]")
+    t1 = min(
+        (np.datetime64(_d1.isoformat()) + np.timedelta64(23, "h")).astype("datetime64[ns]"),
+        all_times[-1].astype("datetime64[ns]"),
+    )
+    if SOURCE != "analysis":
+        # the forecast is one init's 49 leads; the window form does not apply
+        t0, t1 = all_times[0].astype("datetime64[ns]"), all_times[-1].astype("datetime64[ns]")
+    window_note = (
+        f"{np.datetime_as_string(t0, unit='m').replace('T', ' ')}Z to "
+        f"{np.datetime_as_string(t1, unit='m').replace('T', ' ')}Z"
+    )
+    return n_days, slice_mode, t0, t1, window_note
 
 
 @app.cell
@@ -915,62 +1108,73 @@ def _(RES, con, coordinates_to_cells, counties, grid_x, grid_y, lat, lon, np, pa
 
 
 @app.cell
-def _(VAR, XarrayContext, cube, cube_chunks, pix2c):
+def _():
+    # Kernel-side memo across form submits: the last folded window and its table.
+    HOLD = {"key": None, "county_hour": None, "stats": ""}
+    return (HOLD,)
+
+
+@app.cell
+def _(HOLD, SOURCE, VAR, XarrayContext, cube_all, pix2c, t0, t1):
     # THE FOLD AND THE JOIN, ONE STATEMENT, STRAIGHT OFF THE CUBE. xarray-sql exposes the
-    # lazy (t, y, x) cube as a table; the join to pix2c on the grid coordinates is the
+    # lazy (t, y, x) window as a table; the join to pix2c on the grid coordinates is the
     # H3 fold (each pixel already carries its cell, and its cell carries its county) and
-    # the group by is the zonal mean per county per hour. DataFusion pulls the
-    # chunks in parallel, so the analysis is fetch-bound (~20 s for a CONUS window,
-    # measured at 24 h and 240 h alike) and the aggregate is nearly free.
+    # the group by is the zonal mean per county per hour. The block is the WHOLE time
+    # window x one 45x45 store column, so each 2,160 h store chunk is decoded once (a
+    # narrower block grid decoded them once per block: 111.7 s against 20.9 s for the
+    # same 168 h). DataFusion pulls the columns in parallel; the analysis is fetch-bound
+    # (~20 s for a CONUS window up to ~10 days) and the aggregate is nearly free.
+    #
+    # Memoised on the window: re-submitting the same dates, or switching hourly/daily,
+    # never refetches.
     import time as _ftime
 
-    _ft0 = _ftime.perf_counter()
-    ctx = XarrayContext()
-    ctx.from_arrow(pix2c, name="pix2c")
-    ctx.from_dataset("cube", cube, chunks=cube_chunks)
-    county_hour = ctx.sql(f"""
-        SELECT t, id, avg(CAST({VAR} AS DOUBLE)) AS v, count(*) AS px
-        FROM cube JOIN pix2c USING (y, x)
-        WHERE {VAR} = {VAR}
-        GROUP BY 1, 2
-    """).to_arrow_table()
-    fold_stats = (
-        f"{county_hour.num_rows:,} county-hour rows · fold + join {_ftime.perf_counter() - _ft0:.1f}s"
-    )
+    _key = (SOURCE, str(t0), str(t1))
+    if HOLD["key"] == _key and HOLD["county_hour"] is not None:
+        county_hour = HOLD["county_hour"]
+        fold_stats = HOLD["stats"] + " (memo)"
+    else:
+        _ft0 = _ftime.perf_counter()
+        _cube = cube_all.sel(t=slice(t0, t1))
+        _hours = int(_cube.sizes["t"])
+        _chunks = {"t": _hours, "y": 45, "x": 45} if SOURCE == "analysis" else {"t": _hours, "y": 265, "x": 300}
+        ctx = XarrayContext()
+        ctx.from_arrow(pix2c, name="pix2c")
+        ctx.from_dataset("cube", _cube, chunks=_chunks)
+        county_hour = ctx.sql(f"""
+            SELECT t, id, avg(CAST({VAR} AS DOUBLE)) AS v, count(*) AS px
+            FROM cube JOIN pix2c USING (y, x)
+            WHERE {VAR} = {VAR}
+            GROUP BY 1, 2
+        """).to_arrow_table()
+        fold_stats = (
+            f"{_hours} hours · {county_hour.num_rows:,} county-hour rows · "
+            f"fold + join {_ftime.perf_counter() - _ft0:.1f}s"
+        )
+        HOLD["key"], HOLD["county_hour"], HOLD["stats"] = _key, county_hour, fold_stats
     return county_hour, fold_stats
 
 
 @app.cell
-def _(mo):
-    slice_pick = mo.ui.dropdown(
-        options={"hourly, as it comes": "hourly", "daily mean": "daily_mean", "daily max": "daily_max"},
-        value="hourly, as it comes",
-        label="frames",
-    )
-    slice_pick
-    return (slice_pick,)
-
-
-@app.cell
-def _(PIVOT, SPAN, con, counties, county_hour, np, slice_pick):
+def _(PIVOT, SPAN, con, counties, county_hour, np, slice_mode):
     # THE FRAME MATRIX: F frames x N counties, float32, NaN where a county has no
     # pixel, in the counties table's row order (the widget indexes by row). Hourly is
     # the table as it comes; the daily slices roll it up in DuckDB on UTC days (the
-    # first and last day of a window ending mid-day are partial days, labelled as
-    # days all the same). One
-    # ramp for the whole slice: pivot at the median, span to the wider of p2/p98,
-    # unless PIVOT/SPAN pin them.
-    _mode = slice_pick.value
+    # first and last day of a window are partial if the window is, labelled as days
+    # all the same). One ramp for the whole film: pivot at the median, span to the
+    # wider of p2/p98, unless PIVOT/SPAN pin them.
     con.register("ch", county_hour)
-    if _mode == "hourly":
+    if slice_mode == "hourly":
         _tbl = con.sql("SELECT t AS f, id, v FROM ch ORDER BY f").to_arrow_table()
         _labels = [np.datetime_as_string(t, unit="m").replace("T", " ") + "Z" for t in np.unique(_tbl["f"].to_numpy())]
+        frame_kind = "hour (UTC)"
     else:
-        _agg = "avg" if _mode == "daily_mean" else "max"
+        _agg = "avg" if slice_mode == "daily_mean" else "max"
         _tbl = con.sql(
             f"SELECT date_trunc('day', t) AS f, id, {_agg}(v) AS v FROM ch GROUP BY 1, 2 ORDER BY f"
         ).to_arrow_table()
-        _labels = [np.datetime_as_string(t, unit="D") + (" mean" if _agg == "avg" else " max") for t in np.unique(_tbl["f"].to_numpy())]
+        _labels = [np.datetime_as_string(t, unit="D") for t in np.unique(_tbl["f"].to_numpy())]
+        frame_kind = "UTC day, " + ("mean" if _agg == "avg" else "max")
     con.unregister("ch")
 
     _fkeys = np.unique(_tbl["f"].to_numpy())
@@ -991,10 +1195,10 @@ def _(PIVOT, SPAN, con, counties, county_hour, np, slice_pick):
     )
     ramp_lo, ramp_mid, ramp_hi = _mid - _span, _mid, _mid + _span
     frame_stats = (
-        f"{frames.shape[0]} frames x {frames.shape[1]} counties ({_mode}) · "
+        f"{frames.shape[0]} frames x {frames.shape[1]} counties ({slice_mode.replace('_', ' ')}) · "
         f"ramp {ramp_lo:.1f} / {ramp_mid:.1f} / {ramp_hi:.1f}"
     )
-    return frame_labels, frame_stats, frames, ramp_hi, ramp_lo, ramp_mid
+    return frame_kind, frame_labels, frame_stats, frames, ramp_hi, ramp_lo, ramp_mid
 
 
 @app.cell
@@ -1011,7 +1215,7 @@ def _(
     pa_ipc,
 ):
     # THE WIDGET, BUILT ONCE with the county geometry and nothing else. The frames and
-    # the config are set from the wiring cell below, so a slice or ramp change never
+    # the config are set from the wiring cell below, so a window or slice change never
     # rebuilds the map (the deck instance and its GPU buffers survive; only the colour
     # attribute is re-uploaded, browser side).
     #
@@ -1058,15 +1262,20 @@ def _(
     UNITS,
     VAR,
     film,
+    fold_stats,
+    frame_kind,
     frame_labels,
+    frame_stats,
     frames,
     json,
+    n_days,
     ramp_hi,
     ramp_lo,
     ramp_mid,
-    store_stats,
+    source_note,
+    window_note,
 ):
-    # THE WIRING: re-runs on every slice or ramp change and only pushes bytes + JSON at
+    # THE WIRING: re-runs on every window/slice change and only pushes JSON + bytes at
     # the existing widget. Config first, then frames: the JS rebuilds its colour table
     # on the frames change and reads the config it already has.
     film.config = json.dumps(
@@ -1079,8 +1288,10 @@ def _(
             "units": UNITS,
             "fps": FPS,
             "height": MAP_HEIGHT,
-            "alpha": 235,
-            "title": f"{VAR} · {store_stats.split(' · ')[0]}",
+            "title": f"{VAR.replace('_', ' ')} · {source_note}",
+            "subtitle": f"{window_note} · {n_days} days · {frame_kind}",
+            "frame_kind": frame_kind,
+            "meta": f"{fold_stats} · {frame_stats}",
             "autoplay": False,
         }
     )

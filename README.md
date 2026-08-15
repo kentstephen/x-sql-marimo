@@ -2,12 +2,16 @@
 
 Fold a raster to H3 in SQL, then join it to something that has edges. One notebook is
 the point of the repo: worldwide deforestation, streamed straight out of object storage,
-joined to administrative divisions everywhere the camera lands. A second, experimental
-notebook applies the same chassis to terrain.
+joined to administrative divisions everywhere the camera lands. A second notebook points
+the same fold at the weather: HRRR temperature per US county, hour by hour, as a film
+that plays in the browser. A third, experimental, applies the chassis to terrain.
 
 ```bash
 # where forest was lost 2002-2022, by administrative division, worldwide
 uv run marimo edit xsql-deforest-divisions.py --sandbox
+
+# HRRR 2 m temperature per CONUS county, hour by hour, animated (dashboard on the map)
+uv run marimo edit xsql-hrrr-counties.py --sandbox
 
 # EXPERIMENTAL, use caution: worldwide Mapterhorn terrain as extruded H3 columns.
 # Open defects (res-to-zoom tuning, deep-zoom regional reads unflown); expect rough
@@ -216,6 +220,23 @@ Zonal means checked against geography we can reason about:
 A ~30x to ~70x split in the right direction and roughly the right magnitude. If the join
 were smearing neighbours together or dropping the area weighting, that contrast would
 collapse.
+
+## HRRR temperature by county, as a film
+
+`xsql-hrrr-counties.py` reads [dynamical.org](https://dynamical.org/)'s Zarr build of
+NOAA's HRRR analysis (3 km, hourly, CC-BY 4.0) straight from S3 with
+[xarray-sql](https://github.com/alxmrs/xarray-sql), labels every pixel with its H3
+res 7 cell from the store's own lat/lon, polyfills Overture counties in DuckDB at the
+same res, and one DataFusion join + group by gives 2 m temperature per county per hour
+for a chosen window (a submit form: UTC date range, hourly or daily mean / max, with
+limits). That table is small, so the whole film goes to the browser once and the
+browser owns the clock: a bespoke anywidget on deck.gl + `@geoarrow/deck.gl-layers`
+recolours the counties per frame from a Float32Array, and the dashboard (transport,
+legend, live per-frame stats, warmest and coolest counties, a clicked county's
+series, display settings) is drawn on the map itself, hideable, so the map's own
+browser fullscreen carries all of it. The kernel is idle while it plays. Res 7 is
+finer than the 3 km pixel, so the fold is a relabel here; the county mean is the
+honest mean of its pixels. Notes and measurements: `docs/hrrr-counties-notes.md`.
 
 ## The terrain explorer (experimental, use caution)
 

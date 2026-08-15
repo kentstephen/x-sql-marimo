@@ -136,15 +136,50 @@ to know:
   buffer before viewing it as Float32 (alignment). Browser -> kernel is `clicked`, a
   Unicode row index, per the proven-trait-types rule.
 - **The map cell builds the widget with geometry only and must not re-run**; the
-  wiring cell pushes `config` (labels, ramp lo/mid/hi, stops, fps, height) then
-  `frames` (float32 F x N, NaN = no pixel) and re-runs freely on the slice dropdown.
-  One ramp per slice: pivot at the median, span to the wider of p2/p98, `PIVOT`/`SPAN`
-  pin them. Daily slices are UTC days (first/last partial for a mid-day window end).
-- Headless: store 2 s, counties 7.6 s, polyfill + lookup 1.5 s, fold 19.8 s, 168 x
-  3,108 frames, ramp 13.6 / 25.3 / 37.0 degC. **NOT FLOWN**: the esm.sh module graph,
-  the deck boot inside marimo's shadow DOM, picking, the frame loop and the chart are
-  all unverified in a browser; the ruler span in the control bar prints deck/boot
-  errors if any. `marimo export html` does not render the widget (same as lonboard).
+  wiring cell pushes `config` (labels, ramp lo/mid/hi, stops, fps, height, title,
+  subtitle, meta) then `frames` (float32 F x N, NaN = no pixel) and re-runs freely.
+  One ramp per film: pivot at the median, span to the wider of p2/p98, `PIVOT`/`SPAN`
+  pin them. Daily frames are UTC days (first/last partial if the window is).
+- **The HUD is MINIMAL and on the map** (2026-08-15, after a flight of a fuller
+  dashboard that Stephen called dizzying and that froze the notebook: "want
+  minimal"): one panel top-left (title, legend, county mean for the frame, and a
+  clicked county's line only after a click, × clears) with its own hide toggle
+  (H), and the transport across the bottom (step / play / step, slider with UTC day
+  ticks, timestamp, fps, ⛶ fullscreen / F). ⛶ is the DECK ELEMENT's own browser
+  fullscreen (`mapEl.requestFullscreen()`, not marimo's); the HUD is inside the
+  element so it comes along; deck polls its canvas size, no resize handler.
+  Everything is computed in the browser from the frame matrix (no
+  hyparquet/hightable). Space plays, arrows step.
+- **The widget SHARES THE PAGE'S STYLESHEET, so every class is `cf-` prefixed.**
+  The "hide freezes the notebook and exits fullscreen" report (two flights) was a
+  root class literally named `hidden`: marimo's Tailwind owns `.hidden { display:
+  none }`, so the toggle blanked the whole widget, the fullscreen element vanished
+  (browser exits fullscreen) and the page read as frozen. Never use a bare
+  utility-looking class name in an anywidget here.
+- **NOTHING crosses back to the kernel from the widget.** The fuller HUD synced the
+  clicked county to a `clicked` trait; nothing consumed it and marimo re-runs cells
+  that reference a displayed widget whose value changed, so it is gone. If a
+  per-county number is ever wanted kernel-side, it must not go through a synced
+  trait on the displayed widget.
+- **Clicks are picked explicitly** on pointerup with `deck.pickObject({x, y, radius: 3,
+  layerIds: ["counties"]})` (prefix match on sublayer ids; a press that starts on
+  the HUD or moved > 4 px is not a click): deck's own `onClick` did nothing on the
+  first flight inside marimo's shadow DOM. Hover uses `getTooltip` and worked.
+- **The window is a submit FORM** (`mo.ui.date_range` + frames-mode dropdown,
+  `.batch(...).form(submit_button_label="load window")`), UTC days inclusive, end
+  clipped to the newest hour; opening default is the last `DAYS` (7) days ending
+  now. Limits per mode: hourly <= `HOURLY_MAX_DAYS` (14; 336 frames), daily mean/max
+  <= `DAILY_MAX_DAYS` (92; the read cost, one full store chunk is 149 s); over the
+  limit `mo.stop`s with the reason rather than clamping. The fold is memoised in
+  `HOLD` on (SOURCE, t0, t1) so re-submitting the same dates or switching
+  hourly/daily never refetches. The forecast source ignores the window (one init's
+  49 leads, coords rewritten to valid times).
+- Headless: store 2.8 s, counties 7.6 s, polyfill + lookup 1.5 s, fold 19.0 s for
+  159 h (7 UTC days to the newest hour), 159 x 3,108 frames. Flights so far: 9.1.14
+  rendered and played, clicks failed; the fuller HUD at 9.3.10 rendered and played,
+  its top-right buttons froze the notebook and exited fullscreen. **The minimal HUD
+  is unflown.**
+  `marimo export html` does not render the widget (same as lonboard).
 
 `xsql-mapterhorn-explorer.py` (EXPERIMENTAL, open defects below) draws Mapterhorn terrain
 worldwide as extruded H3 columns: the DEM half of the parked
