@@ -211,6 +211,8 @@ to know:
   full offsets under a sliced table) and shows its value and line; clicking it again,
   or off any county, clears. Headless: store 2.8 s, counties 7.4 s cold / 0.0 s from
   the tmp cache, polyfill + lookup 1.5-3 s, fold ~20 s for a 7-UTC-day window.
+  Carries an "Open in molab" badge cell (first cell after the imports); Stephen
+  ran it in molab from the badge and it works there (2026-08-15).
   Stephen: "probably the coolest notebook I've shared so far, but the slowest";
   thirty seconds accepted for a LinkedIn demo, no cloud spend, no publishing a
   derived cube (the idea and its numbers are in the notes). Known: 1-3 px seams
