@@ -161,10 +161,20 @@ to know:
   that reference a displayed widget whose value changed, so it is gone. If a
   per-county number is ever wanted kernel-side, it must not go through a synced
   trait on the displayed widget.
-- **Clicks are picked explicitly** on pointerup with `deck.pickObject({x, y, radius: 3,
-  layerIds: ["counties"]})` (prefix match on sublayer ids; a press that starts on
-  the HUD or moved > 4 px is not a click): deck's own `onClick` did nothing on the
-  first flight inside marimo's shadow DOM. Hover uses `getTooltip` and worked.
+- **Picking is GEOMETRIC, in JS, not deck's.** deck's GPU picking returned null for
+  every click on three flights here (`pick: none (null)` in the ruler; hover never
+  showed either), inside marimo's shadow DOM with deck 9.3.10 + geoarrow layers
+  0.3.2. So a click is unprojected (`deck.getViewports()[0].unproject`) and tested
+  against the county rings the browser already holds (arrow data walk:
+  multipolygon `valueOffsets` -> polygon -> ring -> `FixedSizeList<f64,2>` values;
+  bbox reject, even-odd over every ring; index 4 ms, lookup 0.1 ms, verified in node
+  on the real table). A press that starts on the HUD or moves > 4 px is a drag.
+  There is no hover readout for the same reason.
+- **Counties are NOT stroked** (Stephen: "then dont stroke the counties"). Adjacent
+  counties from the z8 tiles do not quite meet at deep zoom (~30 m vertex
+  quantisation, 1-3 px hairlines at z10, his "gaps btw counties"); a same-colour 1 px
+  stroke would hide them and was declined. The other fix, if wanted, is finer county
+  geometry (z10 tiles, 16x the fetch), not a stroke.
 - **The window is a submit FORM** (`mo.ui.date_range` + frames-mode dropdown,
   `.batch(...).form(submit_button_label="load window")`), UTC days inclusive, end
   clipped to the newest hour; opening default is the last `DAYS` (7) days ending
@@ -174,6 +184,14 @@ to know:
   `HOLD` on (SOURCE, t0, t1) so re-submitting the same dates or switching
   hourly/daily never refetches. The forecast source ignores the window (one init's
   49 leads, coords rewritten to valid times).
+- **Startup cost, measured:** store 2.8 s, counties 7.3 s (1,008 ranged GETs + Python
+  MVT decode; dissolve 0.1 s), polyfill + lookup 1.5-3 s, fold ~20 s. The fold is the
+  floor and it is DECODE, not the wire: DataFusion partitions 32/96, zarr
+  `async.concurrency` 64 and icechunk `max_concurrent_requests` 64/256 all measured
+  ~20 s; each 45x45 store chunk is 2,160 h deep, so any window decodes 960 x 17.5 MB
+  of zstd. Do not try obstore for icechunk (same Rust object_store underneath, and no
+  seam). The counties are cached as parquet in the OS temp dir (`CACHE_DIR`,
+  Stephen: tmp not .cache; None disables): warm run reads them in 0.0 s.
 - Headless: store 2.8 s, counties 7.6 s, polyfill + lookup 1.5 s, fold 19.0 s for
   159 h (7 UTC days to the newest hour), 159 x 3,108 frames. Flights so far: 9.1.14
   rendered and played, clicks failed; the fuller HUD at 9.3.10 rendered and played,

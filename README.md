@@ -236,7 +236,11 @@ legend, live per-frame stats, warmest and coolest counties, a clicked county's
 series, display settings) is drawn on the map itself, hideable, so the map's own
 browser fullscreen carries all of it. The kernel is idle while it plays. Res 7 is
 finer than the 3 km pixel, so the fold is a relabel here; the county mean is the
-honest mean of its pixels. Notes and measurements: `docs/hrrr-counties-notes.md`.
+honest mean of its pixels. Cold start to first frame is about thirty seconds, most of
+it the ~20 s fold (the archive is time-optimised, so any window downloads the whole
+current 90-day layer, ~0.44 GB); the dissolved counties are cached as one parquet in
+the OS temp dir after the first run. Notes and measurements:
+`docs/hrrr-counties-notes.md`.
 
 ## The terrain explorer (experimental, use caution)
 

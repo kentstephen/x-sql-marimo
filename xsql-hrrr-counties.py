@@ -49,6 +49,20 @@ scales the frame count, not the read, until it crosses a 90-day chunk boundary.
 Days are UTC days. The 48-hour forecast on source.coop is the other SOURCE (plain
 Zarr, all 49 leads x CONUS in 2.2 s); the pipeline is identical from the fold on.
 
+WHAT IT COSTS TO RUN, AND WHY. About thirty seconds to the first frame from a cold
+start: the store opens in ~3 s, the counties take ~7 s (1,008 ranged GETs against the
+PMTiles object plus the MVT decode; the dissolve is 0.1 s), the pixel -> county lookup
+~2 s, and the fold ~20 s. THE COUNTIES ARE CACHED ON DISK as one parquet in the OS temp
+dir (see CACHE_DIR): they never change for a pinned Overture release, so every run
+after the first reads them in 0.0 s and the system cleans the file up on its own
+schedule. Nothing else is cached. The fold cannot be made faster from here: the
+archive is time-optimised (each 45 x 45 px chunk is 2,160 hours deep), so any window
+downloads the whole current 90-day layer, ~0.44 GB today and more as it fills, and
+that is bandwidth-bound wherever you run it (dynamical.org, source.coop and the AWS
+Open Data bucket are the same us-west-2 objects). A precomputed county-hour cube would
+make any window sub-second and reach back to 2014, and the fold here is its recipe;
+for a demonstration, computing it on the fly is the point, and thirty seconds is fine.
+
 Two engines, same split as the rest of the repo: DuckDB does geometry (dissolve,
 polyfill, the daily roll-up), DataFusion does the fold and the join, and DuckDB's
 replacement scan is NOT used from cell bodies (marimo mangles underscore locals, so
@@ -78,6 +92,7 @@ def _():
     import obstore
     import pyarrow as pa
     import pyarrow.ipc as pa_ipc
+    import pyarrow.parquet as pq
     import traitlets
     import xarray as xr
     from arro3.core import Array as ArroArray, Table as ArroTable
@@ -106,6 +121,7 @@ def _():
         obstore,
         pa,
         pa_ipc,
+        pq,
         struct,
         traitlets,
         xr,
@@ -149,6 +165,13 @@ def _():
     COUNTY_Z = 8
     BOX = (-124.8, 24.4, -66.9, 49.5)
     NOT_CONUS = {"AK", "HI"}
+    # Disk cache for the dissolved counties, which never change between runs: ~7.3 s
+    # of the ~30 s before the map (1,008 ranged GETs + the Python MVT decode; the
+    # dissolve itself is 0.1 s). In the OS temp dir, so the system cleans it up
+    # (Stephen: tmp, not .cache). None turns it off.
+    import tempfile as _tempfile
+
+    CACHE_DIR = str(_tempfile.gettempdir()) + "/x-sql-marimo"
 
     # ------------------------------------------------------------------ the film
     # Diverging ramp on a blue <-> yellow/orange axis (protan-safe: no red leg, no
@@ -164,6 +187,7 @@ def _():
         ANALYSIS_BUCKET,
         ANALYSIS_PREFIX,
         BOX,
+        CACHE_DIR,
         COUNTY_Z,
         DAILY_MAX_DAYS,
         DAYS,
@@ -173,6 +197,7 @@ def _():
         HOURLY_MAX_DAYS,
         MAP_HEIGHT,
         NOT_CONUS,
+        OVERTURE_RELEASE,
         PIVOT,
         PM_BUCKET,
         PM_PATH,
@@ -235,7 +260,7 @@ def _(anywidget, traitlets):
 
         _esm = r"""
         import {Deck} from "https://esm.sh/@deck.gl/core@9.3.10?deps=apache-arrow@18.1.0";
-        import {BitmapLayer} from "https://esm.sh/@deck.gl/layers@9.3.10?deps=@deck.gl/core@9.3.10,apache-arrow@18.1.0";
+        import {BitmapLayer, PathLayer} from "https://esm.sh/@deck.gl/layers@9.3.10?deps=@deck.gl/core@9.3.10,apache-arrow@18.1.0";
         import {TileLayer} from "https://esm.sh/@deck.gl/geo-layers@9.3.10?deps=@deck.gl/core@9.3.10,@deck.gl/extensions@9.3.10,@deck.gl/layers@9.3.10,@deck.gl/mesh-layers@9.3.10,apache-arrow@18.1.0";
         import {GeoArrowPolygonLayer} from "https://esm.sh/@geoarrow/deck.gl-layers@0.3.2?deps=@deck.gl/aggregation-layers@9.3.10,@deck.gl/core@9.3.10,@deck.gl/extensions@9.3.10,@deck.gl/geo-layers@9.3.10,@deck.gl/layers@9.3.10,@deck.gl/mesh-layers@9.3.10,apache-arrow@18.1.0";
         import * as arrow from "https://esm.sh/apache-arrow@18.1.0";
@@ -312,7 +337,7 @@ def _(anywidget, traitlets):
                     <div class="cf-row"><span class="cf-k cf-cname">–</span><span><span class="cf-num cf-v cf-cval">–</span> <button class="cf-clear" title="clear">×</button></span></div>
                     <canvas class="cf-chart" height="96"></canvas>
                   </div>
-                  <div class="cf-dim cf-hint">click a county for its line · space plays · ← → step</div>
+                  <div class="cf-dim cf-hint">click a county for its value and line · space plays · ← → step</div>
                 </div>
               </div></div>
               <span class="cf-ruler cf-num"></span>
@@ -347,6 +372,55 @@ def _(anywidget, traitlets):
             const i = Math.round(t * 255) * 3; return `rgb(${lut[i]},${lut[i+1]},${lut[i+2]})`;
           };
 
+          // Geometry index for picking IN JS: deck's GPU picking returned null for every
+          // click on the flights here (ruler read "pick: none (null)"), so a click is
+          // unprojected to lon/lat and tested against the county rings the browser
+          // already holds: bbox reject, then even-odd over every ring of every polygon
+          // (holes fall out of even-odd). ~ms for 3,108 multipolygons.
+          let geo = null;
+          function indexGeometry() {
+            const d = table.getChild("geometry").data[0];       // multipolygon: list<polygon>
+            const polyD = d.children[0];                        // polygon: list<ring>
+            const ringD = polyD.children[0];                    // ring: list<coord>
+            const coordD = ringD.children[0];                   // coord: fixed_size_list<f64, 2>
+            const xy = coordD.children[0].values;               // interleaved x y
+            const mpOff = d.valueOffsets, polyOff = polyD.valueOffsets, ringOff = ringD.valueOffsets;
+            const bbox = new Float64Array(N * 4), polys = new Array(N);
+            for (let i = 0; i < N; i++) {
+              let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+              const ps = [];
+              for (let p = mpOff[d.offset + i]; p < mpOff[d.offset + i + 1]; p++) {
+                const rings = [];
+                for (let r = polyOff[p]; r < polyOff[p + 1]; r++) {
+                  const s = ringOff[r], e = ringOff[r + 1];
+                  rings.push([s, e]);
+                  for (let c = s; c < e; c++) { const x = xy[2 * c], y = xy[2 * c + 1]; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+                }
+                ps.push(rings);
+              }
+              bbox[4 * i] = x0; bbox[4 * i + 1] = y0; bbox[4 * i + 2] = x1; bbox[4 * i + 3] = y1;
+              polys[i] = ps;
+            }
+            geo = {xy, bbox, polys};
+          }
+          function countyAt(lng, lat) {
+            if (!geo) return -1;
+            const {xy, bbox, polys} = geo;
+            for (let i = 0; i < N; i++) {
+              if (lng < bbox[4 * i] || lng > bbox[4 * i + 2] || lat < bbox[4 * i + 1] || lat > bbox[4 * i + 3]) continue;
+              for (const rings of polys[i]) {
+                let inside = false;
+                for (const [s, e] of rings) {
+                  for (let a = s, b = e - 1; a < e; b = a++) {
+                    const xa = xy[2 * a], ya = xy[2 * a + 1], xb = xy[2 * b], yb = xy[2 * b + 1];
+                    if ((ya > lat) !== (yb > lat) && lng < (xb - xa) * (lat - ya) / (yb - ya) + xa) inside = !inside;
+                  }
+                }
+                if (inside) return i;
+              }
+            }
+            return -1;
+          }
           function loadTable() {
             const u8 = bytesOf(model.get("counties"));
             if (!u8 || !u8.length) return;
@@ -354,6 +428,7 @@ def _(anywidget, traitlets):
             N = table.numRows;
             names = table.getChild("name").toArray();
             states = table.getChild("state").toArray();
+            try { indexGeometry(); } catch (e) { geo = null; ruler.textContent = "geometry index: " + e.message; }
           }
           function recolor() {
             if (!frames) return;
@@ -423,9 +498,27 @@ def _(anywidget, traitlets):
                 getFillColor: colorVector(frame),
                 filled: true,
                 stroked: false,
-                pickable: true,
+                pickable: false,
                 _validate: false,
               }));
+              if (selected >= 0 && selected < N && geo) {
+                // the picked county, outlined: its rings as plain paths (a one-row
+                // GeoArrow layer via table.slice drew EVERY county: the layer reads the
+                // full offsets under a sliced table)
+                const paths = [];
+                for (const rings of geo.polys[selected]) for (const [st, en] of rings) paths.push(geo.xy.subarray(2 * st, 2 * en));
+                out.push(new PathLayer({
+                  id: "picked",
+                  data: paths,
+                  getPath: d => d,
+                  positionFormat: "XY",
+                  getColor: [230, 193, 74, 255],
+                  getWidth: 2,
+                  widthUnits: "pixels",
+                  widthMinPixels: 2,
+                  pickable: false,
+                }));
+              }
             }
             out.push(tiles("labels", "https://basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}.png", 0.6));
             return out;
@@ -479,9 +572,9 @@ def _(anywidget, traitlets):
             selected = i;
             root.classList.add("cf-picked");
             cname.textContent = `${names[i]}, ${states[i]}`;
-            stats(); drawChart();
+            update();
           }
-          q(".cf-clear").onclick = () => { selected = -1; root.classList.remove("cf-picked"); };
+          q(".cf-clear").onclick = () => { selected = -1; root.classList.remove("cf-picked"); update(); };
           function update() {
             if (!deck) return;
             deck.setProps({layers: layers()});
@@ -526,8 +619,6 @@ def _(anywidget, traitlets):
               initialViewState: HOME,
               controller: true,
               layers: layers(),
-              getTooltip: info => (info.picked && info.index >= 0 && info.layer && String(info.layer.id).startsWith("counties"))
-                ? {text: `${names[info.index]}, ${states[info.index]}\n${fmt(val(frame, info.index))}`} : null,
               onError: e => { ruler.textContent = "deck: " + (e && e.message ? e.message : e); },
             });
             // explicit pick on pointerup: deck's onClick did nothing on the first flight
@@ -538,8 +629,12 @@ def _(anywidget, traitlets):
               const moved = Math.hypot(ev.clientX - down[0], ev.clientY - down[1]); down = null;
               if (moved > 4 || !deck) return;
               const r = mapEl.getBoundingClientRect();
-              const info = deck.pickObject({x: ev.clientX - r.left, y: ev.clientY - r.top, radius: 3, layerIds: ["counties"]});
-              if (info && info.index >= 0) select(info.index);
+              let ll = null;
+              try { ll = deck.getViewports()[0].unproject([ev.clientX - r.left, ev.clientY - r.top]); }
+              catch (e) { ruler.textContent = "unproject: " + e.message; return; }
+              const i = countyAt(ll[0], ll[1]);
+              if (i >= 0 && i !== selected) select(i);
+              else { selected = -1; root.classList.remove("cf-picked"); update(); }  // click off a county, or the picked one again, clears
             }, true);
             ruler.textContent = `${N.toLocaleString()} counties · ${F} frames`;
             update();
@@ -563,8 +658,10 @@ def _(anywidget, traitlets):
 @app.cell
 async def _(
     BOX,
+    CACHE_DIR,
     COUNTY_Z,
     NOT_CONUS,
+    OVERTURE_RELEASE,
     PM_BUCKET,
     PM_PATH,
     S3Store,
@@ -575,6 +672,7 @@ async def _(
     np,
     obstore,
     pa,
+    pq,
     struct,
 ):
     # THE COUNTIES, OUT OF ONE PMTILES OBJECT BY RANGED GET. The client and the MVT
@@ -584,335 +682,359 @@ async def _(
     import time as _ctime
 
     _ct0 = _ctime.perf_counter()
-    _pm_store = S3Store(PM_BUCKET, region="us-west-2", skip_signature=True)
+    # DISK CACHE in the OS temp dir: the dissolved counties never change for a pinned
+    # Overture release and BOX, and this fetch + dissolve is ~7.3 s of the ~30 s before
+    # the map. First run writes the parquet, every run after reads it (0.0 s).
+    # CACHE_DIR = None turns it off.
+    import pathlib as _pl
 
-    async def _pm_range(a, b):
-        """Inclusive byte range [a, b]. obstore's `end` is exclusive."""
-        return bytes(
-            memoryview(
-                await obstore.get_range_async(_pm_store, PM_PATH, start=a, end=b + 1)
+    _cache = (
+        _pl.Path(CACHE_DIR) / f"counties-{OVERTURE_RELEASE}-z{COUNTY_Z}-{'-'.join(str(b) for b in BOX)}.parquet"
+        if CACHE_DIR
+        else None
+    )
+    _rows, _x0, _y0, _x1, _y1, _t_fetch = [], 0, 0, -1, -1, 0.0
+    if _cache is not None and _cache.exists():
+        counties = pq.read_table(_cache)
+        _how = f"from {_cache}"
+    else:
+        _pm_store = S3Store(PM_BUCKET, region="us-west-2", skip_signature=True)
+
+        async def _pm_range(a, b):
+            """Inclusive byte range [a, b]. obstore's `end` is exclusive."""
+            return bytes(
+                memoryview(
+                    await obstore.get_range_async(_pm_store, PM_PATH, start=a, end=b + 1)
+                )
+            )
+
+        def _varint(buf, i):
+            r = s = 0
+            while True:
+                c = buf[i]
+                i += 1
+                r |= (c & 0x7F) << s
+                if not c & 0x80:
+                    return r, i
+                s += 7
+
+        def _parse_dir(buf):
+            """A PMTiles v3 directory: four varint columns, tile ids delta-encoded."""
+            n, i = _varint(buf, 0)
+            ids, last = [0] * n, 0
+            for k in range(n):
+                v, i = _varint(buf, i)
+                last += v
+                ids[k] = last
+            runs = [0] * n
+            for k in range(n):
+                runs[k], i = _varint(buf, i)
+            lens = [0] * n
+            for k in range(n):
+                lens[k], i = _varint(buf, i)
+            offs = [0] * n
+            for k in range(n):
+                v, i = _varint(buf, i)
+                offs[k] = (offs[k - 1] + lens[k - 1]) if v == 0 and k > 0 else v - 1
+            return list(zip(ids, offs, lens, runs))
+
+        def _tile_id(z, x, y):
+            """z/x/y -> PMTiles v3 tile id: Hilbert order within a level, levels stacked."""
+            acc = sum((1 << t) * (1 << t) for t in range(z))
+            n = 1 << z
+            d, s = 0, n >> 1
+            while s > 0:
+                rx = 1 if x & s else 0
+                ry = 1 if y & s else 0
+                d += s * s * ((3 * rx) ^ ry)
+                if ry == 0:
+                    if rx == 1:
+                        x, y = s - 1 - x, s - 1 - y
+                    x, y = y, x
+                s >>= 1
+            return acc + d
+
+        def _find(entries, tid):
+            """Binary search, falling back to the run that COVERS tid."""
+            lo, hi = 0, len(entries) - 1
+            while lo <= hi:
+                m = (lo + hi) // 2
+                if tid < entries[m][0]:
+                    hi = m - 1
+                elif tid > entries[m][0]:
+                    lo = m + 1
+                else:
+                    return entries[m]
+            if hi >= 0 and (entries[hi][3] == 0 or tid - entries[hi][0] < entries[hi][3]):
+                return entries[hi]
+            return None
+
+        _hdr = await _pm_range(0, 126)
+        assert _hdr[:7] == b"PMTiles" and _hdr[7] == 3, "not a PMTiles v3 archive"
+        _rd_off, _rd_len, _, _, _ld_off, _, _td_off, _ = struct.unpack("<8Q", _hdr[8:72])
+        assert COUNTY_Z <= _hdr[101], "COUNTY_Z above the pyramid"
+        _root = _parse_dir(gzip.decompress(await _pm_range(_rd_off, _rd_off + _rd_len - 1)))
+        _leaf = {}
+
+        def _fields(buf):
+            """Iterate (field_number, wire_type, value) over one protobuf message."""
+            i, n = 0, len(buf)
+            while i < n:
+                key, i = _varint(buf, i)
+                f, w = key >> 3, key & 0x7
+                if w == 0:
+                    v, i = _varint(buf, i)
+                elif w == 2:
+                    ln, i = _varint(buf, i)
+                    v = buf[i : i + ln]
+                    i += ln
+                elif w == 5:
+                    v = buf[i : i + 4]
+                    i += 4
+                elif w == 1:
+                    v = buf[i : i + 8]
+                    i += 8
+                else:
+                    raise ValueError(f"wire type {w}")
+                yield f, w, v
+
+        def _value(buf):
+            """An MVT Value message: exactly one of its fields is set."""
+            for f, _w, v in _fields(buf):
+                if f == 1:
+                    return v.decode("utf-8")
+                if f == 2:
+                    return struct.unpack("<f", v)[0]
+                if f == 3:
+                    return struct.unpack("<d", v)[0]
+                if f in (4, 5):
+                    return v
+                if f == 6:
+                    return (v >> 1) ^ -(v & 1)
+                if f == 7:
+                    return bool(v)
+            return None
+
+        def _mvt_rings(geom):
+            """Packed geometry commands -> rings of (x, y) tile coords, closed."""
+            rings, ring = [], None
+            x = y = 0
+            i, n = 0, len(geom)
+            while i < n:
+                cmd, i = _varint(geom, i)
+                op, count = cmd & 0x7, cmd >> 3
+                if op == 1:  # MoveTo: starts a ring
+                    for _ in range(count):
+                        dx, i = _varint(geom, i)
+                        dy, i = _varint(geom, i)
+                        x += (dx >> 1) ^ -(dx & 1)
+                        y += (dy >> 1) ^ -(dy & 1)
+                        ring = [(x, y)]
+                        rings.append(ring)
+                elif op == 2:  # LineTo
+                    for _ in range(count):
+                        dx, i = _varint(geom, i)
+                        dy, i = _varint(geom, i)
+                        x += (dx >> 1) ^ -(dx & 1)
+                        y += (dy >> 1) ^ -(dy & 1)
+                        ring.append((x, y))
+                elif op == 7:  # ClosePath: repeat the first point
+                    ring.append(ring[0])
+                else:
+                    raise ValueError(f"geometry op {op}")
+            return rings
+
+        def _area2(ring):
+            """Twice the signed shoelace area: >0 marks an exterior ring (tile y is down)."""
+            a = 0
+            for (x0, y0), (x1, y1) in zip(ring, ring[1:]):
+                a += x0 * y1 - x1 * y0
+            return a
+
+        def _division_areas(tile_buf):
+            """The division_area layer: ([(properties, [(exterior, holes), ...]), ...], extent)."""
+            for f, _w, v in _fields(tile_buf):
+                if f != 3:  # Tile.layers
+                    continue
+                name, extent = None, 4096
+                keys, values, feats = [], [], []
+                for lf, _lw, lv in _fields(v):
+                    if lf == 1:
+                        name = lv.decode("utf-8")
+                    elif lf == 2:
+                        feats.append(lv)
+                    elif lf == 3:
+                        keys.append(lv.decode("utf-8"))
+                    elif lf == 4:
+                        values.append(_value(lv))
+                    elif lf == 5:
+                        extent = lv
+                if name != "division_area":
+                    continue
+                out = []
+                for fv in feats:
+                    tags, gtype, geom = [], 0, b""
+                    for ff, _fw, fvv in _fields(fv):
+                        if ff == 2:
+                            i = 0
+                            while i < len(fvv):
+                                t, i = _varint(fvv, i)
+                                tags.append(t)
+                        elif ff == 3:
+                            gtype = fvv
+                        elif ff == 4:
+                            geom = fvv
+                    if gtype != 3:  # not a polygon feature
+                        continue
+                    props = {
+                        keys[tags[i]]: values[tags[i + 1]] for i in range(0, len(tags), 2)
+                    }
+                    polys, cur = [], None
+                    for ring in _mvt_rings(geom):
+                        if _area2(ring) > 0:
+                            cur = (ring, [])
+                            polys.append(cur)
+                        elif cur is not None:
+                            cur[1].append(ring)
+                    out.append((props, polys))
+                return out, extent
+            return [], 4096
+
+        def _feature_wkb(polys, z, x, y, extent):
+            """Tile-integer rings -> a lon/lat MultiPolygon WKB, closed-form Web Mercator."""
+            n = 1 << z
+            parts = []
+            for ext, holes in polys:
+                rings = []
+                for r in (ext, *holes):
+                    a = np.asarray(r, dtype=np.float64)
+                    pts = np.empty_like(a)
+                    pts[:, 0] = (x + a[:, 0] / extent) / n * 360.0 - 180.0
+                    pts[:, 1] = np.degrees(
+                        np.arctan(np.sinh(np.pi * (1.0 - 2.0 * (y + a[:, 1] / extent) / n)))
+                    )
+                    rings.append(struct.pack("<I", len(a)) + pts.tobytes())
+                parts.append(struct.pack("<BII", 1, 3, len(rings)) + b"".join(rings))
+            return struct.pack("<BII", 1, 6, len(parts)) + b"".join(parts)
+
+        _sem = asyncio.Semaphore(32)
+
+        async def _tile_pieces(z, x, y):
+            """One tile, walked to through the directories, decoded, filtered to CONUS counties.
+
+            A piece is one county's presence in one tile. The filter runs at decode: county
+            subtype only, land only (is_land is always present in this tileset, measured in
+            the interactive notebook), country US, region not in NOT_CONUS. `division_id`
+            rather than `id`, because `id` names the AREA row and a division can own
+            several; joining on the wrong one silently returns zero rows.
+            """
+            tid, ents = _tile_id(z, x, y), _root
+            blob = None
+            for _ in range(4):  # root + up to three leaf levels
+                e = _find(ents, tid)
+                if e is None:
+                    break
+                if e[3] == 0:
+                    lk = (e[1], e[2])
+                    if lk not in _leaf:
+                        _leaf[lk] = _parse_dir(
+                            gzip.decompress(
+                                await _pm_range(_ld_off + e[1], _ld_off + e[1] + e[2] - 1)
+                            )
+                        )
+                    ents = _leaf[lk]
+                    continue
+                async with _sem:
+                    blob = await _pm_range(_td_off + e[1], _td_off + e[1] + e[2] - 1)
+                break
+            pieces = []
+            if blob is not None:
+                if blob[:2] == b"\x1f\x8b":  # tile_compression says gzip; trust the bytes
+                    blob = gzip.decompress(blob)
+                feats, extent = _division_areas(blob)
+                for props, polys in feats:
+                    if props.get("subtype") != "county":
+                        continue
+                    if props.get("is_land") is not True or not polys:
+                        continue
+                    if props.get("country") != "US":
+                        continue
+                    region = (props.get("region") or "").split("-", 1)[-1]
+                    if region in NOT_CONUS:
+                        continue
+                    pieces.append(
+                        {
+                            "id": props.get("division_id") or props.get("id"),
+                            "name": props.get("@name"),
+                            "region": region,
+                            "wkb": _feature_wkb(polys, z, x, y, extent),
+                        }
+                    )
+            return pieces
+
+        def _mtile(lon, lat, z):
+            """lon/lat -> tile x, y at z, clamped to the grid."""
+            n = 1 << z
+            xx = min(n - 1, max(0, int((lon + 180.0) / 360.0 * n)))
+            la = min(85.05, max(-85.05, lat))
+            yy = (
+                1.0
+                - math.log(math.tan(math.radians(la)) + 1.0 / math.cos(math.radians(la)))
+                / math.pi
+            ) / 2.0
+            return xx, min(n - 1, max(0, int(yy * n)))
+
+        _x0, _y0 = _mtile(BOX[0], BOX[3], COUNTY_Z)
+        _x1, _y1 = _mtile(BOX[2], BOX[1], COUNTY_Z)
+        _parts = await asyncio.gather(
+            *(
+                _tile_pieces(COUNTY_Z, xx, yy)
+                for yy in range(_y0, _y1 + 1)
+                for xx in range(_x0, _x1 + 1)
             )
         )
+        _rows = [p for tp in _parts for p in tp]
+        _t_fetch = _ctime.perf_counter() - _ct0
 
-    def _varint(buf, i):
-        r = s = 0
-        while True:
-            c = buf[i]
-            i += 1
-            r |= (c & 0x7F) << s
-            if not c & 0x80:
-                return r, i
-            s += 7
-
-    def _parse_dir(buf):
-        """A PMTiles v3 directory: four varint columns, tile ids delta-encoded."""
-        n, i = _varint(buf, 0)
-        ids, last = [0] * n, 0
-        for k in range(n):
-            v, i = _varint(buf, i)
-            last += v
-            ids[k] = last
-        runs = [0] * n
-        for k in range(n):
-            runs[k], i = _varint(buf, i)
-        lens = [0] * n
-        for k in range(n):
-            lens[k], i = _varint(buf, i)
-        offs = [0] * n
-        for k in range(n):
-            v, i = _varint(buf, i)
-            offs[k] = (offs[k - 1] + lens[k - 1]) if v == 0 and k > 0 else v - 1
-        return list(zip(ids, offs, lens, runs))
-
-    def _tile_id(z, x, y):
-        """z/x/y -> PMTiles v3 tile id: Hilbert order within a level, levels stacked."""
-        acc = sum((1 << t) * (1 << t) for t in range(z))
-        n = 1 << z
-        d, s = 0, n >> 1
-        while s > 0:
-            rx = 1 if x & s else 0
-            ry = 1 if y & s else 0
-            d += s * s * ((3 * rx) ^ ry)
-            if ry == 0:
-                if rx == 1:
-                    x, y = s - 1 - x, s - 1 - y
-                x, y = y, x
-            s >>= 1
-        return acc + d
-
-    def _find(entries, tid):
-        """Binary search, falling back to the run that COVERS tid."""
-        lo, hi = 0, len(entries) - 1
-        while lo <= hi:
-            m = (lo + hi) // 2
-            if tid < entries[m][0]:
-                hi = m - 1
-            elif tid > entries[m][0]:
-                lo = m + 1
-            else:
-                return entries[m]
-        if hi >= 0 and (entries[hi][3] == 0 or tid - entries[hi][0] < entries[hi][3]):
-            return entries[hi]
-        return None
-
-    _hdr = await _pm_range(0, 126)
-    assert _hdr[:7] == b"PMTiles" and _hdr[7] == 3, "not a PMTiles v3 archive"
-    _rd_off, _rd_len, _, _, _ld_off, _, _td_off, _ = struct.unpack("<8Q", _hdr[8:72])
-    assert COUNTY_Z <= _hdr[101], "COUNTY_Z above the pyramid"
-    _root = _parse_dir(gzip.decompress(await _pm_range(_rd_off, _rd_off + _rd_len - 1)))
-    _leaf = {}
-
-    def _fields(buf):
-        """Iterate (field_number, wire_type, value) over one protobuf message."""
-        i, n = 0, len(buf)
-        while i < n:
-            key, i = _varint(buf, i)
-            f, w = key >> 3, key & 0x7
-            if w == 0:
-                v, i = _varint(buf, i)
-            elif w == 2:
-                ln, i = _varint(buf, i)
-                v = buf[i : i + ln]
-                i += ln
-            elif w == 5:
-                v = buf[i : i + 4]
-                i += 4
-            elif w == 1:
-                v = buf[i : i + 8]
-                i += 8
-            else:
-                raise ValueError(f"wire type {w}")
-            yield f, w, v
-
-    def _value(buf):
-        """An MVT Value message: exactly one of its fields is set."""
-        for f, _w, v in _fields(buf):
-            if f == 1:
-                return v.decode("utf-8")
-            if f == 2:
-                return struct.unpack("<f", v)[0]
-            if f == 3:
-                return struct.unpack("<d", v)[0]
-            if f in (4, 5):
-                return v
-            if f == 6:
-                return (v >> 1) ^ -(v & 1)
-            if f == 7:
-                return bool(v)
-        return None
-
-    def _mvt_rings(geom):
-        """Packed geometry commands -> rings of (x, y) tile coords, closed."""
-        rings, ring = [], None
-        x = y = 0
-        i, n = 0, len(geom)
-        while i < n:
-            cmd, i = _varint(geom, i)
-            op, count = cmd & 0x7, cmd >> 3
-            if op == 1:  # MoveTo: starts a ring
-                for _ in range(count):
-                    dx, i = _varint(geom, i)
-                    dy, i = _varint(geom, i)
-                    x += (dx >> 1) ^ -(dx & 1)
-                    y += (dy >> 1) ^ -(dy & 1)
-                    ring = [(x, y)]
-                    rings.append(ring)
-            elif op == 2:  # LineTo
-                for _ in range(count):
-                    dx, i = _varint(geom, i)
-                    dy, i = _varint(geom, i)
-                    x += (dx >> 1) ^ -(dx & 1)
-                    y += (dy >> 1) ^ -(dy & 1)
-                    ring.append((x, y))
-            elif op == 7:  # ClosePath: repeat the first point
-                ring.append(ring[0])
-            else:
-                raise ValueError(f"geometry op {op}")
-        return rings
-
-    def _area2(ring):
-        """Twice the signed shoelace area: >0 marks an exterior ring (tile y is down)."""
-        a = 0
-        for (x0, y0), (x1, y1) in zip(ring, ring[1:]):
-            a += x0 * y1 - x1 * y0
-        return a
-
-    def _division_areas(tile_buf):
-        """The division_area layer: ([(properties, [(exterior, holes), ...]), ...], extent)."""
-        for f, _w, v in _fields(tile_buf):
-            if f != 3:  # Tile.layers
-                continue
-            name, extent = None, 4096
-            keys, values, feats = [], [], []
-            for lf, _lw, lv in _fields(v):
-                if lf == 1:
-                    name = lv.decode("utf-8")
-                elif lf == 2:
-                    feats.append(lv)
-                elif lf == 3:
-                    keys.append(lv.decode("utf-8"))
-                elif lf == 4:
-                    values.append(_value(lv))
-                elif lf == 5:
-                    extent = lv
-            if name != "division_area":
-                continue
-            out = []
-            for fv in feats:
-                tags, gtype, geom = [], 0, b""
-                for ff, _fw, fvv in _fields(fv):
-                    if ff == 2:
-                        i = 0
-                        while i < len(fvv):
-                            t, i = _varint(fvv, i)
-                            tags.append(t)
-                    elif ff == 3:
-                        gtype = fvv
-                    elif ff == 4:
-                        geom = fvv
-                if gtype != 3:  # not a polygon feature
-                    continue
-                props = {
-                    keys[tags[i]]: values[tags[i + 1]] for i in range(0, len(tags), 2)
-                }
-                polys, cur = [], None
-                for ring in _mvt_rings(geom):
-                    if _area2(ring) > 0:
-                        cur = (ring, [])
-                        polys.append(cur)
-                    elif cur is not None:
-                        cur[1].append(ring)
-                out.append((props, polys))
-            return out, extent
-        return [], 4096
-
-    def _feature_wkb(polys, z, x, y, extent):
-        """Tile-integer rings -> a lon/lat MultiPolygon WKB, closed-form Web Mercator."""
-        n = 1 << z
-        parts = []
-        for ext, holes in polys:
-            rings = []
-            for r in (ext, *holes):
-                a = np.asarray(r, dtype=np.float64)
-                pts = np.empty_like(a)
-                pts[:, 0] = (x + a[:, 0] / extent) / n * 360.0 - 180.0
-                pts[:, 1] = np.degrees(
-                    np.arctan(np.sinh(np.pi * (1.0 - 2.0 * (y + a[:, 1] / extent) / n)))
-                )
-                rings.append(struct.pack("<I", len(a)) + pts.tobytes())
-            parts.append(struct.pack("<BII", 1, 3, len(rings)) + b"".join(rings))
-        return struct.pack("<BII", 1, 6, len(parts)) + b"".join(parts)
-
-    _sem = asyncio.Semaphore(32)
-
-    async def _tile_pieces(z, x, y):
-        """One tile, walked to through the directories, decoded, filtered to CONUS counties.
-
-        A piece is one county's presence in one tile. The filter runs at decode: county
-        subtype only, land only (is_land is always present in this tileset, measured in
-        the interactive notebook), country US, region not in NOT_CONUS. `division_id`
-        rather than `id`, because `id` names the AREA row and a division can own
-        several; joining on the wrong one silently returns zero rows.
-        """
-        tid, ents = _tile_id(z, x, y), _root
-        blob = None
-        for _ in range(4):  # root + up to three leaf levels
-            e = _find(ents, tid)
-            if e is None:
-                break
-            if e[3] == 0:
-                lk = (e[1], e[2])
-                if lk not in _leaf:
-                    _leaf[lk] = _parse_dir(
-                        gzip.decompress(
-                            await _pm_range(_ld_off + e[1], _ld_off + e[1] + e[2] - 1)
-                        )
-                    )
-                ents = _leaf[lk]
-                continue
-            async with _sem:
-                blob = await _pm_range(_td_off + e[1], _td_off + e[1] + e[2] - 1)
-            break
-        pieces = []
-        if blob is not None:
-            if blob[:2] == b"\x1f\x8b":  # tile_compression says gzip; trust the bytes
-                blob = gzip.decompress(blob)
-            feats, extent = _division_areas(blob)
-            for props, polys in feats:
-                if props.get("subtype") != "county":
-                    continue
-                if props.get("is_land") is not True or not polys:
-                    continue
-                if props.get("country") != "US":
-                    continue
-                region = (props.get("region") or "").split("-", 1)[-1]
-                if region in NOT_CONUS:
-                    continue
-                pieces.append(
-                    {
-                        "id": props.get("division_id") or props.get("id"),
-                        "name": props.get("@name"),
-                        "region": region,
-                        "wkb": _feature_wkb(polys, z, x, y, extent),
-                    }
-                )
-        return pieces
-
-    def _mtile(lon, lat, z):
-        """lon/lat -> tile x, y at z, clamped to the grid."""
-        n = 1 << z
-        xx = min(n - 1, max(0, int((lon + 180.0) / 360.0 * n)))
-        la = min(85.05, max(-85.05, lat))
-        yy = (
-            1.0
-            - math.log(math.tan(math.radians(la)) + 1.0 / math.cos(math.radians(la)))
-            / math.pi
-        ) / 2.0
-        return xx, min(n - 1, max(0, int(yy * n)))
-
-    _x0, _y0 = _mtile(BOX[0], BOX[3], COUNTY_Z)
-    _x1, _y1 = _mtile(BOX[2], BOX[1], COUNTY_Z)
-    _parts = await asyncio.gather(
-        *(
-            _tile_pieces(COUNTY_Z, xx, yy)
-            for yy in range(_y0, _y1 + 1)
-            for xx in range(_x0, _x1 + 1)
+        # THE SEAM DISSOLVE. Tile geometry arrives clipped, so one county is several pieces
+        # and the clip edges are straight lines the stroke would draw across the map.
+        # Union-ing per division removes every interior edge; the tile buffer (pieces
+        # overlap slightly past each tile edge) is what makes the union clean.
+        #
+        # con.register, NOT the replacement scan the interactive notebook leans on: marimo
+        # mangles underscore-prefixed cell locals to make them cell-private, so the frame
+        # name never matches the SQL name and DuckDB reports the table as missing.
+        _pieces = pa.table(
+            {
+                "id": pa.array([r["id"] for r in _rows]),
+                "name": pa.array([r["name"] for r in _rows]),
+                "region": pa.array([r["region"] for r in _rows]),
+                "wkb": pa.array([r["wkb"] for r in _rows], pa.binary()),
+            }
         )
-    )
-    _rows = [p for tp in _parts for p in tp]
-    _t_fetch = _ctime.perf_counter() - _ct0
-
-    # THE SEAM DISSOLVE. Tile geometry arrives clipped, so one county is several pieces
-    # and the clip edges are straight lines the stroke would draw across the map.
-    # Union-ing per division removes every interior edge; the tile buffer (pieces
-    # overlap slightly past each tile edge) is what makes the union clean.
-    #
-    # con.register, NOT the replacement scan the interactive notebook leans on: marimo
-    # mangles underscore-prefixed cell locals to make them cell-private, so the frame
-    # name never matches the SQL name and DuckDB reports the table as missing.
-    _pieces = pa.table(
-        {
-            "id": pa.array([r["id"] for r in _rows]),
-            "name": pa.array([r["name"] for r in _rows]),
-            "region": pa.array([r["region"] for r in _rows]),
-            "wkb": pa.array([r["wkb"] for r in _rows], pa.binary()),
-        }
-    )
-    con.register("pm_pieces", _pieces)
-    counties = con.sql("""
-        SELECT id,
-               any_value(name)   AS name,
-               any_value(region) AS region,
-               CAST(ST_AsWKB(ST_Union_Agg(ST_GeomFromWKB(wkb))) AS BLOB) AS wkb
-        FROM pm_pieces
-        GROUP BY id
-    """).to_arrow_table()
-    con.unregister("pm_pieces")
+        con.register("pm_pieces", _pieces)
+        counties = con.sql("""
+            SELECT id,
+                   any_value(name)   AS name,
+                   any_value(region) AS region,
+                   CAST(ST_AsWKB(ST_Union_Agg(ST_GeomFromWKB(wkb))) AS BLOB) AS wkb
+            FROM pm_pieces
+            GROUP BY id
+        """).to_arrow_table()
+        con.unregister("pm_pieces")
+        _how = "fetched"
+        if _cache is not None:
+            _cache.parent.mkdir(parents=True, exist_ok=True)
+            pq.write_table(counties, _cache)
 
     county_stats = (
-        f"{(_x1 - _x0 + 1) * (_y1 - _y0 + 1)} tiles at z{COUNTY_Z} · "
-        f"{len(_rows):,} pieces -> {counties.num_rows:,} counties · "
-        f"fetch {_t_fetch:.1f}s, with dissolve {_ctime.perf_counter() - _ct0:.1f}s"
+        f"{counties.num_rows:,} counties {_how} · "
+        + (
+            f"{(_x1 - _x0 + 1) * (_y1 - _y0 + 1)} tiles at z{COUNTY_Z} · {len(_rows):,} pieces · fetch {_t_fetch:.1f}s, with dissolve "
+            if _rows
+            else ""
+        )
+        + f"{_ctime.perf_counter() - _ct0:.1f}s"
     )
     return counties, county_stats
 
@@ -975,43 +1097,6 @@ def _(
         f"to {np.datetime_as_string(all_times[-1])} UTC ({all_times.size:,} steps) · open {_stime.perf_counter() - _st0:.1f}s"
     )
     return all_times, cube_all, grid_x, grid_y, lat, lon, source_note, store_stats
-
-
-@app.cell
-def _(DAILY_MAX_DAYS, DAYS, HOURLY_MAX_DAYS, all_times, mo):
-    # THE WINDOW FORM. A form, not live controls: every submit is a fold (~20 s for the
-    # analysis), so nothing runs until "load window". Dates are UTC days, inclusive; the
-    # end day is clipped to the newest hour in the store. Limits per mode keep the
-    # frame count and the read honest: hourly is capped at HOURLY_MAX_DAYS (336 frames
-    # at 14), daily at DAILY_MAX_DAYS (a 90-day window is one full store chunk deep,
-    # measured 149 s).
-    import datetime as _dt
-
-    _last = all_times[-1].astype("datetime64[D]").astype(_dt.date)
-    _first = all_times[0].astype("datetime64[D]").astype(_dt.date)
-    window_form = (
-        mo.md("{dates} &nbsp;&nbsp; {mode}")
-        .batch(
-            dates=mo.ui.date_range(
-                start=_first,
-                stop=_last,
-                value=(_last - _dt.timedelta(days=DAYS - 1), _last),
-                label="window (UTC days, inclusive)",
-            ),
-            mode=mo.ui.dropdown(
-                options={
-                    f"hourly, as it comes (max {HOURLY_MAX_DAYS} days)": "hourly",
-                    f"daily mean (max {DAILY_MAX_DAYS} days)": "daily_mean",
-                    f"daily max (max {DAILY_MAX_DAYS} days)": "daily_max",
-                },
-                value=f"hourly, as it comes (max {HOURLY_MAX_DAYS} days)",
-                label="frames",
-            ),
-        )
-        .form(submit_button_label="load window", bordered=False)
-    )
-    window_form
-    return (window_form,)
 
 
 @app.cell
@@ -1199,6 +1284,43 @@ def _(PIVOT, SPAN, con, counties, county_hour, np, slice_mode):
         f"ramp {ramp_lo:.1f} / {ramp_mid:.1f} / {ramp_hi:.1f}"
     )
     return frame_kind, frame_labels, frame_stats, frames, ramp_hi, ramp_lo, ramp_mid
+
+
+@app.cell
+def _(DAILY_MAX_DAYS, DAYS, HOURLY_MAX_DAYS, all_times, mo):
+    # THE WINDOW FORM. A form, not live controls: every submit is a fold (~20 s for the
+    # analysis), so nothing runs until "load window". Dates are UTC days, inclusive; the
+    # end day is clipped to the newest hour in the store. Limits per mode keep the
+    # frame count and the read honest: hourly is capped at HOURLY_MAX_DAYS (336 frames
+    # at 14), daily at DAILY_MAX_DAYS (a 90-day window is one full store chunk deep,
+    # measured 149 s).
+    import datetime as _dt
+
+    _last = all_times[-1].astype("datetime64[D]").astype(_dt.date)
+    _first = all_times[0].astype("datetime64[D]").astype(_dt.date)
+    window_form = (
+        mo.md("{dates} &nbsp;&nbsp; {mode}")
+        .batch(
+            dates=mo.ui.date_range(
+                start=_first,
+                stop=_last,
+                value=(_last - _dt.timedelta(days=DAYS - 1), _last),
+                label="window (UTC days, inclusive)",
+            ),
+            mode=mo.ui.dropdown(
+                options={
+                    f"hourly, as it comes (max {HOURLY_MAX_DAYS} days)": "hourly",
+                    f"daily mean (max {DAILY_MAX_DAYS} days)": "daily_mean",
+                    f"daily max (max {DAILY_MAX_DAYS} days)": "daily_max",
+                },
+                value=f"hourly, as it comes (max {HOURLY_MAX_DAYS} days)",
+                label="frames",
+            ),
+        )
+        .form(submit_button_label="load window", bordered=False)
+    )
+    window_form
+    return (window_form,)
 
 
 @app.cell

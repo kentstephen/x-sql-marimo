@@ -238,3 +238,15 @@ styles, so the whole widget went `display: none`: map gone, fullscreen element g
 class. The `Model not found for key` console line is present from page load and is
 unrelated. Fix: every widget class is now `cf-` prefixed and the states are
 `cf-collapsed` / `cf-picked`.
+
+## Picking, and the seams (2026-08-15, later)
+
+Third flight, ruler on: every click read `pick: none (null)`. deck's GPU picking
+does not work in this setup (marimo shadow DOM, deck 9.3.10, geoarrow layers 0.3.2);
+never did, hover included. Replaced with geometric picking in JS: unproject the click,
+walk the arrow multipolygon offsets to rings, bbox reject, even-odd. Verified in node
+on the real 3,108-county table (index 4 ms, 0.1 ms per lookup, right county at eight
+test points). The seams: counties from z8 tiles leave 1-3 px gaps between fills at
+z10. A same-colour 1 px stroke was tried and declined ("then dont stroke the
+counties"); the geometry-side fix would be z10 tiles (16x the fetch, ~2 px seams
+become sub-pixel).
