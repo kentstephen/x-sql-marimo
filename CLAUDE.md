@@ -7,7 +7,8 @@ Guidance for Claude Code working in this repository. Inherits the global rules i
 
 **Two interactive notebooks are the repo**: deforestation divisions and the terrain
 3D experiment, plus one maintained one-shot (`xsql-deforest-conus-counties.py`, the
-deforestation fold as a static CONUS county choropleth, below). Everything else is in `archive/`, kept for reference and not
+deforestation fold as a static CONUS county choropleth, below) and, since 2026-08-15,
+`xsql-hrrr-counties.py` (HRRR temperature per county as an animated film, below). Everything else is in `archive/`, kept for reference and not
 maintained. (The HFP pair, the flood-buildings experiment, the canopy notebook and
 the fire-risk buildings notebook moved there on 2026-08-13, Stephen's call; their
 full sections live under the archive heading below, undiminished.)
@@ -84,6 +85,66 @@ zero swatch; Stephen turned the stroke OFF). Flown and committed. Things to know
   screenshot pipeline; screenshots come from the live notebook. A pretty title/legend/
   stats export layer was built 2026-08-14 and REVERTED at Stephen's direction (his
   notes before the revert: fit one screen, no rounded corners).
+
+`xsql-hrrr-counties.py` (2026-08-15, BUILT AND HEADLESS-PASSED, NOT YET FLOWN) is
+Stephen's HRRR idea: dynamical.org's hourly HRRR analysis read straight from its Zarr
+with xarray-sql, every pixel labelled with its H3 res 7 cell from the store's own 2-D
+lat/lon (no pyproj), Overture counties polyfilled in DuckDB at the same res, one
+DataFusion join + group by giving 2 m temperature per county per hour for the last
+`DAYS` days, and the WHOLE FILM shipped to the browser once: a bespoke anywidget with
+deck.gl + `@geoarrow/deck.gl-layers` (the layers lonboard renders with) that owns the
+clock (play/pause, scrub, fps, hover, click-to-series chart, all client side; the
+kernel is idle while it plays). Route 2 of the three in `docs/hrrr-counties-notes.md`,
+picked by Stephen ("geoarrow deck.gl if possible"; slices hourly / daily mean / daily
+max; res 7, fall back to 6 on performance; diverging blue-yellow-orange ramp). Things
+to know:
+
+- **Two archives.** The analysis is icechunk v2 in `s3://dynamical-noaa-hrrr` (AWS Open
+  Data, anonymous, NOT on source.coop), chunks 2,160 h x 45 x 45 px: any CONUS window
+  up to 90 days costs about the same fetch (~20 s through xarray-sql; the full 2,160 h
+  depth is 149 s). The 48 h forecast IS on source.coop as plain Zarr v3 (obstore, all
+  49 leads x CONUS in 2.2 s); `SOURCE` in the constants cell switches, the pipeline is
+  identical from the fold on. Both carry `spatial_ref` WKT and 27 variables.
+- **No dask.** The store is opened `chunks=None` (lazily indexed) and xarray-sql cuts
+  it into blocks itself (`cube_chunks`: the whole time window x 45 x 45, one block
+  per store column), which DataFusion pulls in parallel; measured identical to a
+  dask-backed open (20.9 s for 168 h). The block must span the whole window: a block
+  grid narrower than the window decodes each 2,160 h store chunk once per block it
+  touches (measured 111.7 s for the same window with 168 h blocks laid unaligned).
+- **Res 7 is finer than the 3 km pixel** (1.00 px per cell, measured; res 6 is 4.2, res
+  5 is 29), so the fold is a relabel and the polyfill decides which pixel belongs to
+  which county. 3,107 of 3,108 counties catch a pixel (Lexington VA does not; drawn
+  hollow). `pix2c(y, x, county)` is a static lookup built once (879,420 pixel rows);
+  the per-frame SQL is `SELECT t, id, avg(v) FROM cube JOIN pix2c USING (y, x) GROUP
+  BY 1, 2`, 168 frames x CONUS in 19.8 s headless, aggregate nearly free.
+- **The widget's esm.sh imports pin EVERY deck package to one version (9.3.10, the
+  newest at build time) AND pin `?deps=` so that all of them resolve to ONE
+  `@deck.gl/core` module.** esm.sh hashes a module's URL by its deps list, and it
+  resolves the packages' own caret ranges to the newest release: the first flight
+  (2026-08-15) pinned 9.1.14 and died on `geo-layers -> mesh-layers@^9.1.0` landing
+  on 9.3, which asked the 9.1 core for `phongMaterial`. The fix is pin-to-newest plus
+  a crawl of the whole module graph (200 modules: one core, one luma set, one
+  geo-layers; crawler in `docs/hrrr-counties-notes.md`). Re-crawl if any version
+  moves. The fallback if esm.sh misbehaves is a local esbuild bundle (node 26 is
+  installed), lonboard's own approach.
+- **Geometry crosses as one Arrow IPC stream with INTERLEAVED coords**
+  (`multipolygon("xy", coord_type="interleaved")`, one record batch): geoarrow-rust's
+  default is separated `struct<x,y>`, which the JS layers do not read (lonboard
+  converts to interleaved for the same reason). The extension metadata survives
+  pyarrow IPC (verified). Bytes traits kernel -> browser are how lonboard ships its
+  tables, so that direction is proven under marimo; the JS copies the DataView's
+  buffer before viewing it as Float32 (alignment). Browser -> kernel is `clicked`, a
+  Unicode row index, per the proven-trait-types rule.
+- **The map cell builds the widget with geometry only and must not re-run**; the
+  wiring cell pushes `config` (labels, ramp lo/mid/hi, stops, fps, height) then
+  `frames` (float32 F x N, NaN = no pixel) and re-runs freely on the slice dropdown.
+  One ramp per slice: pivot at the median, span to the wider of p2/p98, `PIVOT`/`SPAN`
+  pin them. Daily slices are UTC days (first/last partial for a mid-day window end).
+- Headless: store 2 s, counties 7.6 s, polyfill + lookup 1.5 s, fold 19.8 s, 168 x
+  3,108 frames, ramp 13.6 / 25.3 / 37.0 degC. **NOT FLOWN**: the esm.sh module graph,
+  the deck boot inside marimo's shadow DOM, picking, the frame loop and the chart are
+  all unverified in a browser; the ruler span in the control bar prints deck/boot
+  errors if any. `marimo export html` does not render the widget (same as lonboard).
 
 `xsql-mapterhorn-explorer.py` (EXPERIMENTAL, open defects below) draws Mapterhorn terrain
 worldwide as extruded H3 columns: the DEM half of the parked
