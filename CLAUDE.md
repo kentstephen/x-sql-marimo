@@ -192,12 +192,18 @@ to know:
   of zstd. Do not try obstore for icechunk (same Rust object_store underneath, and no
   seam). The counties are cached as parquet in the OS temp dir (`CACHE_DIR`,
   Stephen: tmp not .cache; None disables): warm run reads them in 0.0 s.
-- Headless: store 2.8 s, counties 7.6 s, polyfill + lookup 1.5 s, fold 19.0 s for
-  159 h (7 UTC days to the newest hour), 159 x 3,108 frames. Flights so far: 9.1.14
-  rendered and played, clicks failed; the fuller HUD at 9.3.10 rendered and played,
-  its top-right buttons froze the notebook and exited fullscreen. **The minimal HUD
-  is unflown.**
-  `marimo export html` does not render the widget (same as lonboard).
+- **Status (2026-08-15, evening): FLOWN AND WORKING, pushed as f95c637.** Map and
+  film play, hide/fullscreen work once the Tailwind `.hidden` collision was fixed,
+  clicking a county outlines it (yellow PathLayer from its own rings; a one-row
+  GeoArrow layer via `table.slice` outlined EVERY county because the layer reads the
+  full offsets under a sliced table) and shows its value and line; clicking it again,
+  or off any county, clears. Headless: store 2.8 s, counties 7.4 s cold / 0.0 s from
+  the tmp cache, polyfill + lookup 1.5-3 s, fold ~20 s for a 7-UTC-day window.
+  Stephen: "probably the coolest notebook I've shared so far, but the slowest";
+  thirty seconds accepted for a LinkedIn demo, no cloud spend, no publishing a
+  derived cube (the idea and its numbers are in the notes). Known: 1-3 px seams
+  between counties at deep zoom (z8 geometry), left as is. `marimo export html` does
+  not render the widget (same as lonboard).
 
 `xsql-mapterhorn-explorer.py` (EXPERIMENTAL, open defects below) draws Mapterhorn terrain
 worldwide as extruded H3 columns: the DEM half of the parked
