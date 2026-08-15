@@ -156,11 +156,23 @@ to know:
   none }`, so the toggle blanked the whole widget, the fullscreen element vanished
   (browser exits fullscreen) and the page read as frozen. Never use a bare
   utility-looking class name in an anywidget here.
-- **NOTHING crosses back to the kernel from the widget.** The fuller HUD synced the
-  clicked county to a `clicked` trait; nothing consumed it and marimo re-runs cells
-  that reference a displayed widget whose value changed, so it is gone. If a
-  per-county number is ever wanted kernel-side, it must not go through a synced
-  trait on the displayed widget.
+- **ONE thing crosses back to the kernel from the widget: `window`.** The fuller HUD
+  synced the clicked county to a `clicked` trait; nothing consumed it and marimo
+  re-runs cells that reference a displayed widget whose value changed, so it is
+  gone. The date range is different: since 2026-08-15 (night) it lives IN THE HUD
+  PANEL (Stephen: "this needs to be in the map, how would anyone see it there"),
+  two `<input type=date>` + mode select + load button, and "load" sets `window`
+  (Unicode JSON `{"d0","d1","mode"}`); marimo re-running the cells that read
+  `film` IS the refold. The widget is wrapped `mo.ui.anywidget(...)` explicitly
+  in the map cell (setattr/getattr forward, so `film.config = ...` still lands);
+  the window cell reads `film.widget.window`, NOT `film.value` (that packs every
+  synced trait, county bytes included). Limits are checked in the JS before send
+  (button disabled with the reason) and again kernel-side (`mo.stop`, the guard).
+  The kernel states span/served window/limits in `config.win`; the JS reflects
+  it on each film. Round trip measured in a headless Chrome via playwright:
+  load pressed -> new 3-day film on screen 25 s later. The old marimo submit form
+  cell is deleted. Anything else per-county wanted kernel-side must still not go
+  through a synced trait.
 - **Picking is GEOMETRIC, in JS, not deck's.** deck's GPU picking returned null for
   every click on three flights here (`pick: none (null)` in the ruler; hover never
   showed either), inside marimo's shadow DOM with deck 9.3.10 + geoarrow layers
@@ -175,10 +187,10 @@ to know:
   quantisation, 1-3 px hairlines at z10, his "gaps btw counties"); a same-colour 1 px
   stroke would hide them and was declined. The other fix, if wanted, is finer county
   geometry (z10 tiles, 16x the fetch), not a stroke.
-- **The window is a submit FORM** (`mo.ui.date_range` + frames-mode dropdown,
-  `.batch(...).form(submit_button_label="load window")`), UTC days inclusive, end
-  clipped to the newest hour; opening default is the last `DAYS` (7) days ending
-  now. Limits per mode: hourly <= `HOURLY_MAX_DAYS` (14; 336 frames), daily mean/max
+- **The window is the HUD's load button** (see the `window` bullet above; the
+  marimo `.form()` cell it replaced was above the map and invisible in practice),
+  UTC days inclusive, end clipped to the newest hour; opening default is the last
+  `DAYS` (7) days ending now. Limits per mode: hourly <= `HOURLY_MAX_DAYS` (14; 336 frames), daily mean/max
   <= `DAILY_MAX_DAYS` (92; the read cost, one full store chunk is 149 s); over the
   limit `mo.stop`s with the reason rather than clamping. The fold is memoised in
   `HOLD` on (SOURCE, t0, t1) so re-submitting the same dates or switching

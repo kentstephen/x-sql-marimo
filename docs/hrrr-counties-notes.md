@@ -250,3 +250,39 @@ test points). The seams: counties from z8 tiles leave 1-3 px gaps between fills 
 z10. A same-colour 1 px stroke was tried and declined ("then dont stroke the
 counties"); the geometry-side fix would be z10 tiles (16x the fetch, ~2 px seams
 become sub-pixel).
+
+## The window control moves onto the map (2026-08-15, night)
+
+Stephen, on the marimo `.form()` cell above the map: "this needs to be in the map,
+how would anyone see it there." (In edit view the form sat between two code cells;
+in app view it was above the map, and either way it was not where anyone looks.)
+
+Now: two `<input type=date>` (min/max = the store's day span), a mode select
+(hourly / daily mean / daily max) and a `load` button in the top-left panel, under
+the county mean. `load` sets ONE Unicode trait, `window` = `{"d0","d1","mode"}`
+JSON, and that is the only thing that ever crosses browser -> kernel. Marimo
+re-runs the cells that reference `film` when the browser sets it; the window cell
+reads `film.widget.window`, the fold reruns (memoised on the window), the frames
+cell, the wiring cell, and the new film lands on `change:frames`. The map cell
+wraps the widget in `mo.ui.anywidget` explicitly so that reactivity is not left to
+the display auto-wrap; setattr/getattr forward, so `film.config = ...` in the wiring
+cell still hits the trait. `film.widget.window`, not `film.value`: the latter
+packs every synced trait, the county IPC bytes included.
+
+Limits (hourly 14 d, daily 92 d) are checked in the JS before sending (button
+disabled, note says why) and still `mo.stop` kernel-side as the guard. The kernel
+puts span / served window / limits in `config.win`, and the JS reflects it whenever
+a film arrives (loading state cleared, fields set to what was actually served, e.g.
+the end clipped to the newest hour). While loading the note reads "loading N days
+· about 20 s…" and the button is disabled.
+
+Measured in a headless Chrome driven by playwright against `marimo run`: initial
+film 7 days / 162 frames; dates set to 08-12..08-14, load pressed, "loading" shown
+at once, subtitle and ruler flipped to "3 days / 72 frames" 25 s later; over-limit
+(45 days hourly) disables the button with the reason and switching to daily max
+re-enables it. `marimo export html` still passes (fold + join 19.5 s).
+
+Also: the DuckDB cell printed `<_duckdb.DuckDBPyConnection ...>` in app view because
+`con.execute(...)` returns the connection and it was the cell's last expression;
+`con.sql(...)` runs INSTALL/LOAD the same and returns None for a non-query (both
+verified on duckdb 1.5.5, extensions load either way).

@@ -31,8 +31,9 @@ renders with) draws the counties from one GeoArrow IPC table and recolours them 
 frame from a Float32Array. The HUD is minimal and ON THE MAP (one hideable panel:
 title, legend, county mean, a clicked county's line; one transport bar), so the deck
 element's own browser fullscreen carries it. Nothing crosses back to the kernel while
-it plays; a submit form above the map (UTC date range + hourly / daily mean / daily
-max, with per-mode limits) is the only thing that reaches back for data.
+it plays; the window control in the panel (UTC date range + hourly / daily mean /
+daily max, with per-mode limits, and a load button) is the only thing that reaches
+back for data, as one Unicode trait.
 
 RES 7 IS FINER THAN THE DATA. A res 7 hex averages 5.16 km2 and an HRRR pixel is 9 km2,
 so the "fold" is a relabel (measured: 1,905,141 cells for 1,905,141 pixels, 1.00 px
@@ -216,7 +217,9 @@ def _(duckdb):
     # DataFusion does the fold and the join, per the engine benchmark in
     # xsql-duckdb-nlcd-h3.py.
     con = duckdb.connect()
-    con.execute("INSTALL h3 FROM community; LOAD h3; INSTALL spatial; LOAD spatial;")
+    # con.sql, not con.execute: execute() returns the connection, which as the last
+    # expression printed as the cell's output; sql() returns None for non-queries.
+    con.sql("INSTALL h3 FROM community; LOAD h3; INSTALL spatial; LOAD spatial;")
     return (con,)
 
 
@@ -228,12 +231,16 @@ def _(anywidget, traitlets):
         Kernel -> browser only: `counties` (one GeoArrow IPC stream: geometry, name,
         state, interleaved coords, the layout the JS layers want), `frames` (Float32Array
         of F x N values, frame-major, NaN = no data) and `config` (JSON: labels, ramp
-        bounds, stops, fps, units, height, title). NOTHING crosses back: the first HUD
-        synced the clicked county to a trait and marimo answered a widget value change
-        by re-running the cells that reference the widget, which pulled the fullscreen
-        element out of the DOM and rebuilt deck (Stephen: buttons "freeze the notebook
-        and exit fullscreen"). Bytes traits kernel -> browser are how lonboard ships
-        its tables, so that direction is proven.
+        bounds, stops, fps, units, height, title, and `win`, the store's day span, the
+        served window and the per-mode limits). Browser -> kernel: `window` only, the
+        HUD's date range + frames mode + load button, as one Unicode JSON trait; marimo
+        answers a widget value change by re-running the cells that reference the
+        widget, which is exactly the fold we want here and nothing else (the map cell
+        that builds the widget references no value of it, so deck survives). The
+        first HUD's `clicked` trait was removed for the same mechanism (a click
+        re-ran the wiring cell for nothing); the clock, the picking and the chart
+        stay client side. Bytes traits kernel -> browser are how lonboard ships its
+        tables, so that direction is proven.
 
         The HUD is inside the map element so the ELEMENT's own browser fullscreen (⛶
         or F, `mapEl.requestFullscreen()`, not marimo's) carries it: one panel top-left
@@ -301,6 +308,11 @@ def _(anywidget, traitlets):
           .cf button.cf-b:hover, .cf select:hover { background: #2b323b; }
           .cf button:focus-visible, .cf select:focus-visible, .cf input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
           .cf .cf-dim { color: var(--dim); }
+          .cf .cf-win { display: flex; flex-wrap: wrap; align-items: center; gap: .3rem .4rem; margin-top: .5rem; padding-top: .45rem; border-top: 1px solid rgba(255,255,255,.08); }
+          .cf .cf-win input[type=date] { background: #22282f; color: var(--ink); border: 1px solid #343b45; padding: .15rem .3rem; font: inherit; color-scheme: dark; min-width: 0; }
+          .cf .cf-win .cf-note { flex-basis: 100%; }
+          .cf .cf-win .cf-note.cf-bad { color: var(--accent); }
+          .cf .cf-win button.cf-load:disabled { opacity: .55; cursor: default; }
           .cf .cf-ruler { position: absolute; right: .6rem; top: .6rem; color: var(--dim); z-index: 5; }
           @media (max-width: 720px) { .cf .cf-stamp { min-width: 0; } .cf .cf-hud.cf-tl { width: calc(100% - 1.2rem); } }
         `;
@@ -337,6 +349,12 @@ def _(anywidget, traitlets):
                     <div class="cf-row"><span class="cf-k cf-cname">–</span><span><span class="cf-num cf-v cf-cval">–</span> <button class="cf-clear" title="clear">×</button></span></div>
                     <canvas class="cf-chart" height="96"></canvas>
                   </div>
+                  <div class="cf-win">
+                    <input type="date" class="cf-d0" title="first UTC day, inclusive" aria-label="window start (UTC day)"><span class="cf-dim">to</span><input type="date" class="cf-d1" title="last UTC day, inclusive" aria-label="window end (UTC day)">
+                    <select class="cf-mode" title="frames"><option value="hourly">hourly</option><option value="daily_mean">daily mean</option><option value="daily_max">daily max</option></select>
+                    <button class="cf-b cf-load" title="fold this window (the kernel refetches; ~20 s)">load</button>
+                    <span class="cf-dim cf-note"></span>
+                  </div>
                   <div class="cf-dim cf-hint">click a county for its value and line · space plays · ← → step</div>
                 </div>
               </div></div>
@@ -356,7 +374,8 @@ def _(anywidget, traitlets):
           const mapEl = q(".cf-map"), playBtn = q(".cf-play"), slider = q(".cf-frame"), ticks = q(".cf-ticks"),
                 stampV = q(".cf-stampv"), stampK = q(".cf-stampk"), fpsSel = q(".cf-fps"), grad = q(".cf-grad"),
                 loEl = q(".cf-lo"), hiEl = q(".cf-hi"), chart = q(".cf-chart"), ruler = q(".cf-ruler"),
-                ttl = q(".cf-ttl"), sub = q(".cf-sub"), meanEl = q(".cf-mean"), cname = q(".cf-cname"), cval = q(".cf-cval");
+                ttl = q(".cf-ttl"), sub = q(".cf-sub"), meanEl = q(".cf-mean"), cname = q(".cf-cname"), cval = q(".cf-cval"),
+                d0In = q(".cf-d0"), d1In = q(".cf-d1"), modeSel = q(".cf-mode"), loadBtn = q(".cf-load"), noteEl = q(".cf-note");
 
           let table = null, N = 0, F = 0, frames = null, colors = null, names = [], states = [];
           let cfg = {}, frame = 0, playing = false, timer = null, deck = null, selected = -1, lut = null;
@@ -465,6 +484,7 @@ def _(anywidget, traitlets):
             loEl.textContent = fmt(cfg.lo); hiEl.textContent = fmt(cfg.hi);
             ttl.textContent = cfg.title || ""; sub.textContent = cfg.subtitle || "";
             stampK.textContent = cfg.frame_kind || "frame";
+            syncWindow();
             // day ticks under the slider: one per label whose date part changes
             const labels = cfg.labels || [];
             let html = "";
@@ -567,6 +587,52 @@ def _(anywidget, traitlets):
             frame = Math.max(0, Math.min(F - 1, Math.round(t * (F - 1)))); update();
           });
 
+          // THE WINDOW CONTROL, on the map. The kernel states the store's day span, the
+          // window it served and the per-mode limits in cfg.win; "load" sends
+          // {d0, d1, mode} back as ONE Unicode trait (`window`), which is the only
+          // thing that ever crosses browser -> kernel here: marimo answers it by
+          // re-running the cells that read it (the window cell, so the fold, so the
+          // frames), and the new film lands on change:frames ~20 s later. Limits are
+          // checked here too, so the button never sends what the kernel would stop.
+          let loading = false;
+          const dayCount = () => {
+            const a = Date.parse(d0In.value), b = Date.parse(d1In.value);
+            return Number.isFinite(a) && Number.isFinite(b) ? Math.round(Math.abs(b - a) / 864e5) + 1 : 0;
+          };
+          function checkWindow() {
+            const w = cfg.win || {};
+            const n = dayCount(), mode = modeSel.value;
+            const lim = mode === "hourly" ? (w.hourly_max || 14) : (w.daily_max || 92);
+            let bad = "";
+            if (!n) bad = "pick both days";
+            else if (n > lim) bad = `${n} days is over the ${lim}-day ${mode.replace("_", " ")} limit`;
+            noteEl.classList.toggle("cf-bad", !!bad);
+            if (loading) noteEl.textContent = `loading ${n} days · about 20 s…`;
+            else noteEl.textContent = bad || `${n} UTC days · ${mode === "hourly" ? n * 24 : n} frames · hourly ≤ ${w.hourly_max || 14} d, daily ≤ ${w.daily_max || 92} d`;
+            loadBtn.disabled = loading || !!bad;
+            return !bad;
+          }
+          function syncWindow() {
+            const w = cfg.win;
+            if (!w) return;
+            d0In.min = d1In.min = w.first || ""; d0In.max = d1In.max = w.last || "";
+            if (w.d0) d0In.value = w.d0;
+            if (w.d1) d1In.value = w.d1;
+            if (w.mode) modeSel.value = w.mode;
+            loading = false; loadBtn.textContent = "load";
+            checkWindow();
+          }
+          d0In.onchange = d1In.onchange = modeSel.onchange = checkWindow;
+          loadBtn.onclick = () => {
+            if (!checkWindow()) return;
+            let d0 = d0In.value, d1 = d1In.value;
+            if (d1 < d0) [d0, d1] = [d1, d0];
+            loading = true; loadBtn.textContent = "loading"; frame = 0; checkWindow();
+            model.set("window", JSON.stringify({d0, d1, mode: modeSel.value}));
+            model.save_changes();
+          };
+          checkWindow();
+
           function select(i) {
             if (!(i >= 0 && i < N)) return;
             selected = i;
@@ -651,6 +717,10 @@ def _(anywidget, traitlets):
         counties = traitlets.Bytes(b"").tag(sync=True)
         frames = traitlets.Bytes(b"").tag(sync=True)
         config = traitlets.Unicode("{}").tag(sync=True)
+        # browser -> kernel, the one thing that crosses back: {"d0","d1","mode"} JSON
+        # from the HUD's load button ("" until the first load, meaning the default
+        # window). Unicode, per the proven-trait-types rule.
+        window = traitlets.Unicode("").tag(sync=True)
 
     return (CountyFilm,)
 
@@ -1100,20 +1170,40 @@ def _(
 
 
 @app.cell
-def _(DAILY_MAX_DAYS, DAYS, HOURLY_MAX_DAYS, SOURCE, all_times, mo, np, window_form):
-    # THE WINDOW, resolved: the form's value once submitted, the last DAYS days before
-    # that. Over the limit stops here with the reason instead of clamping silently.
+def _(DAILY_MAX_DAYS, DAYS, HOURLY_MAX_DAYS, SOURCE, all_times, film, json, mo, np):
+    # THE WINDOW, resolved: the HUD's `window` trait once "load" has been pressed
+    # (marimo re-runs this cell when the browser sets it), the last DAYS days before
+    # that. Over the limit stops here with the reason instead of clamping silently
+    # (the HUD checks the same limits before it sends, so this is the guard, not the
+    # UI). Read the trait off the widget, not film.value: get_anywidget_state packs
+    # every synced trait, the county IPC bytes included.
     import datetime as _wdt
 
     _last = all_times[-1].astype("datetime64[D]").astype(_wdt.date)
-    if window_form.value is None:
+    _first = all_times[0].astype("datetime64[D]").astype(_wdt.date)
+    _req = {}
+    try:
+        _req = json.loads(film.widget.window or "{}")
+    except ValueError:
+        _req = {}
+    if _req.get("d0") and _req.get("d1"):
+        _d0 = max(_first, min(_last, _wdt.date.fromisoformat(_req["d0"])))
+        _d1 = max(_first, min(_last, _wdt.date.fromisoformat(_req["d1"])))
+        slice_mode = _req.get("mode") if _req.get("mode") in ("hourly", "daily_mean", "daily_max") else "hourly"
+    else:
         _d0, _d1 = _last - _wdt.timedelta(days=DAYS - 1), _last
         slice_mode = "hourly"
-    else:
-        _d0, _d1 = window_form.value["dates"]
-        slice_mode = window_form.value["mode"]
     if _d1 < _d0:
         _d0, _d1 = _d1, _d0
+    win_cfg = {
+        "first": _first.isoformat(),
+        "last": _last.isoformat(),
+        "d0": _d0.isoformat(),
+        "d1": _d1.isoformat(),
+        "mode": slice_mode,
+        "hourly_max": HOURLY_MAX_DAYS,
+        "daily_max": DAILY_MAX_DAYS,
+    }
     n_days = (_d1 - _d0).days + 1
     _limit = HOURLY_MAX_DAYS if slice_mode == "hourly" else DAILY_MAX_DAYS
     mo.stop(
@@ -1135,7 +1225,7 @@ def _(DAILY_MAX_DAYS, DAYS, HOURLY_MAX_DAYS, SOURCE, all_times, mo, np, window_f
         f"{np.datetime_as_string(t0, unit='m').replace('T', ' ')}Z to "
         f"{np.datetime_as_string(t1, unit='m').replace('T', ' ')}Z"
     )
-    return n_days, slice_mode, t0, t1, window_note
+    return n_days, slice_mode, t0, t1, win_cfg, window_note
 
 
 @app.cell
@@ -1194,7 +1284,7 @@ def _(RES, con, coordinates_to_cells, counties, grid_x, grid_y, lat, lon, np, pa
 
 @app.cell
 def _():
-    # Kernel-side memo across form submits: the last folded window and its table.
+    # Kernel-side memo across window loads: the last folded window and its table.
     HOLD = {"key": None, "county_hour": None, "stats": ""}
     return (HOLD,)
 
@@ -1287,43 +1377,6 @@ def _(PIVOT, SPAN, con, counties, county_hour, np, slice_mode):
 
 
 @app.cell
-def _(DAILY_MAX_DAYS, DAYS, HOURLY_MAX_DAYS, all_times, mo):
-    # THE WINDOW FORM. A form, not live controls: every submit is a fold (~20 s for the
-    # analysis), so nothing runs until "load window". Dates are UTC days, inclusive; the
-    # end day is clipped to the newest hour in the store. Limits per mode keep the
-    # frame count and the read honest: hourly is capped at HOURLY_MAX_DAYS (336 frames
-    # at 14), daily at DAILY_MAX_DAYS (a 90-day window is one full store chunk deep,
-    # measured 149 s).
-    import datetime as _dt
-
-    _last = all_times[-1].astype("datetime64[D]").astype(_dt.date)
-    _first = all_times[0].astype("datetime64[D]").astype(_dt.date)
-    window_form = (
-        mo.md("{dates} &nbsp;&nbsp; {mode}")
-        .batch(
-            dates=mo.ui.date_range(
-                start=_first,
-                stop=_last,
-                value=(_last - _dt.timedelta(days=DAYS - 1), _last),
-                label="window (UTC days, inclusive)",
-            ),
-            mode=mo.ui.dropdown(
-                options={
-                    f"hourly, as it comes (max {HOURLY_MAX_DAYS} days)": "hourly",
-                    f"daily mean (max {DAILY_MAX_DAYS} days)": "daily_mean",
-                    f"daily max (max {DAILY_MAX_DAYS} days)": "daily_max",
-                },
-                value=f"hourly, as it comes (max {HOURLY_MAX_DAYS} days)",
-                label="frames",
-            ),
-        )
-        .form(submit_button_label="load window", bordered=False)
-    )
-    window_form
-    return (window_form,)
-
-
-@app.cell
 def _(
     ArroArray,
     ArroTable,
@@ -1332,6 +1385,7 @@ def _(
     counties,
     from_wkb,
     io,
+    mo,
     multipolygon,
     pa,
     pa_ipc,
@@ -1371,7 +1425,10 @@ def _(
     _sink = io.BytesIO()
     with pa_ipc.new_stream(_sink, _tbl.schema) as _w:
         _w.write_table(_tbl)
-    film = CountyFilm(counties=_sink.getvalue())
+    # mo.ui.anywidget explicitly, not marimo's display auto-wrap: the `window` trait
+    # set from the HUD must re-run the cells that read `film`, and setattr/getattr
+    # forward to the widget so `film.config = ...` still lands on the trait.
+    film = mo.ui.anywidget(CountyFilm(counties=_sink.getvalue()))
     film
     return (film,)
 
@@ -1395,6 +1452,7 @@ def _(
     ramp_lo,
     ramp_mid,
     source_note,
+    win_cfg,
     window_note,
 ):
     # THE WIRING: re-runs on every window/slice change and only pushes JSON + bytes at
@@ -1414,6 +1472,7 @@ def _(
             "subtitle": f"{window_note} · {n_days} days · {frame_kind}",
             "frame_kind": frame_kind,
             "meta": f"{fold_stats} · {frame_stats}",
+            "win": win_cfg,
             "autoplay": False,
         }
     )
