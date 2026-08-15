@@ -133,6 +133,41 @@ def _():
 def _(mo):
     mo.md(r"""
     [![Open in molab](https://molab.marimo.io/molab-shield.svg)](https://molab.marimo.io/github/github.com/kentstephen/x-sql-marimo/blob/main/xsql-hrrr-counties.py)
+
+    # HRRR temperature by county, as a film
+
+    Hourly 2 m air temperature for every county in the lower 48, played as an animated
+    map. Each frame is one hour (or one UTC day, as a mean or a max); each county's
+    colour is the mean of the HRRR pixels inside it. Pick a window, press load, press
+    play.
+
+    **Where the numbers come from.** The weather is [dynamical.org](https://dynamical.org/)'s
+    Zarr build of NOAA's HRRR analysis (3 km, hourly, CONUS, CC-BY 4.0), read
+    anonymously from the AWS Open Data bucket `s3://dynamical-noaa-hrrr`. Counties are
+    Overture Maps divisions, read from Overture's PMTiles. Nothing is precomputed and
+    nothing sits between this notebook and those two buckets.
+
+    **What the notebook does with them.** The HRRR store is queried with
+    [xarray-sql](https://github.com/alxmrs/xarray-sql), which lets DataFusion treat the
+    Zarr cube as a table. Every pixel is labelled with its H3 res 7 cell straight from
+    the store's own latitude/longitude arrays (no reprojection); the counties are
+    dissolved and polyfilled to the same H3 resolution in DuckDB; one join and one
+    `GROUP BY` give temperature per county per hour. Res 7 hexes (about 5 km²) are
+    finer than the 3 km pixels, so the H3 step is a relabel, not an average: the county
+    mean is the honest mean of the pixels that fall inside it, each counted once.
+
+    **Why it plays smoothly.** The result is small (3,108 counties × a few hundred
+    hours), so the whole film is sent to the browser once as a Float32 matrix and the
+    browser owns the clock. The map is deck.gl with the GeoArrow layers, in a small
+    custom widget; the kernel does nothing while it plays. The only thing that reaches
+    back to Python is the load button.
+
+    **What it costs.** About thirty seconds from a cold start to the first frame, most
+    of it the fold: dynamical's archive is chunked for time series (each 45 × 45 pixel
+    chunk is 2,160 hours deep), so any window inside the current 90 days downloads the
+    same ~0.4 GB. That is the price of computing on the fly, and it is why the window
+    is a form and not a live slider. The county geometry is cached on disk after the
+    first run.
     """)
     return
 
@@ -177,7 +212,7 @@ def _():
     # Disk cache for the dissolved counties, which never change between runs: ~7.3 s
     # of the ~30 s before the map (1,008 ranged GETs + the Python MVT decode; the
     # dissolve itself is 0.1 s). In the OS temp dir, so the system cleans it up
-    # (Stephen: tmp, not .cache). None turns it off.
+    # (tmp, deliberately, not a project .cache). None turns it off.
     import tempfile as _tempfile
 
     CACHE_DIR = str(_tempfile.gettempdir()) + "/x-sql-marimo"
@@ -1418,6 +1453,20 @@ def _(PIVOT, SPAN, con, counties, county_hour, np, slice_mode):
         ramp_lo,
         ramp_mid,
     )
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    **Using the map.** Space plays, arrows step, drag the slider to scrub, `H` hides the
+    panel, `F` or ⛶ goes fullscreen (the panel comes along). Click a county for its
+    value and its line over the window; click it again, or empty ground, to clear.
+    The window control in the panel takes UTC days, inclusive; hourly windows are
+    limited to 14 days (336 frames), daily windows to 92. Load refetches and refolds,
+    about twenty seconds. The colour ramp is blue to yellow to orange, pivoting on the
+    window's median temperature; grey means no HRRR pixel fell inside the county.
+    """)
+    return
 
 
 @app.cell
