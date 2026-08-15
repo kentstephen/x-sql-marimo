@@ -129,6 +129,16 @@ def _():
     )
 
 
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(
+        r"""
+    [![Open in molab](https://molab.marimo.io/molab-shield.svg)](https://molab.marimo.io/github/github.com/kentstephen/x-sql-marimo/blob/main/xsql-hrrr-counties.py)
+    """
+    )
+    return
+
+
 @app.cell
 def _():
     # ------------------------------------------------------------------ the weather
