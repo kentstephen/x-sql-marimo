@@ -524,8 +524,10 @@ def _(math):
     # box, and folding all of it at the flat view's resolution is what made the
     # parked notebook overread 9x. Past PITCH_COARSE the fold steps ONE H3 coarser:
     # the extra ground is in the far field where a cell is subpixel anyway, and one
-    # step is 7x fewer cells, which is what pays for the horizon-ward padding in
-    # _pad. Below the threshold a tilt is mostly cosmetic and the flat ladder holds.
+    # step is 7x fewer cells, which is what pays for the exact camera footprint that
+    # view_to_bbox folds (at pitch 60 it is ~7.5x the flat box's area, measured by
+    # its own ray-cast, so one step holds the cell count roughly level). Below the
+    # threshold a tilt is mostly cosmetic and the flat ladder holds.
     PITCH_COARSE = 35.0
 
     def res_for_view(z, pitch, off=0):
@@ -541,13 +543,16 @@ def _(math):
     # headless runs, where no browser ever reports in.
     VIEW_W, VIEW_H = 1400, 620
 
-    # The SYMMETRIC part of the padding only. The canopy notebook's flat PAD 1.5
-    # stood in for pitch here at first, and a fullscreen pitched view over Tibet
-    # showed exactly what the parked notebook's "PITCH EATS THE PADDING" note
-    # predicted: a band of missing cells along the horizon, because the trapezoid a
-    # tilted camera sees runs far past the flat box. The pitch handling now lives in
-    # _pad explicitly (horizon-ward extension along the bearing) and in res_for_view
-    # (one step coarser when tilted), so the symmetric pad drops back to 1.35.
+    # SYMMETRIC slack around the camera footprint, nothing more. The canopy
+    # notebook's flat PAD 1.5 stood in for pitch here at first, and a fullscreen
+    # pitched view over Tibet showed exactly what the parked notebook's "PITCH EATS
+    # THE PADDING" note predicted: a band of missing cells along the horizon. A
+    # heuristic horizon extension (1.5 view-heights x sin(pitch)) came next and
+    # still fell short at pitch 60 (2.36 view-heights past the centre, 2.5 widths
+    # wide, is what deck's camera really sees). Since 2026-08-15 view_to_bbox
+    # ray-casts deck's own camera model, so the fold box is the ground on screen
+    # at any pitch, bearing and canvas size, and PAD is only the margin that lets
+    # a nudge or a small orbit ride on the fold in hand.
     PAD = 1.35
 
     SETTLE = 0.2
@@ -1286,21 +1291,59 @@ def _(
             return 0
 
     def view_to_bbox(vs):
-        """Camera -> [W, S, E, N], clamped to the world.
+        """Camera -> [W, S, E, N]: the ground deck's camera ACTUALLY SEES, exact.
 
-        Web Mercator flat-view arithmetic; the pitch is absorbed by the widened PAD.
-        The size comes from HOLD["wh"], the MEASURED canvas.
+        Not the flat box. Deck's MapView is a pinhole camera 1.5 screen-heights from
+        the focal point (the map centre on the ground) with a half-fov of 18.4
+        degrees, and a pitched camera looks past the flat box toward the horizon:
+        at pitch 60 the top of the screen is 2.36 view-heights BEYOND the centre and
+        the far edge is 2.5 screen-widths wide (measured by this arithmetic, and
+        the reason a tilted fullscreen view opened with a missing band at the
+        horizon and empty far corners under the old sin(pitch) heuristic). So the
+        four screen corners are ray-cast onto the ground plane in the camera's own
+        frame, rotated by the bearing, and their bounding box in Web Mercator is
+        the answer. Pitch 0 collapses to the flat box exactly. The size comes from
+        HOLD["wh"], the MEASURED canvas, so fullscreen changes the footprint too.
+
+        T_MAX caps a corner ray that grazes or misses the ground (deck clamps its
+        far plane the same way): pitch past ~71.6 degrees would otherwise send the
+        far edge to infinity. Deck's default max pitch is 60, where the top corners
+        sit at t = 2.37 camera-distances, well inside the cap.
         """
         import math as _m
 
         vw, vh = HOLD["wh"]
-        span = 360.0 * vw / (512 * 2**vs.zoom)
-        lat_span = span * (vh / vw) * _m.cos(_m.radians(vs.latitude))
+        scale = 512.0 * 2**vs.zoom  # world width in screen px at this zoom
+        p, brg = _cam(vs)
+        pr, br = _m.radians(p), _m.radians(brg)
+        d = 1.5 * vh  # camera-to-focal distance, screen px
+        cam_z = d * _m.cos(pr)  # camera height above the ground plane
+        cam_y = -d * _m.sin(pr)  # camera sits behind the centre along screen-up
+        T_MAX = 6.0
+        xs, ys = [], []
+        for u in (-vw / 2, vw / 2):
+            for v in (-vh / 2, vh / 2):
+                # Ray from the camera through screen point (u, v), in the frame
+                # x = screen-right, y = screen-up on the ground, z = up.
+                dy = v * _m.cos(pr) + d * _m.sin(pr)
+                dz = v * _m.sin(pr) - d * _m.cos(pr)
+                t = T_MAX if dz >= -1e-9 else min(T_MAX, cam_z / -dz)
+                gx, gy = u * t, cam_y + dy * t
+                # Bearing rotates screen-up clockwise from north.
+                xs.append(gx * _m.cos(br) + gy * _m.sin(br))
+                ys.append(-gx * _m.sin(br) + gy * _m.cos(br))
+        deg_px = 360.0 / scale
+        rad_px = 2 * _m.pi / scale
+        y0 = _m.log(_m.tan(_m.pi / 4 + _m.radians(vs.latitude) / 2))
+
+        def _lat(dn):
+            return _m.degrees(2 * _m.atan(_m.exp(y0 + dn * rad_px)) - _m.pi / 2)
+
         return (
-            max(-180.0, vs.longitude - span / 2),
-            max(-85.0, vs.latitude - lat_span / 2),
-            min(180.0, vs.longitude + span / 2),
-            min(85.0, vs.latitude + lat_span / 2),
+            max(-180.0, vs.longitude + min(xs) * deg_px),
+            max(-85.0, _lat(min(ys))),
+            min(180.0, vs.longitude + max(xs) * deg_px),
+            min(85.0, _lat(max(ys))),
         )
 
     def _cam(vs):
@@ -1310,33 +1353,15 @@ def _(
             float(getattr(vs, "bearing", 0.0) or 0.0),
         )
 
-    def _cam_ok(fold_cam, now_cam):
-        """Is a fold padded for `fold_cam` still honest under `now_cam`?
+    def _pad(b):
+        """The symmetric margin around the footprint, so a nudge does not refold.
 
-        A shallow camera is covered by any fold (the flat box is inside every padded
-        box). A deep tilt needs the fold's horizon extension to have been at least
-        as deep, and pointed the same way: the extension runs along the bearing, so
-        orbiting far enough swings the far field off the folded box.
-        """
-        if now_cam[0] <= 20.0:
-            return True
-        if now_cam[0] > fold_cam[0] + 5.0:
-            return False
-        d = abs(now_cam[1] - fold_cam[1]) % 360.0
-        return min(d, 360.0 - d) <= 15.0
-
-    def _pad(b, vs=None):
-        """PITCH EATS THE PADDING, so the pad follows the camera.
-
-        The parked terrain notebook learned this and grew the box symmetrically; the
-        measured cost there (a 9x overread at the opening view) is why this version
-        grows it WHERE THE CAMERA LOOKS instead. The top of a pitched screen shows
-        ground far beyond the flat box along the bearing, so the box is extended
-        that way by up to 1.5 view-heights, and widened at half that rate because
-        the far field is also wider in world terms than the near field. The cap at
-        60 degrees is because the trapezoid diverges as pitch approaches 90; deck's
-        default max pitch is 60. res_for_view coarsens the fold in the same regime,
-        which is what pays for the extra ground.
+        This used to carry the pitch as well: a horizon-ward extension of 1.5
+        view-heights times sin(pitch), widened 0.25, guessed. view_to_bbox now
+        ray-casts the real camera, so the box IS the ground on screen at any
+        pitch and bearing and the only job left here is PAD's slack. The parked
+        terrain notebook's symmetric 9x overread is what the exact footprint
+        replaces from the other side: no more than the screen shows, plus PAD.
         """
         w, s, e, n = b
         sw_, sh_ = e - w, n - s
@@ -1344,25 +1369,6 @@ def _(
         e += sw_ * (PAD - 1) / 2
         s -= sh_ * (PAD - 1) / 2
         n += sh_ * (PAD - 1) / 2
-        if vs is not None:
-            import math as _m
-
-            p, brg = _cam(vs)
-            if p > 0:
-                ext = 1.5 * _m.sin(_m.radians(min(p, 60.0)))
-                dlon, dlat = _m.sin(_m.radians(brg)), _m.cos(_m.radians(brg))
-                if dlat >= 0:
-                    n += dlat * ext * sh_
-                else:
-                    s += dlat * ext * sh_
-                if dlon >= 0:
-                    e += dlon * ext * sw_
-                else:
-                    w += dlon * ext * sw_
-                w -= 0.25 * ext * sw_
-                e += 0.25 * ext * sw_
-                s -= 0.25 * ext * sh_
-                n += 0.25 * ext * sh_
         return (max(-180.0, w), max(-85.0, s), min(180.0, e), min(85.0, n))
 
     def _covers(box, want):
@@ -1378,10 +1384,10 @@ def _(
         """The echo check: ignore the event the map emits for a view we set ourselves.
 
         Pitch and bearing are IN the comparison here, unlike the canopy notebook it
-        came from, and that is the other half of the horizon fix: the pad and the
-        resolution both follow the camera now, so an orbit or a tilt has to reach
-        _instant, where _cam_ok decides whether the fold in hand still covers it.
-        Orbit frames that stay inside the tolerances cost one cheap check each.
+        came from, and that is the other half of the horizon fix: the footprint and
+        the resolution both follow the camera now, so an orbit or a tilt has to reach
+        _instant, where plain box coverage decides whether the fold in hand still
+        covers the ground on screen. Orbit frames inside PAD cost one cheap check.
         """
         return (
             a is not None
@@ -1432,15 +1438,11 @@ def _(
         cam = _cam(vs)
         res = res_for_view(vs.zoom, cam[0], _res_off())
         seen = view_to_bbox(vs)
-        if (
-            res == HOLD["res"]
-            and _covers(HOLD["box"], seen)
-            and _cam_ok(HOLD["cam"], cam)
-        ):
+        if res == HOLD["res"] and _covers(HOLD["box"], seen):
             set_status(vs)
             return True
         hit = HOLD["cache"].get(res)
-        if hit and _covers(hit[0], seen) and _cam_ok(hit[3], cam):
+        if hit and _covers(hit[0], seen):
             _ensure_paint(hit)
             put_cells(hit[1], hit[2])
             HOLD["res"], HOLD["box"], HOLD["cam"] = res, hit[0], hit[3]
@@ -1455,7 +1457,7 @@ def _(
             return
         cam = _cam(vs)
         res = res_for_view(vs.zoom, cam[0], _res_off())
-        want = _pad(view_to_bbox(vs), vs)
+        want = _pad(view_to_bbox(vs))
         # THE LAST ANSWER STAYS UP UNTIL THERE IS A NEW ONE: the read happens under
         # the columns already on screen and the swap is one trait update.
         HOLD["head"] = f"<b>reading…</b> res {res}"
@@ -1663,8 +1665,8 @@ async def _(
         longitude = HOME["longitude"]
         latitude = HOME["latitude"]
         zoom = HOME["zoom"]
-        # The opening camera is pitched, so the opening fold must be padded and
-        # coarsened for that pitch or the horizon opens with the missing band.
+        # HOME is flat today; if it is ever pitched again the footprint ray-cast in
+        # view_to_bbox and the pitch step in res_for_view cover it unchanged.
         pitch = HOME["pitch"]
         bearing = HOME["bearing"]
 

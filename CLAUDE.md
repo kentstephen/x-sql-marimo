@@ -102,12 +102,20 @@ the fold is xarray-sql + the h3 UDF, `avg(elev)` per cell. Things to know:
   exists at coarse zooms it reads ~0 m (mid-Pacific z4: 99.7% of pixels within 1 m of
   zero). The fold drops `|elev| <= 1` and `elev <= -500`; Death Valley (-86) and the
   Dead Sea shore (-430) survive as signed metres.
-- **Pitch eats the padding AND the resolution.** `_pad` extends the fold box toward
-  the horizon along the bearing (anisotropic, unlike the parked notebook's symmetric
-  9x overread), and pitch >= 35 folds one H3 step coarser to pay for it. `_same_view`
-  includes pitch/bearing, and coverage is gated by `_cam_ok`, or tilting past the
-  folded trapezoid leaves a band of missing cells at the horizon (seen in fullscreen
-  over Tibet before the fix).
+- **The fold box is deck's camera footprint, ray-cast exactly** (2026-08-15).
+  `view_to_bbox` casts the four screen corners of deck's pinhole camera (1.5
+  screen-heights from the focal point, half-fov 18.4 degrees) onto the ground,
+  rotates by the bearing, and takes the Mercator bounding box; pitch 0 collapses
+  to the flat box. It replaced a sin(pitch) horizon heuristic in `_pad` and the
+  `_cam_ok` tolerances (both deleted): at pitch 60 the screen sees 2.37
+  view-heights past the centre and 2.36 widths wide (~7x the flat area) and the
+  heuristic reached ~1.98 heights and ~1.0 widths, which was the missing horizon
+  band and empty far corners on tilt, orbit and fullscreen. `_pad` is now only
+  PAD's symmetric slack; coverage is plain box containment; pitch >= 35 folds
+  one H3 step coarser (7x fewer cells, which is what pays for the ~7x area).
+  Table of footprints per pitch and the frame conventions are in
+  `docs/mapterhorn-explorer-notes.md`. Headless passes (res 4 · 82,387 cells);
+  the flight to run is fullscreen, pitch 60, full orbit.
 - **The ladder** is BASE_RES 7 / ZOOM0 6.2 / PER_RES 1.4, MIN_RES 4, MAX_RES 13, plus
   a `res offset` +/- 2 slider in the panel (commit debounced 350 ms after the thumb
   stops, because Safari and Firefox fire `change` DURING a drag and every stop is a
@@ -146,7 +154,12 @@ the fold is xarray-sql + the h3 UDF, `avg(elev)` per cell. Things to know:
   (Mississippi deep zoom is the test case). (3) The 2026-08-13 rework (serve-path
   repaint, relative colors, new scale controls, res-offset debounce) passes
   headless but none of it has been flown; the `repaint N ms` readout is there to
-  decide whether relative colors is cheap enough to keep.
+  decide whether relative colors is cheap enough to keep. (4) The 2026-08-15
+  camera-footprint fold (above) is committed UNFLOWN; the flight is fullscreen,
+  pitch 60, full orbit. If those folds are too heavy, the next lever is
+  area-based coarsening (steps from the footprint's own area ratio, log base 7)
+  in place of the PITCH_COARSE 35 threshold. Full record in
+  `docs/mapterhorn-explorer-notes.md`.
 
 None of the notebooks import anything from `archive/`: their only dependencies are the
 third-party ones in their PEP 723 headers.
