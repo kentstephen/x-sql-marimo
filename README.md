@@ -224,23 +224,45 @@ collapse.
 ## HRRR temperature by county, as a film
 
 `xsql-hrrr-counties.py` reads [dynamical.org](https://dynamical.org/)'s Zarr build of
-NOAA's HRRR analysis (3 km, hourly, CC-BY 4.0) straight from S3 with
+NOAA's HRRR analysis straight from S3 with
 [xarray-sql](https://github.com/alxmrs/xarray-sql), labels every pixel with its H3
 res 7 cell from the store's own lat/lon, polyfills Overture counties in DuckDB at the
 same res, and one DataFusion join + group by gives 2 m temperature per county per hour
-for a chosen window (a submit form: UTC date range, hourly or daily mean / max, with
-limits). That table is small, so the whole film goes to the browser once and the
-browser owns the clock: a bespoke anywidget on deck.gl + `@geoarrow/deck.gl-layers`
-recolours the counties per frame from a Float32Array, and the dashboard (transport,
-legend, live per-frame stats, warmest and coolest counties, a clicked county's
-series, display settings) is drawn on the map itself, hideable, so the map's own
-browser fullscreen carries all of it. The kernel is idle while it plays. Res 7 is
-finer than the 3 km pixel, so the fold is a relabel here; the county mean is the
-honest mean of its pixels. Cold start to first frame is about thirty seconds, most of
-it the ~20 s fold (the archive is time-optimised, so any window downloads the whole
-current 90-day layer, ~0.44 GB); the dissolved counties are cached as one parquet in
-the OS temp dir after the first run. Notes and measurements:
+for a chosen window (a control in the map's panel: UTC date range, hourly or daily
+mean / max, with limits, and a load button). That table is small, so the whole film
+goes to the browser once and the browser owns the clock: a bespoke anywidget on
+deck.gl + `@geoarrow/deck.gl-layers` recolours the counties per frame from a
+Float32Array, and the minimal dashboard (title, legend, county mean, a clicked
+county's value and series, the window control; a transport bar) is drawn on the map
+itself, hideable, so the map's own browser fullscreen carries all of it. The kernel
+is idle while it plays; the only thing that reaches back to it is the load button.
+Res 7 is finer than the 3 km pixel, so the fold is a relabel here; the county mean
+is the honest mean of its pixels. Cold start to first frame is about thirty seconds,
+most of it the ~20 s fold (the archive is time-optimised, so any window downloads
+the whole current 90-day layer, ~0.44 GB); the dissolved counties are cached as one
+parquet in the OS temp dir after the first run. Notes and measurements:
 `docs/hrrr-counties-notes.md`.
+
+### The data
+
+The weather is **[dynamical.org](https://dynamical.org/)'s NOAA HRRR analysis**
+(`noaa-hrrr-analysis`, v0.2.0), NOAA's 3 km hourly CONUS analysis republished as an
+icechunk / Zarr store, CC-BY 4.0. Credit to dynamical.org for the store and to NOAA
+for the model. Note where it lives, because it is not where the rest of this repo
+reads from: the analysis is in dynamical's own bucket on the AWS Open Data programme,
+
+```
+s3://dynamical-noaa-hrrr/noaa-hrrr-analysis/v0.2.0.icechunk/
+```
+
+anonymous, us-west-2. It is **not on Source Cooperative**. Dynamical's 48-hour
+forecast (`noaa-hrrr-forecast-48-hour`, plain Zarr v3) *is* on Source Cooperative
+under `s3://us-west-2.opendata.source.coop/dynamical/`, and the notebook can be
+pointed at it with `SOURCE = "forecast"` in the constants cell; the default, and
+everything above, is the analysis from the AWS Open Data bucket. Both stores carry
+the full CRS (`spatial_ref`) and 2-D lat/lon coordinates, which is why the fold
+needs no pyproj. Counties are Overture divisions from the same PMTiles build as the
+deforestation notebook.
 
 ## The terrain explorer (experimental, use caution)
 
