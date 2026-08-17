@@ -733,6 +733,8 @@ def _(anywidget, traitlets):
             if (!(i >= 0 && i < N)) return;
             selected = i;
             root.classList.add("hf-picked");
+            // a pick opens a folded panel: the cell's value and line live in the body
+            if (root.classList.contains("hf-collapsed")) { root.classList.remove("hf-collapsed"); q(".hf-toggle").textContent = "hide"; }
             const c = cidx && cidx[i] !== 65535 ? names[cidx[i]] : null;
             cname.textContent = c ? `cell in ${c}` : `cell ${hexes[i]}`;
             update();
