@@ -346,7 +346,7 @@ def _(anywidget, traitlets):
                 font: 12px/1.35 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--ink); background: #0f1216; }
           .hf * { box-sizing: border-box; }
           .hf .hf-num { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
-          .hf .hf-map { position: relative; width: 100%; background: #e8e8e4; overflow: hidden; }
+          .hf .hf-map { position: relative; width: 100%; background: #0b0d10; overflow: hidden; }
           .hf .hf-map:fullscreen { height: 100vh !important; width: 100vw; }
           .hf .hf-hud { position: absolute; z-index: 5; }
           .hf .hf-hud.hf-tl { top: .6rem; left: .6rem; width: 22rem; max-width: calc(100% - 1.2rem); }
@@ -581,14 +581,14 @@ def _(anywidget, traitlets):
             const k = frame * N + index;
             if (field === "load") {
               const qv = load ? load[k] : 255;
-              if (qv === 255) { target[0] = 120; target[1] = 124; target[2] = 130; target[3] = 60; return target; }
+              if (qv === 255) { target[0] = 40; target[1] = 44; target[2] = 50; target[3] = 60; return target; }
               let t = (qv / 10) / loadHi; if (t > 1) t = 1;
               const j = Math.round(t * 255) * 3;
               target[0] = lutL[j]; target[1] = lutL[j + 1]; target[2] = lutL[j + 2]; target[3] = 60 + Math.round(175 * t);
               return target;
             }
             const qv = frames[k];
-            if (qv === 255) { target[0] = 120; target[1] = 124; target[2] = 130; target[3] = 60; return target; }
+            if (qv === 255) { target[0] = 40; target[1] = 44; target[2] = 50; target[3] = 60; return target; }
             let t = (HI_OF(qv) - cfg.lo) / (cfg.hi - cfg.lo); t = t < 0 ? 0 : t > 1 ? 1 : t;
             const j = Math.round(t * 255) * 3;
             target[0] = lutI[j]; target[1] = lutI[j + 1]; target[2] = lutI[j + 2]; target[3] = 225;
@@ -602,9 +602,10 @@ def _(anywidget, traitlets):
             },
           });
           function layers() {
-            // Positron (light), not dark matter: the load ramp runs down to black, which
-            // vanishes on a dark ground; the index ramp's pale pivot reads on either.
-            const out = [tiles("base", "https://basemaps.cartocdn.com/light_nolabels/{z}/{x}/{y}.png", 1.0)];
+            // Dark matter (Stephen's call after a Positron round: the sustained-heat ramp
+            // runs down to black, but the low end is drawn faint, alpha 60, and the dark
+            // ground reads better under the film).
+            const out = [tiles("base", "https://basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}.png", 1.0)];
             if (N && frames) {
               out.push(new H3HexagonLayer({
                 id: "cells",
@@ -625,7 +626,7 @@ def _(anywidget, traitlets):
                 pickable: false,
               }));
             }
-            out.push(tiles("labels", "https://basemaps.cartocdn.com/light_only_labels/{z}/{x}/{y}.png", 0.8));
+            out.push(tiles("labels", "https://basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}.png", 0.6));
             return out;
           }
 
@@ -1321,12 +1322,21 @@ def _(
     np,
     pa,
 ):
-    # Res 8 and finer: 10M+ cells, ~1.7 billion answers a week, no machine and no
-    # browser this notebook targets. Stop with the reason instead of starting a fold
-    # that never ends (the res 7 spill lesson, above).
+    # Res 7 and finer: stop with the reasons instead of starting a fold that never
+    # ends. Coverage: a res 7 hex (5.2 km2) is smaller than the 3 km pixel, so only
+    # 879k of the 1.47M land cells contain a pixel centre and ~40% of the map is
+    # holes (flown 2026-08-17: "a lot of gaps between the cells"); res 8 is 7x
+    # worse. Memory: a week at res 7 is 248M (hour, cell) answers, ~35 GB of
+    # DataFusion aggregate state (res 6: 35M, ~5 GB with the pool).
     mo.stop(
-        int(RES) > 7,
-        mo.md(f"**RES {RES} is past the limit for this notebook (7).** Res 7 is the HRRR pixel itself; set RES to 7 or coarser."),
+        int(RES) >= 7,
+        mo.md(
+            f"**RES {RES} is too fine for this notebook: set RES to 6 or coarser.** "
+            f"Two reasons. Coverage: a res {RES} hexagon is smaller than the 3 km HRRR pixel, so most "
+            f"cells hold no pixel centre and the map is mostly holes (res 7: ~40% empty). Memory: a "
+            f"week at res 7 is 248M hour-cell answers, ~35 GB of aggregate state in the kernel "
+            f"(res 6: 35M, ~5 GB). Res 6 over a smaller BOX is the way to see finer weather."
+        ),
     )
     # PIXEL -> CELL, ONCE, AND THE LAND MASK. Cell per pixel from the store's own
     # lat/lon; CONUS land = the res 6 cells whose centre falls in a county (DuckDB
