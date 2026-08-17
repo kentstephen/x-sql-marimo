@@ -195,12 +195,13 @@ def _():
     # on record) all sit in the full chunk, so as presets they cost ~2 min:
     #   DAYS = ("2026-07-06", "2026-07-12")   # West dome, Salt Lake City 109 F Jul 12
     #   DAYS = ("2026-06-29", "2026-07-05")   # East dome, Atlantic City 106 F Jul 4
-    #   DAYS = 7                              # the last week, ~30 s while the chunk is young
-    # The opening window is the late-July dome: in a block-sampled scan of the store
-    # (one 45x45 column in every third, Jun 15 to Aug 17) it is the summer's CONUS-wide
-    # peak, the largest share of land pixels over 35 degC (0.22-0.24 on Jul 25-27
-    # against 0.13 for the West dome's Jul 8-12) and the highest CONUS-mean day (Jul 27).
-    DAYS = ("2026-07-23", "2026-07-29")   # Plains dome, Rapid City 112 F Jul 26; ~2 min
+    #   DAYS = ("2026-07-23", "2026-07-29")   # Plains dome, Rapid City 112 F Jul 26: in a
+    #       block-sampled scan of the store (one 45x45 column in every third, Jun 15 to
+    #       Aug 17) the summer's CONUS-wide peak, the largest share of land pixels over
+    #       35 degC (0.22-0.24 on Jul 25-27 against 0.13 for the West dome's Jul 8-12)
+    #       and the highest CONUS-mean day (Jul 27)
+    # The opening window is the last week: the current chunk, ~30 s while it is young.
+    DAYS = 7
     HOURLY_MAX_DAYS = 14  # 336 frames x 210k cells = 71 MB per field across the bridge
 
     # ------------------------------------------------------------------ the fold
@@ -212,7 +213,14 @@ def _():
     # under a GB, 5 MB per field, ~250 km2 hexes) is the one-constant retreat, and
     # was flown; the counties film with this accumulator is the fallback after that.
     # Res 7 is the pixel itself (a relabel) and 1.47M cells: no film fits.
-    RES = 7
+    RES = 6
+    # DataFusion memory pool for the fold's final aggregate (one hash entry per
+    # (hour, cell) answer, ~150 B). At res 6 a 3 GB pool holds the process near 5 GB
+    # instead of 9.5, no time cost. AT RES 7 THE POOL MUST BE OFF: 248M answers a week
+    # is ~30 GB of state, and under any pool that fits in RAM DataFusion spills nearly
+    # all of it to disk and merge-sorts it back, which reads as the fold spinning
+    # forever (2026-08-17, Stephen's res 7 demo run). None = unbounded, RAM decides.
+    MEM_POOL_GB = 3 if RES <= 6 else None
 
     # ------------------------------------------------------------------ the land mask
     # Overture's PMTiles build of the pinned release, same object, box, zoom and
@@ -262,6 +270,7 @@ def _():
         INDEX_STOPS,
         LOAD_STOPS,
         MAP_HEIGHT,
+        MEM_POOL_GB,
         NOT_CONUS,
         OVERTURE_RELEASE,
         PIVOT,
@@ -1305,9 +1314,17 @@ def _(
     grid_y,
     lat,
     lon,
+    mo,
     np,
     pa,
 ):
+    # Res 8 and finer: 10M+ cells, ~1.7 billion answers a week, no machine and no
+    # browser this notebook targets. Stop with the reason instead of starting a fold
+    # that never ends (the res 7 spill lesson, above).
+    mo.stop(
+        int(RES) > 7,
+        mo.md(f"**RES {RES} is past the limit for this notebook (7).** Res 7 is the HRRR pixel itself; set RES to 7 or coarser."),
+    )
     # PIXEL -> CELL, ONCE, AND THE LAND MASK. Cell per pixel from the store's own
     # lat/lon; CONUS land = the res 6 cells whose centre falls in a county (DuckDB
     # polyfill, 'center' rule, so each cell has exactly one county, which is the click
@@ -1396,6 +1413,7 @@ def _():
 @app.cell
 def _(
     HOLD,
+    MEM_POOL_GB,
     READ_RAIN,
     READ_WIND,
     VARS,
@@ -1425,14 +1443,18 @@ def _(
         _ft0 = _ftime.perf_counter()
         _cube = cube_all.sel(t=slice(t0, t1))
         _hours = int(_cube.sizes["t"])
-        # A 3 GB fair spill pool: the final aggregate holds one entry per (hour, cell)
-        # answer until the last block lands (35M at res 6), and over the pool it spills
-        # to the temp dir instead of growing; measured ~5 GB process peak against 9.5
-        # without, same ~28 s. (A smaller pool spilled more and measured HIGHER; spill
-        # buffers live outside it.)
+        # A fair spill pool (MEM_POOL_GB, constants cell): the final aggregate holds one
+        # entry per (hour, cell) answer until the last block lands (35M at res 6), and
+        # over the pool it spills to the temp dir instead of growing; measured ~5 GB
+        # process peak against 9.5 without, same ~28 s at res 6. A pool that is small
+        # against the state (any pool at res 7) spills nearly everything and crawls.
         from datafusion import RuntimeEnvBuilder as _RTB, SessionConfig as _SC
 
-        ctx = XarrayContext(_SC(), _RTB().with_fair_spill_pool(3 << 30))
+        ctx = (
+            XarrayContext(_SC(), _RTB().with_fair_spill_pool(int(MEM_POOL_GB * (1 << 30))))
+            if MEM_POOL_GB
+            else XarrayContext()
+        )
         # Broadcast the pixel lookup to every block partition (CollectLeft) instead of
         # re-hashing the cube by (y, x): with the default Partitioned join a cell's
         # pixels scatter across partitions and every partition's partial aggregate
