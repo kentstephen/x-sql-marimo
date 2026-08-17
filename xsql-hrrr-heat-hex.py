@@ -215,7 +215,11 @@ def _():
     # million people under major or extreme heat risk, Atlantic City 106 F on Jul 4,
     # daily records in Boston, Philadelphia and Washington on Jul 2; storms broke it up
     # Jul 4-6). Humid, so the heat index is the right lens, and the nights are the story.
-    DAYS = ("2026-06-29", "2026-07-05")   # East dome; a full chunk, ~2 min
+    # Since 2026-08-17 (evening) it opens on the Plains dome instead: the hottest
+    # 7-day CONUS-wide stretch in the store's span (Oct 2014 on). July 2026 is
+    # NOAA's hottest CONUS month in the 132-year record (76.9 F), and the store's own
+    # scan puts the CONUS-wide peak at Jul 25-27.
+    DAYS = ("2026-07-23", "2026-07-29")   # Plains dome; a full chunk, ~2 min
     HOURLY_MAX_DAYS = 14  # 336 frames x 210k cells = 71 MB per field across the bridge
 
     # ------------------------------------------------------------------ the fold
@@ -629,10 +633,11 @@ def _(anywidget, traitlets):
             },
           });
           function layers() {
-            // Dark matter (Stephen's call after a Positron round: the sustained-heat ramp
-            // runs down to black, but the low end is drawn faint, alpha 60, and the dark
-            // ground reads better under the film).
-            const out = [tiles("base", "https://basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}.png", 1.0)];
+            // No basemap tiles (Stephen, 2026-08-17): a blank near-black canvas (the
+            // .hf-map background, #0b0d10) so the bottom of the inferno load ramp still
+            // reads against it; the Carto dark-matter base it replaced was one line
+            // here (tiles("base", ".../dark_nolabels/{z}/{x}/{y}.png", 1.0)).
+            const out = [];
             if (N && frames) {
               out.push(new H3HexagonLayer({
                 id: "cells",
@@ -653,7 +658,8 @@ def _(anywidget, traitlets):
                 pickable: false,
               }));
             }
-            out.push(tiles("labels", "https://basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}.png", 0.6));
+            // Carto place labels off too (Stephen, 2026-08-17); the line to bring them
+            // back: out.push(tiles("labels", ".../dark_only_labels/{z}/{x}/{y}.png", 0.6)).
             return out;
           }
 
@@ -805,6 +811,8 @@ def _(anywidget, traitlets):
               parent: mapEl,
               initialViewState: HOME,
               controller: true,
+              // Blank canvas, cleared to the same near-black as .hf-map (no basemap).
+              parameters: {clearColor: [11 / 255, 13 / 255, 16 / 255, 1]},
               layers: layers(),
               onError: e => { ruler.textContent = "deck: " + (e && e.message ? e.message : e); },
             });
