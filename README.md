@@ -13,6 +13,10 @@ uv run marimo edit xsql-deforest-divisions.py --sandbox
 # HRRR 2 m temperature per CONUS county, hour by hour, animated (dashboard on the map)
 uv run marimo edit xsql-hrrr-counties.py --sandbox
 
+# HRRR heat index on H3 hexagons with a browser-side memory (heat load: half-life,
+# threshold, rain flush, wind vent as live sliders); ~30 s to first frame
+uv run marimo edit xsql-hrrr-heat-hex.py --sandbox
+
 # EXPERIMENTAL, use caution: worldwide Mapterhorn terrain as extruded H3 columns.
 # Open defects (res-to-zoom tuning, deep-zoom regional reads unflown); expect rough
 # edges and occasional refolds that cost real bandwidth.
@@ -242,6 +246,27 @@ most of it the ~20 s fold (the archive is time-optimised, so any window download
 the whole current 90-day layer, ~0.44 GB); the dissolved counties are cached as one
 parquet in the OS temp dir after the first run. Notes and measurements:
 `docs/hrrr-counties-notes.md`.
+
+## HRRR heat with a memory
+
+`xsql-hrrr-heat-hex.py` is the counties film's machinery asked a different question:
+not how hot, but how the heat sits. Temperature and relative humidity are folded to
+H3 res 6 over CONUS land (210,724 cells, ~4 pixels each) and turned into the NWS heat
+index per cell per hour; the film crosses to the browser once, and the browser runs
+an accumulator over it, heat load: it rises by how far the heat index sits above a
+threshold and decays with a half-life, so places whose nights do not cool stay
+bright after dark. Half-life, threshold, and (if the fields are read) a rain flush
+and a wind vent are sliders on the map, recomputed over the whole film in the
+browser; the map switches between the index and the load; a click gives a cell's
+line. A week at res 6 is 35M hour-cell answers, which is what sets the kernel's
+memory (~5 GB peak with two DataFusion knobs in the fold cell: a broadcast join and
+a 3 GB spill pool; 17 GB without) and the 35 MB per field to the browser; res 5 is
+the one-constant retreat. The read is the wire: about 28 s for the two variables on
+a ~200 Mbit link for a week in the current store chunk, and only the 523 of 960
+store columns that touch land are fetched (xarray-sql partition pruning). It opens
+on the late-July 2026 Plains heat dome, which sits in a full 90-day chunk and costs
+~2 min; the HUD states the read for whatever dates are picked. Notes:
+`docs/hrrr-heat-hex-notes.md`.
 
 ### The data
 

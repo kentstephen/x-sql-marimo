@@ -13,6 +13,7 @@ requires-python = ">=3.13"
 #                                geoarrow-rust-core
 #   xsql-mapterhorn-explorer.py           adds pillow        (the terrarium WebP decode)
 #   xsql-hrrr-counties.py        adds icechunk (the analysis store), zarr
+#   xsql-hrrr-heat-hex.py        a subset of the counties film's header, nothing new
 dependencies = [
     "anywidget>=0.9",
     "arro3-core",
