@@ -127,6 +127,12 @@ def _(mo):
     mo.md(r"""
     [![Open in molab](https://molab.marimo.io/molab-shield.svg)](https://molab.marimo.io/github/github.com/kentstephen/x-sql-marimo/blob/main/xsql-hrrr-heat-hex.py)
 
+    **Run this one in molab if you can.** The wait here is bandwidth: every window
+    pulls a full 90-day store chunk per variable straight from S3 in us-west-2, and
+    from a home connection (~200 Mbit) that is about two minutes for the opening
+    window and longer with rain and wind on. molab runs next to the bucket, so the
+    same read is a fraction of that. Nothing else changes.
+
     # HRRR heat with a memory
 
     Hourly heat index for the lower 48 on H3 hexagons, played as a film, with a
@@ -161,9 +167,10 @@ def _(mo):
     the pace. A week in the current, part-filled chunk is about thirty seconds for
     two variables on a ~200 Mbit link; the opening window (the eastern heat dome of
     Jun 29 to Jul 5, 2026) sits in a full chunk and is about two minutes; the panel
-    states the estimate for whatever dates you pick. Rain and wind are off by default because each
-    variable is another chunk read; flip `READ_RAIN` / `READ_WIND` in the constants
-    cell to have them.
+    states the estimate for whatever dates you pick. Rain and wind are off by default
+    because each variable is another chunk read; flip `READ_RAIN` / `READ_WIND` in
+    the constants cell to have them. All of that is the distance to the bucket, which
+    is why molab (us-west-2) is the faster place to run this notebook.
     """)
     return
 

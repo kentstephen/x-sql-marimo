@@ -12,7 +12,9 @@ uv run marimo edit xsql-deforest-divisions.py --sandbox
 # HRRR 2 m temperature per CONUS county, hour by hour, as a film
 uv run marimo edit xsql-hrrr-counties.py --sandbox
 
-# HRRR heat index on H3 hexagons with a browser-side memory (sustained heat)
+# HRRR heat index on H3 hexagons with a browser-side memory (sustained heat).
+# Faster in molab (the notebook's badge): the read is a full 90-day store chunk per
+# variable from us-west-2, minutes over a home link, seconds next to the bucket.
 uv run marimo edit xsql-hrrr-heat-hex.py --sandbox
 
 # EXPERIMENTAL: worldwide Mapterhorn terrain as extruded H3 columns (open defects)
