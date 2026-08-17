@@ -681,6 +681,17 @@ is the prize, not the polygons. Do not re-propose without re-reading those numbe
 stale comment about outlines "bulging outward" was from the h3ronpy era; `WASH_SQL`
 dissolves at native resolution and the outline is exact.
 
+## The fold is the H3 UDF inside DataFusion (hard requirement)
+
+The point of this repo, in Stephen's words (2026-08-17): the H3 fold as an h3ronpy
+UDF called INSIDE the DataFusion SQL, `h3_latlng_to_cell(lat, lon, res)` in the
+`SELECT ... GROUP BY`, "the gold star of this whole repo, what I've been working on
+for weeks". Never move it out of the SQL for a saving. `xsql-hrrr-heat-hex.py`
+shipped for one day with the cell ids precomputed in Python and joined in as a
+static lookup (carried over from the counties film, where it still is); that was
+wrong for this repo and was put back into the query the moment he saw it. Python
+may precompute cells for a MASK or a pruning predicate; the fold itself is the UDF.
+
 ## Colorblind-safe rendering (hard requirement)
 
 Stephen has trouble seeing RED (protan-type). Never encode anything on a red-green

@@ -13,8 +13,14 @@ it fits (it did not, see below), a fallback on counties.
   (`READ_RAIN`) and `wind_u_10m` + `wind_v_10m` (`READ_WIND`) as flags. xarray-sql,
   no dask, blocks = the whole time window x one 45x45 store column, as in the
   counties film.
-- **Fold**: every pixel labelled with its H3 res 6 cell from the store's 2-D lat/lon;
-  `GROUP BY hour, cell` averages ~4 pixels per cell; 210,724 cells over CONUS land.
+- **Fold**: `SELECT t, h3_latlng_to_cell(lat, lon, 6) AS hex, avg(...) FROM cube JOIN
+  pix2h USING (y, x) ... GROUP BY 1, 2`, the h3ronpy UDF registered in DataFusion, the
+  lookup carrying each land pixel's lat/lon; ~4 pixels per cell; 210,724 cells over
+  CONUS land. FOR ONE DAY (2026-08-17) THE CELL IDS WERE PRECOMPUTED IN PYTHON and
+  joined in as a static `(y, x, hex)` table, carried over from the counties film;
+  Stephen: "Why on earth are we not doing that? ... thats the gold star of this whole
+  repo, what i've been working on for weeks." Put back into the SQL the same day.
+  The Python h3ronpy call remains only for the land mask and the block predicate.
   (Res 5 was the unit for one round of the build, see below; res 6 is where it
   landed, at Stephen's word.)
 - **Land mask**: the counties film's PMTiles counties (same tmp parquet cache),

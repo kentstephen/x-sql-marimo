@@ -1380,6 +1380,10 @@ def _(
     con.unregister("conus_divs")
     _t_fill = _ptime.perf_counter() - _pt0
 
+    # THE CELL IDS ARE GENERATED IN THE SQL FOLD, by the h3ronpy UDF registered in
+    # DataFusion (fold cell); this cell only decides WHICH pixels are CONUS land, so
+    # the same h3ronpy call runs here once for the mask and the block predicate. The
+    # lookup carries each land pixel's lat/lon for the UDF, not a precomputed cell.
     _ny, _nx = lat.shape
     _hex = np.asarray(coordinates_to_cells(lat.ravel(), lon.ravel(), int(RES)))
     cells = _mapping["hex"].to_numpy().astype(np.uint64)  # sorted: the film's row order
@@ -1389,7 +1393,8 @@ def _(
         {
             "y": pa.array(np.repeat(grid_y, _nx)[_flat]),
             "x": pa.array(np.tile(grid_x, _ny)[_flat]),
-            "hex": pa.array(_hex[_flat]),
+            "lat": pa.array(lat.ravel()[_flat]),
+            "lon": pa.array(lon.ravel()[_flat]),
         }
     )
     # county index per cell (uint16, 65535 = none), names in county-table order
@@ -1480,8 +1485,10 @@ def _(
     RES,
     VARS,
     XarrayContext,
+    coordinates_to_cells,
     cube_all,
     land_pred,
+    pa,
     pix2h,
     t0,
     t1,
@@ -1526,6 +1533,23 @@ def _(
         # 17 GB against 9.5 GB). pix2h is ~10 MB, above the 1 MB / 128k-row defaults.
         ctx.sql("SET datafusion.optimizer.hash_join_single_partition_threshold = 268435456")
         ctx.sql("SET datafusion.optimizer.hash_join_single_partition_threshold_rows = 16777216")
+        # THE H3 UDF: lat/lon -> cell as a whole-column h3ronpy call inside DataFusion,
+        # the repo's fold (xsql-deforest-divisions.py registers the same one). The
+        # join on (y, x) attaches each pixel-hour's lat/lon from the land lookup; the
+        # UDF labels it; the GROUP BY averages the pixels that share a cell.
+        from datafusion import udf as _udf
+
+        ctx.register_udf(
+            _udf(
+                lambda la, lo, r: pa.array(
+                    coordinates_to_cells(la.to_numpy(), lo.to_numpy(), r[0].as_py())
+                ),
+                [pa.float64(), pa.float64(), pa.int32()],
+                pa.uint64(),
+                "stable",
+                name="h3_latlng_to_cell",
+            )
+        )
         ctx.from_arrow(pix2h, name="pix2h")
         ctx.from_dataset("cube", _cube, chunks={"t": _hours, "y": 45, "x": 45})
         _cols = [
@@ -1539,7 +1563,7 @@ def _(
                 "CAST(avg(sqrt(CAST(wind_u_10m AS DOUBLE) * wind_u_10m + CAST(wind_v_10m AS DOUBLE) * wind_v_10m)) AS FLOAT) AS ws"
             )
         cell_hour = ctx.sql(f"""
-            SELECT t, hex, {", ".join(_cols)}
+            SELECT t, h3_latlng_to_cell(lat, lon, CAST({int(RES)} AS INT)) AS hex, {", ".join(_cols)}
             FROM cube JOIN pix2h USING (y, x)
             WHERE temperature_2m = temperature_2m AND ({land_pred})
             GROUP BY 1, 2
