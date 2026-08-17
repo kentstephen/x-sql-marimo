@@ -17,18 +17,27 @@
 # ///
 """HRRR heat, per H3 res 6 cell over CONUS, as a film with a memory.
 
+WHAT THE SECOND FIELD IS, STATED PLAINLY. "Sustained heat" is an exponentially
+weighted moving average of the heat index's excess over a threshold (the same
+recurrence as hydrology's antecedent precipitation index, a first-order low-pass
+filter): L[t] = a L[t-1] + (1 - a) max(0, HI[t] - thr), a = 2^(-1/half_life). It is a
+smoothing with two stated parameters, NOT a published heat index; the sliders are the
+assumptions and the HUD says so. The citable persistent-heat index is the Excess Heat
+Factor (Nairn & Fawcett, BoM), daily and anomaly-based, which needs a per-cell
+climatology and is the recorded next step (docs/hrrr-heat-hex-notes.md).
+
 The counties film (xsql-hrrr-counties.py) asks how hot each county is, hour by hour.
 This one asks how the heat SITS: dynamical.org's HRRR analysis (3 km, hourly, CC-BY
 4.0) is read straight from its Zarr with xarray-sql, 2 m temperature and relative
 humidity folded to H3 res 6 (~4 pixels per cell, 210,724 cells over CONUS land)
 and turned into NWS heat index per cell per hour. The whole film crosses to the browser once, and the browser runs an
-ACCUMULATOR over it: each hour a cell's heat load rises by how far the heat index sits
-above a threshold and decays with a half-life; nights that do not cool leave the load
+ACCUMULATOR over it: each hour a cell's sustained heat rises by how far the heat index
+sits above a threshold and decays with a half-life; nights that do not cool leave it
 up, so a place with three hot days and warm nights ends bright while a place with the
 same afternoon highs and cool nights stays dim. That memory (half-life, threshold,
 and, when read, a rain flush and a wind vent) is four sliders in the HUD, recomputed
 in the browser in ~0.2 s, and the map switches between the instantaneous heat index
-and the accumulated load. Same widget skeleton as the counties film (deck.gl from
+and the sustained heat. Same widget skeleton as the counties film (deck.gl from
 esm.sh, browser-owned clock, minimal HUD on the map, the HUD's window loader as the
 one thing that reaches back), with an H3HexagonLayer in place of the GeoArrow
 polygons and geometric picking replaced by h3-js latLngToCell.
@@ -56,7 +65,7 @@ spill pool, all at the same ~28 s; both are set in the fold cell. Res 5 (30,124
 cells, 5M answers, well under a GB, 5 MB per field) is the one-constant retreat, the
 counties film with this accumulator the fallback after that. Bytes to the browser:
 uint8 fields (heat index in 0.5 degC steps; wind/rain packed in one byte), 35 MB per
-field for a week at res 6, the load computed and held browser-side. Hourly frames
+field for a week at res 6, the sustained heat computed and held browser-side. Hourly frames
 only, up to 14 days.
 
 DuckDB does geometry (county dissolve, polyfill; counties are the CONUS land mask
@@ -121,13 +130,14 @@ def _(mo):
     # HRRR heat with a memory
 
     Hourly heat index for the lower 48 on H3 hexagons, played as a film, with a
-    switch to a second field computed live in the browser: **heat load**, an
-    accumulator that rises while the heat index sits above a threshold and decays
-    with a half-life you set. It is the same weather, but the map remembers: a place
+    switch to a second field computed live in the browser: **sustained heat**, an
+    exponentially weighted average of the heat index above a threshold, decaying with
+    a half-life you set. It is the same weather, but the map remembers: a place
     whose nights do not cool stays bright after the sun goes down, and a place with
-    the same afternoon highs and cool nights goes dark. Set the half-life, the
-    threshold, and (if read) how much rain flushes and wind vents the load; press
-    play.
+    the same afternoon highs and cool nights goes dark. This is a smoothing with two
+    stated parameters, not a published index; the sliders are the assumptions. Set
+    the half-life, the threshold, and (if read) how much rain flushes and wind vents
+    it; press play.
 
     **Where the numbers come from.** [dynamical.org](https://dynamical.org/)'s Zarr
     build of NOAA's HRRR analysis (3 km, hourly, CONUS, CC-BY 4.0), read anonymously
@@ -222,14 +232,14 @@ def _():
     # ------------------------------------------------------------------ the film
     # Heat index: diverging blue <-> yellow/orange (protan-safe: no red leg, no
     # red-vs-green pair), pale at the pivot (the film's median), span to the wider of
-    # p2/p98 unless PIVOT/SPAN pin it. Heat load: one-signed, so a luminance ramp,
+    # p2/p98 unless PIVOT/SPAN pin it. Sustained heat: one-signed, so a luminance ramp,
     # dark to bright (matplotlib inferno's stops; on the colorblind-safe shortlist),
-    # scaled in the browser to the p98 of the load it just computed.
+    # scaled in the browser to the p98 of the values it just computed.
     INDEX_STOPS = ["#08306b", "#2f79b5", "#9ecae1", "#f2f0e6", "#fee391", "#fdb034", "#d94801"]
     LOAD_STOPS = ["#000004", "#1b0c41", "#4a0c6b", "#781c6d", "#a52c60", "#cf4446", "#ed6925", "#fb9b06", "#f7d13d", "#fcffa4"]
     PIVOT = None  # degC heat index, or None for the film median
     SPAN = None  # degC either side, or None for the p2/p98 rule
-    # Accumulator defaults (all live sliders in the HUD): the load rises by the heat
+    # Accumulator defaults (all live sliders in the HUD): sustained heat rises by the heat
     # index's excess over THRESHOLD (27 degC is where the NWS caution band starts)
     # and decays with HALF_LIFE hours; RAIN_FLUSH and WIND_VENT are 0..1 weights,
     # meaningful only when the field was read.
@@ -396,7 +406,7 @@ def _(anywidget, traitlets):
             <div class="hf-map">
               <div class="hf-hud hf-tl"><div class="hf-card hf-panel">
                 <div class="hf-head"><span><span class="hf-ttl"></span><span class="hf-sub"></span></span><button class="hf-toggle" title="hide / show (H)">hide</button></div>
-                <div class="hf-fields"><button class="hf-b hf-fi hf-on" data-field="index" title="NWS heat index this hour (I)">heat index</button><button class="hf-b hf-fi" data-field="load" title="accumulated heat load (L)">heat load</button></div>
+                <div class="hf-fields"><button class="hf-b hf-fi hf-on" data-field="index" title="NWS heat index this hour (I)">heat index</button><button class="hf-b hf-fi" data-field="load" title="sustained heat: exponentially weighted mean of heat index above the threshold (L)">sustained heat</button></div>
                 <div class="hf-legend"><span class="hf-num hf-lo"></span><div class="hf-grad"></div><span class="hf-num hf-hi"></span></div>
                 <div class="hf-body">
                   <div class="hf-row"><span class="hf-k hf-meank">CONUS mean</span><span class="hf-num hf-v hf-mean">–</span></div>
@@ -490,7 +500,7 @@ def _(anywidget, traitlets):
             const p = params();
             halfV.textContent = p.half + " h"; thrV.textContent = p.thr.toFixed(1) + "°C";
             rainV.textContent = p.rain.toFixed(2); windV.textContent = p.wind.toFixed(2);
-            pnote.textContent = `load = sustained heat index above ${p.thr.toFixed(1)}°C, half-life ${p.half} h` +
+            pnote.textContent = `sustained heat = exponentially weighted mean of heat index above ${p.thr.toFixed(1)}°C, half-life ${p.half} h (a smoothing, not a published index)` +
               (cfg.has_rain ? "" : " · rain not read") + (cfg.has_wind ? "" : " · wind not read");
           }
           let ptimer = null;
@@ -547,7 +557,7 @@ def _(anywidget, traitlets):
             const stops = [];
             for (let i = 0; i <= 8; i++) { const j = Math.round(i / 8 * 255) * 3; stops.push(`rgb(${lut[j]},${lut[j+1]},${lut[j+2]}) ${i/8*100}%`); }
             grad.style.background = `linear-gradient(90deg, ${stops.join(",")})`;
-            if (field === "load") { loEl.textContent = "0"; hiEl.textContent = "+" + loadHi.toFixed(1) + "°C"; meanK.textContent = "CONUS mean load"; }
+            if (field === "load") { loEl.textContent = "0"; hiEl.textContent = "+" + loadHi.toFixed(1) + "°C"; meanK.textContent = "CONUS mean sustained heat"; }
             else { loEl.textContent = fmtC(cfg.lo); hiEl.textContent = fmtC(cfg.hi); meanK.textContent = "CONUS mean heat index"; }
             root.querySelectorAll(".hf-fi").forEach(b => b.classList.toggle("hf-on", b.dataset.field === field));
           }
@@ -1539,11 +1549,11 @@ def _(PIVOT, SPAN, cell_hour, cells, np):
 def _(mo):
     mo.md(r"""
     **Using the map.** Space plays, arrows step, drag the slider to scrub, `I` / `L`
-    (or the two buttons) switch between the heat index and the heat load, `H` folds
+    (or the two buttons) switch between the heat index and the sustained heat, `H` folds
     the panel down to the switch and the ramp, `F` or ⛶ goes fullscreen. Click a cell for its value and its line over
     the window; click it again, or empty ground, to clear. The four sliders are the
-    accumulator: half-life (how long the load takes to halve once the heat is gone),
-    threshold (heat index above which load builds; the dashed line on a cell's index
+    accumulator: half-life (how long the sustained heat takes to halve once the heat
+    is gone), threshold (heat index above which it builds; the dashed line on a cell's index
     chart), rain flush and wind vent (only when those fields were read). Every move
     recomputes the whole film in the browser. The window takes UTC days, inclusive,
     up to 14; load refetches and refolds, about thirty seconds.

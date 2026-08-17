@@ -12,7 +12,7 @@ uv run marimo edit xsql-deforest-divisions.py --sandbox
 # HRRR 2 m temperature per CONUS county, hour by hour, as a film
 uv run marimo edit xsql-hrrr-counties.py --sandbox
 
-# HRRR heat index on H3 hexagons with a browser-side memory (heat load)
+# HRRR heat index on H3 hexagons with a browser-side memory (sustained heat)
 uv run marimo edit xsql-hrrr-heat-hex.py --sandbox
 
 # EXPERIMENTAL: worldwide Mapterhorn terrain as extruded H3 columns (open defects)
@@ -112,10 +112,12 @@ back. About thirty seconds to the first frame, nearly all of it the read.
 
 `xsql-hrrr-heat-hex.py`. The same machinery asked how the heat sits, not how hot it
 is. Temperature and relative humidity folded to H3 res 6 over CONUS land (210,724
-cells, ~4 pixels each), NWS heat index per cell per hour, and in the browser an
-accumulator, **heat load**: it rises by the heat index's excess over a threshold and
-decays with a half-life (an exponential moving average of the exceedance, in °C), so
-places whose nights do not cool stay bright after dark. Half-life, threshold, and if
+cells, ~4 pixels each), NWS heat index per cell per hour, and in the browser a second
+field, **sustained heat**: an exponentially weighted moving average of the heat
+index's excess over a threshold, decaying with a half-life (in °C), so places whose
+nights do not cool stay bright after dark. A smoothing with two stated parameters,
+not a published index (the citable one, the Excess Heat Factor, is the recorded next
+step). Half-life, threshold, and if
 read a rain flush and a wind vent, are sliders on the map, recomputed over the whole
 film in the browser; the map switches between index and load; a click gives a cell's
 line. Opens on the late-July 2026 Plains heat dome (~2 min: July is a full 90-day

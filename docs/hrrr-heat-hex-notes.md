@@ -29,7 +29,11 @@ it fits (it did not, see below), a fallback on counties.
 - **The film**: uint8 F x N heat index (0.5 degC steps from -40; 255 = no data),
   plus one packed uint8 for wind (m/s in the high nibble) and rain (0.5 mm/h steps
   in the low), 35 MB per field for a week at res 6 (5 MB at res 5).
-- **The accumulator, in the browser**: L[f] = a L[f-1] + (1 - a) max(0, HI[f] - thr),
+- **The accumulator, "sustained heat"** (labelled "heat load" until 2026-08-17, when
+  Stephen asked whether the formula was a known thing: the recurrence is, an EWMA /
+  antecedent-index form; the name and its use as an index were ours, so the label now
+  says what it is and the HUD calls it a smoothing, not a published index):
+  L[f] = a L[f-1] + (1 - a) max(0, HI[f] - thr),
   a = 2^(-1/half_life), so L is "sustained excess above the threshold" in degC and
   reads on the same scale as the index; rain multiplies L by (1 - flush min(1, mm/2.5))
   that hour, wind scales the excess by max(0, 1 - vent ws/10). Recomputed over the
@@ -146,6 +150,19 @@ the CONUS-wide peak at Jul 25-27: share of sampled land pixels over 35 degC 0.22
 (25.65 degC). Opening window: 2026-07-23 to 07-29. All three domes are in the full
 May-Jul chunk, ~2 min; the East dome is the humid one and the most on-theme for a
 heat index film if the cost is ever not the constraint.
+
+## The next step, if a citable index is wanted (2026-08-17)
+
+Excess Heat Factor (Nairn & Fawcett, BoM 2013/2015): EHI_sig = mean T over 3 days
+minus the local T95 (climatology), EHI_accl = the same 3-day mean minus the previous
+30 days' mean, EHF = EHI_sig x max(1, EHI_accl); daily, anomaly-based, persistence
+built in. A different question from the accumulator (unusual-and-sustained for HERE
+against hot-in-absolute-terms-and-still-hot-at-4am). Needs a per-cell T95 built once
+from past summers (~10 x 2,160 h reads: an hour on this link, minutes near the data;
+cache as parquet like the counties) and the previous 30 days (a chunk-boundary read
+when the window sits near one). Defined on daily mean temperature, not heat index.
+Cooling degree-hours (the accumulator with an infinite half-life) and warm-night
+counts (Tmin, or overnight heat index, above ~24 degC) are the known no-knob cousins.
 
 ## Ideas held back
 
