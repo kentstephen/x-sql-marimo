@@ -198,12 +198,23 @@ to know:
   49 leads, coords rewritten to valid times).
 - **Startup cost, measured:** store 2.8 s, counties 7.3 s (1,008 ranged GETs + Python
   MVT decode; dissolve 0.1 s), polyfill + lookup 1.5-3 s, fold ~20 s. The fold is the
-  floor and it is DECODE, not the wire: DataFusion partitions 32/96, zarr
-  `async.concurrency` 64 and icechunk `max_concurrent_requests` 64/256 all measured
-  ~20 s; each 45x45 store chunk is 2,160 h deep, so any window decodes 960 x 17.5 MB
-  of zstd. Do not try obstore for icechunk (same Rust object_store underneath, and no
-  seam). The counties are cached as parquet in the OS temp dir (`CACHE_DIR`,
-  Stephen: tmp not .cache; None disables): warm run reads them in 0.0 s.
+  floor and FROM STEPHEN'S MACHINE IT IS THE WIRE (2026-08-17, corrected: an earlier
+  note here said decode): a 7-day CONUS window is 960 subchunks, 489 MB compressed,
+  and the link to us-west-2 measures ~24 MB/s whether one object or eight stream
+  (bandwidth, not request latency), so DataFusion partitions 32/96, zarr
+  `async.concurrency` 64 and icechunk `max_concurrent_requests` 64/256 all land at
+  ~20 s because the pipe is already full. Decode is real but hidden under the fetch:
+  each 45x45 store chunk is 2,160 h deep, so any window decodes 960 x 17.5 MB
+  (16.8 GB), ~13 s in zarr-python's blosc pipeline, 1.2 s on zarrista's Rust pool
+  (developmentseed's `zarrs` binding, 0.1.0, beta; takes an icechunk Session
+  directly; measured end to end 17.6 s vs zarr-python 18.7 s here). NOT ADOPTED: at
+  home it buys ~1 s; near the data (molab, us-west-2) decode becomes the floor and it
+  would be the ~10x lever, replacing the read cell only (numpy cube into
+  XarrayContext; fold and join untouched). zarr-python's own zarrista engine is PR
+  #4064, an open draft. Numbers in `docs/hrrr-counties-notes.md`. Do not try obstore
+  for icechunk (same Rust object_store underneath, and no seam). The counties are
+  cached as parquet in the OS temp dir (`CACHE_DIR`, Stephen: tmp not .cache; None
+  disables): warm run reads them in 0.0 s.
 - **Status (2026-08-15, evening): FLOWN AND WORKING, pushed as f95c637.** Map and
   film play, hide/fullscreen work once the Tailwind `.hidden` collision was fixed,
   clicking a county outlines it (yellow PathLayer from its own rings; a one-row

@@ -286,3 +286,29 @@ Also: the DuckDB cell printed `<_duckdb.DuckDBPyConnection ...>` in app view bec
 `con.execute(...)` returns the connection and it was the cell's last expression;
 `con.sql(...)` runs INSTALL/LOAD the same and returns None for a non-query (both
 verified on duckdb 1.5.5, extensions load either way).
+
+## zarrista trial (2026-08-17)
+
+Question: would developmentseed's zarrista (Rust `zarrs` binding, 0.1.0 released
+2026-08-13, beta; takes an icechunk `Session` directly) speed the fold? Measured on
+the analysis store, 7-day CONUS window (168 h, 960 subchunks of (2160, 45, 45),
+489 MB compressed, 16.8 GB decoded), from Stephen's machine:
+
+- zarr-python 3.3.0 `za[t0:t1, :, :]`, no xarray-sql: 18.7 s (so xarray-sql adds ~1 s
+  to the 20 s fold).
+- zarrista `AsyncArray`: fetch of the 960 encoded subchunks 13.3 s; decode of all of
+  them on the Rust pool 1.2 s; `retrieve_array_subset` end to end 17.6 s.
+- Raw link to us-west-2 from here: one 508 MB object 23 MB/s, 8 in parallel 24 MB/s
+  total. Bandwidth-capped, not per-request latency.
+- Decode alone on identical bytes (120 subchunks, 77 MB -> 2.1 GB): zarr-python
+  BatchedCodecPipeline 1.66 s, zarrista Rust pool 0.15 s, zarrista sync sequential
+  1.61 s. Scaled to the window: ~13 s vs ~1.2 s, but zarr-python overlaps decode with
+  fetch, so on this link the wall is the wire either way.
+
+Verdict: from a home link the fold is the wire (489 MB at ~25-37 MB/s) and zarrista
+changes nothing. Near the data (molab, or anything in us-west-2) decode becomes the
+floor and zarrista's ~1.2 s against zarr-python's ~13 s would be the real win. It does
+not plug into xarray-sql: it would replace the read cell (numpy cube in, XarrayContext
+over memory), fold and join untouched. zarr-python's own zarrista engine is PR #4064,
+still an open draft (rebuilt 2026-08-14 on an `ArrayEngine` protocol; no release).
+Scripts: scratch `bench.py`, `bw.py`, `dec.py` (not kept).
