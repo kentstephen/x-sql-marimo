@@ -227,10 +227,14 @@ def _():
     # is ~30 GB of state, and under any pool that fits in RAM DataFusion spills nearly
     # all of it to disk and merge-sorts it back, which reads as the fold spinning
     # forever (2026-08-17, Stephen's res 7 demo run). None = unbounded, RAM decides.
-    # 1.5 GB per aggregated field: T and RH alone is the measured 3 GB; rain and wind
-    # each add an accumulator per (hour, cell) group, and a pool sized for two failed
-    # with all four on ("Failed to reserve memory for sort during spill", 2026-08-17).
-    MEM_POOL_GB = 1.5 * (2 + int(READ_RAIN) + int(READ_WIND)) if RES <= 6 else None
+    # The pool is for the two-field default only. With rain and/or wind on there are
+    # three or four accumulators per (hour, cell) group and DataFusion cannot even
+    # reserve the room it needs to sort a batch before spilling: 3 GB and 6 GB pools
+    # both died with "Failed to reserve memory for sort during spill" (2026-08-17). So
+    # the pool is off then and RAM decides; expect roughly 10-15 GB at res 6 for a
+    # week with all four fields, on top of the read being 4-5 variables (~1 min in
+    # a young chunk, 4-5 min in a full one).
+    MEM_POOL_GB = 3 if (RES <= 6 and not READ_RAIN and not READ_WIND) else None
 
     # ------------------------------------------------------------------ the land mask
     # Overture's PMTiles build of the pinned release, same object, box, zoom and
