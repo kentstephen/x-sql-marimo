@@ -159,9 +159,9 @@ def _(mo):
     pixel column is 2,160 hours = 90 days deep), so a window fetches every filled hour
     of the chunk it falls in, whatever its length, and the link, not the code, sets
     the pace. A week in the current, part-filled chunk is about thirty seconds for
-    two variables on a ~200 Mbit link; the opening window (the late-July 2026 heat
-    dome) sits in a full chunk and is about two minutes; the panel states the estimate
-    for whatever dates you pick. Rain and wind are off by default because each
+    two variables on a ~200 Mbit link; the opening window (the eastern heat dome of
+    Jun 29 to Jul 5, 2026) sits in a full chunk and is about two minutes; the panel
+    states the estimate for whatever dates you pick. Rain and wind are off by default because each
     variable is another chunk read; flip `READ_RAIN` / `READ_WIND` in the constants
     cell to have them.
     """)
@@ -194,14 +194,18 @@ def _():
     # all-time records on Jul 12, Plains Jul 24-28; July 2026 the hottest US month
     # on record) all sit in the full chunk, so as presets they cost ~2 min:
     #   DAYS = ("2026-07-06", "2026-07-12")   # West dome, Salt Lake City 109 F Jul 12
-    #   DAYS = ("2026-06-29", "2026-07-05")   # East dome, Atlantic City 106 F Jul 4
     #   DAYS = ("2026-07-23", "2026-07-29")   # Plains dome, Rapid City 112 F Jul 26: in a
     #       block-sampled scan of the store (one 45x45 column in every third, Jun 15 to
     #       Aug 17) the summer's CONUS-wide peak, the largest share of land pixels over
     #       35 degC (0.22-0.24 on Jul 25-27 against 0.13 for the West dome's Jul 8-12)
     #       and the highest CONUS-mean day (Jul 27)
-    # The opening window is the last week: the current chunk, ~30 s while it is young.
-    DAYS = 7
+    #   DAYS = 7                              # the last week: the current chunk, ~30 s while young
+    # The opening window is the eastern dome, the summer's worst by the human numbers
+    # (Wikipedia, 2026 North American heat wave: at least 44 heat deaths Jul 1-4, 180
+    # million people under major or extreme heat risk, Atlantic City 106 F on Jul 4,
+    # daily records in Boston, Philadelphia and Washington on Jul 2; storms broke it up
+    # Jul 4-6). Humid, so the heat index is the right lens, and the nights are the story.
+    DAYS = ("2026-06-29", "2026-07-05")   # East dome; a full chunk, ~2 min
     HOURLY_MAX_DAYS = 14  # 336 frames x 210k cells = 71 MB per field across the bridge
 
     # ------------------------------------------------------------------ the fold

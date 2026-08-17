@@ -120,9 +120,9 @@ not a published index (the citable one, the Excess Heat Factor, is the recorded 
 step). Half-life, threshold, and if
 read a rain flush and a wind vent, are sliders on the map, recomputed over the whole
 film in the browser; the map switches between index and load; a click gives a cell's
-line. Opens on the late-July 2026 Plains heat dome (~2 min: July is a full 90-day
-store chunk); a week in the current chunk is ~30 s, and the panel states the read
-for the dates picked. A week at res 6 is 35M hour-cell answers, ~5 GB kernel peak
+line. Opens on the eastern heat dome of Jun 29 to Jul 5, 2026, the summer's worst by
+the human numbers (~2 min: it sits in a full 90-day store chunk); a week in the
+current chunk is ~30 s, and the panel states the read for the dates picked. A week at res 6 is 35M hour-cell answers, ~5 GB kernel peak
 with the two DataFusion knobs in the fold cell (a broadcast join, a spill pool; 17 GB
 without) and 35 MB per field to the browser; res 5 is the one-constant retreat.
 

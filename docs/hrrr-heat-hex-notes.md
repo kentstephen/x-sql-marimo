@@ -147,9 +147,16 @@ City 112 F Jul 26); NOAA: July 2026 the hottest US month on record. A block-samp
 scan of the store (one 45x45 column in every third, Jun 15 to Aug 17, T only) puts
 the CONUS-wide peak at Jul 25-27: share of sampled land pixels over 35 degC 0.22-0.24
 (West dome Jul 8-12: 0.13-0.14; Aug 6-11: 0.16-0.19), CONUS-mean day peak Jul 27
-(25.65 degC). Opening window: 2026-07-23 to 07-29. All three domes are in the full
-May-Jul chunk, ~2 min; the East dome is the humid one and the most on-theme for a
-heat index film if the cost is ever not the constraint.
+(25.65 degC). The opening window was Jul 23-29 for one commit, then the last week
+(the res 7 debugging round), then, on "look up a 7 day range heat wave summer 2026,
+worst one, internet research", the EAST dome, Jun 29 to Jul 5: Wikipedia's page has
+it as the worst by the human numbers (at least 44 heat deaths Jul 1-4, 180 million
+under major/extreme heat risk, Atlantic City 106 F Jul 4, daily records in Boston /
+Philadelphia / Washington Jul 2, storms broke it Jul 4-6 with 1.3M outages); the
+West dome has the all-time records (Salt Lake City 109, Miles City 115) and the
+Plains dome the store's own CONUS-wide temperature peak. All three are in the full
+May-Jul chunk, ~2 min. The East dome is the humid one, so the heat index (not bare
+temperature) is the right lens and the warm nights are the film's story.
 
 ## The next step, if a citable index is wanted (2026-08-17)
 
