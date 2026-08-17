@@ -212,7 +212,10 @@ def _():
     # identical at any res (same pixels). Res 5 (30,124 cells, 5M answers, well
     # under a GB, 5 MB per field, ~250 km2 hexes) is the one-constant retreat, and
     # was flown; the counties film with this accumulator is the fallback after that.
-    # Res 7 is the pixel itself (a relabel) and 1.47M cells: no film fits.
+    # Res 7 is the pixel itself (a relabel): 1.47M land cells but only 879k land
+    # pixels, so ~40% of the hexes hold no pixel centre and the map is full of holes
+    # (Stephen ran it 2026-08-17: "a lot of gaps between the cells"), and a week is
+    # 248M answers, ~35 GB of aggregate state. Res 6 is where it lives.
     RES = 6
     # DataFusion memory pool for the fold's final aggregate (one hash entry per
     # (hour, cell) answer, ~150 B). At res 6 a 3 GB pool holds the process near 5 GB
