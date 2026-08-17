@@ -1419,6 +1419,7 @@ def _(
     MEM_POOL_GB,
     READ_RAIN,
     READ_WIND,
+    RES,
     VARS,
     XarrayContext,
     cube_all,
@@ -1435,10 +1436,12 @@ def _(
     # speed is averaged per pixel (sqrt(u^2+v^2)), not from the mean vector; rain rate
     # x 3600 is mm in the hour. Floats, not doubles, in the output: 35M rows at res 6.
     #
-    # Memoised on the window: re-submitting the same dates never refetches.
+    # Memoised on the window (and the res): re-submitting the same dates never refetches.
     import time as _ftime
 
-    _key = (tuple(VARS), str(t0), str(t1))
+    # RES and the cell count are in the key: a memo from another res served against a
+    # new cell list indexes past its end (IndexError in the frames cell, 2026-08-17).
+    _key = (int(RES), int(pix2h.num_rows), tuple(VARS), str(t0), str(t1))
     if HOLD["key"] == _key and HOLD["cell_hour"] is not None:
         cell_hour = HOLD["cell_hour"]
         fold_stats = HOLD["stats"] + " (memo)"
