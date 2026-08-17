@@ -181,8 +181,8 @@ def _():
     # further variable is another whole 90-day chunk layer per column: ~14 s on a
     # ~21 MB/s link after the land pruning, and it grows through the quarter as the
     # current chunk fills. Rain is the accumulator's flush, wind its vent.
-    READ_RAIN = False  # precipitation_surface (kg m-2 s-1, an hourly-mean RATE -> mm/h)
-    READ_WIND = False  # wind_u_10m + wind_v_10m -> speed (m/s); two variables
+    READ_RAIN = True  # precipitation_surface (kg m-2 s-1, an hourly-mean RATE -> mm/h)
+    READ_WIND = True  # wind_u_10m + wind_v_10m -> speed (m/s); two variables
     # Opening window: an int is the last DAYS UTC days ending at the newest hour; a
     # ("YYYY-MM-DD", "YYYY-MM-DD") tuple is a fixed window. THE COST DEPENDS ON WHICH
     # STORE CHUNK THE DATES FALL IN, not on how many days: chunks are 90 days deep and
@@ -227,7 +227,10 @@ def _():
     # is ~30 GB of state, and under any pool that fits in RAM DataFusion spills nearly
     # all of it to disk and merge-sorts it back, which reads as the fold spinning
     # forever (2026-08-17, Stephen's res 7 demo run). None = unbounded, RAM decides.
-    MEM_POOL_GB = 3 if RES <= 6 else None
+    # 1.5 GB per aggregated field: T and RH alone is the measured 3 GB; rain and wind
+    # each add an accumulator per (hour, cell) group, and a pool sized for two failed
+    # with all four on ("Failed to reserve memory for sort during spill", 2026-08-17).
+    MEM_POOL_GB = 1.5 * (2 + int(READ_RAIN) + int(READ_WIND)) if RES <= 6 else None
 
     # ------------------------------------------------------------------ the land mask
     # Overture's PMTiles build of the pinned release, same object, box, zoom and
@@ -1441,7 +1444,7 @@ def _(mo):
     objects, zarr decodes them) and joins and aggregates the rows as they arrive, one
     pipelined stream. So the fetch, the decode and the SQL all show up as one wait here.
 
-    Measured, to separate them:
+    What we measured, to separate them:
 
     - **The wire is the floor.** Raw range reads from us-west-2 with obstore, from this
       machine: 20.9 MB/s on one stream, slower with 8 or 32. icechunk's reader is the
