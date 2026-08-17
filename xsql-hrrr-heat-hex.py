@@ -1441,7 +1441,7 @@ def _(mo):
     objects, zarr decodes them) and joins and aggregates the rows as they arrive, one
     pipelined stream. So the fetch, the decode and the SQL all show up as one wait here.
 
-    What we measured, to separate them:
+    Measured, to separate them:
 
     - **The wire is the floor.** Raw range reads from us-west-2 with obstore, from this
       machine: 20.9 MB/s on one stream, slower with 8 or 32. icechunk's reader is the
