@@ -202,7 +202,7 @@ def _():
     # under a GB, 5 MB per field, ~250 km2 hexes) is the one-constant retreat, and
     # was flown; the counties film with this accumulator is the fallback after that.
     # Res 7 is the pixel itself (a relabel) and 1.47M cells: no film fits.
-    RES = 6
+    RES = 7
 
     # ------------------------------------------------------------------ the land mask
     # Overture's PMTiles build of the pinned release, same object, box, zoom and
@@ -324,7 +324,7 @@ def _(anywidget, traitlets):
                 font: 12px/1.35 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--ink); background: #0f1216; }
           .hf * { box-sizing: border-box; }
           .hf .hf-num { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
-          .hf .hf-map { position: relative; width: 100%; background: #0b0d10; overflow: hidden; }
+          .hf .hf-map { position: relative; width: 100%; background: #e8e8e4; overflow: hidden; }
           .hf .hf-map:fullscreen { height: 100vh !important; width: 100vw; }
           .hf .hf-hud { position: absolute; z-index: 5; }
           .hf .hf-hud.hf-tl { top: .6rem; left: .6rem; width: 22rem; max-width: calc(100% - 1.2rem); }
@@ -344,7 +344,7 @@ def _(anywidget, traitlets):
           .hf .hf-cell { margin-top: .35rem; display: none; }
           .hf.hf-picked .hf-cell { display: block; }
           .hf .hf-chart { display: block; width: 100%; height: 96px; margin-top: .3rem; cursor: crosshair; }
-          .hf.hf-collapsed .hf-body { display: none; }
+          .hf.hf-collapsed .hf-body, .hf.hf-collapsed .hf-sub { display: none; }  /* hide folds the panel; the field switch and the ramp stay */
           .hf .hf-toggle, .hf .hf-clear { background: none; border: 0; color: var(--dim); cursor: pointer; font: inherit; padding: 0 .1rem; }
           .hf .hf-toggle:hover, .hf .hf-clear:hover { color: var(--ink); }
           .hf .hf-params { margin-top: .45rem; padding-top: .4rem; border-top: 1px solid rgba(255,255,255,.08); }
@@ -396,9 +396,9 @@ def _(anywidget, traitlets):
             <div class="hf-map">
               <div class="hf-hud hf-tl"><div class="hf-card hf-panel">
                 <div class="hf-head"><span><span class="hf-ttl"></span><span class="hf-sub"></span></span><button class="hf-toggle" title="hide / show (H)">hide</button></div>
+                <div class="hf-fields"><button class="hf-b hf-fi hf-on" data-field="index" title="NWS heat index this hour (I)">heat index</button><button class="hf-b hf-fi" data-field="load" title="accumulated heat load (L)">heat load</button></div>
+                <div class="hf-legend"><span class="hf-num hf-lo"></span><div class="hf-grad"></div><span class="hf-num hf-hi"></span></div>
                 <div class="hf-body">
-                  <div class="hf-fields"><button class="hf-b hf-fi hf-on" data-field="index" title="NWS heat index this hour (I)">heat index</button><button class="hf-b hf-fi" data-field="load" title="accumulated heat load (L)">heat load</button></div>
-                  <div class="hf-legend"><span class="hf-num hf-lo"></span><div class="hf-grad"></div><span class="hf-num hf-hi"></span></div>
                   <div class="hf-row"><span class="hf-k hf-meank">CONUS mean</span><span class="hf-num hf-v hf-mean">–</span></div>
                   <div class="hf-cell">
                     <div class="hf-row"><span class="hf-k hf-cname">–</span><span><span class="hf-num hf-v hf-cval">–</span> <button class="hf-clear" title="clear">×</button></span></div>
@@ -559,14 +559,14 @@ def _(anywidget, traitlets):
             const k = frame * N + index;
             if (field === "load") {
               const qv = load ? load[k] : 255;
-              if (qv === 255) { target[0] = 40; target[1] = 44; target[2] = 50; target[3] = 60; return target; }
+              if (qv === 255) { target[0] = 120; target[1] = 124; target[2] = 130; target[3] = 60; return target; }
               let t = (qv / 10) / loadHi; if (t > 1) t = 1;
               const j = Math.round(t * 255) * 3;
               target[0] = lutL[j]; target[1] = lutL[j + 1]; target[2] = lutL[j + 2]; target[3] = 60 + Math.round(175 * t);
               return target;
             }
             const qv = frames[k];
-            if (qv === 255) { target[0] = 40; target[1] = 44; target[2] = 50; target[3] = 60; return target; }
+            if (qv === 255) { target[0] = 120; target[1] = 124; target[2] = 130; target[3] = 60; return target; }
             let t = (HI_OF(qv) - cfg.lo) / (cfg.hi - cfg.lo); t = t < 0 ? 0 : t > 1 ? 1 : t;
             const j = Math.round(t * 255) * 3;
             target[0] = lutI[j]; target[1] = lutI[j + 1]; target[2] = lutI[j + 2]; target[3] = 225;
@@ -580,7 +580,9 @@ def _(anywidget, traitlets):
             },
           });
           function layers() {
-            const out = [tiles("base", "https://basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}.png", 1.0)];
+            // Positron (light), not dark matter: the load ramp runs down to black, which
+            // vanishes on a dark ground; the index ramp's pale pivot reads on either.
+            const out = [tiles("base", "https://basemaps.cartocdn.com/light_nolabels/{z}/{x}/{y}.png", 1.0)];
             if (N && frames) {
               out.push(new H3HexagonLayer({
                 id: "cells",
@@ -601,7 +603,7 @@ def _(anywidget, traitlets):
                 pickable: false,
               }));
             }
-            out.push(tiles("labels", "https://basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}.png", 0.6));
+            out.push(tiles("labels", "https://basemaps.cartocdn.com/light_only_labels/{z}/{x}/{y}.png", 0.8));
             return out;
           }
 
@@ -1537,8 +1539,8 @@ def _(PIVOT, SPAN, cell_hour, cells, np):
 def _(mo):
     mo.md(r"""
     **Using the map.** Space plays, arrows step, drag the slider to scrub, `I` / `L`
-    (or the two buttons) switch between the heat index and the heat load, `H` hides
-    the panel, `F` or ⛶ goes fullscreen. Click a cell for its value and its line over
+    (or the two buttons) switch between the heat index and the heat load, `H` folds
+    the panel down to the switch and the ramp, `F` or ⛶ goes fullscreen. Click a cell for its value and its line over
     the window; click it again, or empty ground, to clear. The four sliders are the
     accumulator: half-life (how long the load takes to halve once the heat is gone),
     threshold (heat index above which load builds; the dashed line on a cell's index
