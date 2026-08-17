@@ -1427,6 +1427,41 @@ def _():
     return (HOLD,)
 
 
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### Where the wait in the next cell comes from
+
+    The cell below is the slow one, and it is slow because **the read happens inside
+    it**. xarray-sql registers the Zarr lazily; nothing is fetched until the query
+    runs, and then DataFusion pulls every store column under CONUS land straight from
+    `s3://dynamical-noaa-hrrr` (icechunk range-reads the inner chunks out of the shard
+    objects, zarr decodes them) and joins and aggregates the rows as they arrive, one
+    pipelined stream. So the fetch, the decode and the SQL all show up as one wait here.
+
+    What we measured, to separate them:
+
+    - **The wire is the floor.** Raw range reads from us-west-2 with obstore, from this
+      machine: 20.9 MB/s on one stream, slower with 8 or 32. icechunk's reader is the
+      same Rust `object_store` obstore wraps, so there is no faster transport to hand
+      the read to; the same-machine number is the same number.
+    - **The SQL is a few seconds.** Same read, seven times the aggregate: res 5 27.3 s,
+      res 6 28.5 s. Same aggregate, 45% fewer bytes (the land pruning): 44.7 s to
+      28.5 s. xarray-sql against a dask-backed read: identical; a Rust decoder
+      (zarrista): about a second saved.
+    - **Bytes are per store chunk, not per day.** Each column is 2,160 hours deep, so a
+      window fetches every filled hour of the chunk it falls in: two variables are
+      ~540 MB in the young current chunk (~30 s) and ~2.2 GB in a full one (the
+      summer-2026 heat domes: ~2 min). The panel states the estimate for the dates.
+
+    What would move it: fewer bytes (a smaller `BOX`, a window in the young chunk), or
+    running near the bucket (molab in us-west-2), where the same read is seconds and
+    the decode becomes the floor. Not: another S3 client, more concurrency, or a
+    different query engine.
+    """)
+    return
+
+
 @app.cell
 def _(
     HOLD,
