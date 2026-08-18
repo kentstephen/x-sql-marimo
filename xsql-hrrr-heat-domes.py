@@ -301,6 +301,10 @@ def _():
 
     # Same cache file as the counties film (tmp, not a project .cache; None disables).
     CACHE_DIR = str(_tempfile.gettempdir()) + "/x-sql-marimo"
+    # Disk mirror of FULL time shards' byte ranges (the youngest shard grows hourly and
+    # stays live): a preset dome week costs the wire once, ever; later kernels read
+    # it from disk (measured 0.1 s vs 11 s for 60 inner chunks). None disables.
+    MIRROR_DIR = CACHE_DIR + "/hrrr-mirror/" + ANALYSIS_PREFIX.split("/")[-1]
 
     # ------------------------------------------------------------------ the film
     # Heat index: diverging blue <-> yellow/orange (protan-safe: no red leg, no
@@ -340,6 +344,7 @@ def _():
         LOAD_STOPS,
         MAP_HEIGHT,
         MEM_POOL_GB,
+        MIRROR_DIR,
         NOT_CONUS,
         OVERTURE_RELEASE,
         PIVOT,
@@ -1335,7 +1340,135 @@ async def _(
 
 
 @app.cell
-def _(ANALYSIS_BUCKET, ANALYSIS_PREFIX, CHUNK_CACHE_GB, READ_RAIN, READ_WIND, np, xr):
+def _(asyncio):
+    # A read-only zarr v3 Store that mirrors byte ranges of the icechunk session store
+    # to a local directory, keyed by (key, byte range) exactly as the sharding codec
+    # asks (shard index as a suffix range, inner chunks as (offset, length) ranges from
+    # that index; both stable for an immutable shard). The caller says which keys are
+    # mirrorable: full time shards of the read variables. Shared by copy with the
+    # other zarr notebooks once ported (docs/xarray-sql-multi-backend-notes.md).
+    import hashlib as _hashlib
+    import os as _os
+
+    from zarr.abc.store import OffsetByteRequest, RangeByteRequest, Store, SuffixByteRequest
+
+    class MirrorStore(Store):
+        def __init__(self, inner: Store, root: str, mirrorable):
+            super().__init__(read_only=True)
+            self.inner, self.root, self.mirrorable = inner, root, mirrorable
+            self.hits = self.misses = 0
+            _os.makedirs(root, exist_ok=True)
+
+        supports_writes = False
+        supports_deletes = False
+        supports_partial_writes = False
+        supports_listing = True
+
+        def __eq__(self, other):
+            return isinstance(other, MirrorStore) and other.inner == self.inner and other.root == self.root
+
+        def _tag(self, r):
+            if r is None:
+                return "all"
+            if isinstance(r, RangeByteRequest):
+                return f"r{r.start}-{r.end}"
+            if isinstance(r, OffsetByteRequest):
+                return f"o{r.offset}"
+            if isinstance(r, SuffixByteRequest):
+                return f"s{r.suffix}"
+            return "x" + _hashlib.sha1(repr(r).encode()).hexdigest()[:12]
+
+        def _path(self, key, r):
+            return _os.path.join(self.root, key.replace("/", "__") + "." + self._tag(r))
+
+        def _read(self, key, r, prototype):
+            p = self._path(key, r)
+            try:
+                with open(p, "rb") as f:
+                    self.hits += 1
+                    return prototype.buffer.from_bytes(f.read())
+            except FileNotFoundError:
+                return None
+
+        def _write(self, key, r, buf):
+            p = self._path(key, r)
+            tmp = f"{p}.{_os.getpid()}.{id(buf)}.tmp"
+            with open(tmp, "wb") as f:
+                f.write(buf.to_bytes())
+            try:
+                _os.replace(tmp, p)
+            except FileNotFoundError:  # a concurrent writer of the same range won; theirs is identical
+                pass
+
+        async def get(self, key, prototype, byte_range=None):
+            if not self.mirrorable(key):
+                return await self.inner.get(key, prototype, byte_range)
+            buf = await asyncio.to_thread(self._read, key, byte_range, prototype)
+            if buf is not None:
+                return buf
+            self.misses += 1
+            buf = await self.inner.get(key, prototype, byte_range)
+            if buf is not None:
+                await asyncio.to_thread(self._write, key, byte_range, buf)
+            return buf
+
+        async def get_ranges(self, key, byte_ranges, *, prototype, max_concurrency=10,
+                             max_gap_bytes=1 << 20, max_coalesced_bytes=16 << 20):
+            # serve the ranges on disk, fetch the rest through the inner store's own
+            # coalescing get_ranges, mirror each returned range under its exact request
+            if not self.mirrorable(key):
+                async for group in self.inner.get_ranges(key, byte_ranges, prototype=prototype, max_concurrency=max_concurrency,
+                                                         max_gap_bytes=max_gap_bytes, max_coalesced_bytes=max_coalesced_bytes):
+                    yield group
+                return
+            ranges = list(byte_ranges)
+            held = await asyncio.gather(*(asyncio.to_thread(self._read, key, r, prototype) for r in ranges))
+            hit = [(i, b) for i, b in enumerate(held) if b is not None]
+            if hit:
+                yield hit
+            miss = [i for i, b in enumerate(held) if b is None]
+            if not miss:
+                return
+            self.misses += len(miss)
+            async for group in self.inner.get_ranges(key, [ranges[i] for i in miss], prototype=prototype, max_concurrency=max_concurrency,
+                                                     max_gap_bytes=max_gap_bytes, max_coalesced_bytes=max_coalesced_bytes):
+                out = []
+                for j, buf in group:
+                    i = miss[j]
+                    if buf is not None:
+                        await asyncio.to_thread(self._write, key, ranges[i], buf)
+                    out.append((i, buf))
+                yield out
+
+        async def get_partial_values(self, prototype, key_ranges):
+            return list(await asyncio.gather(*(self.get(k, prototype, r) for k, r in key_ranges)))
+
+        async def exists(self, key):
+            return await self.inner.exists(key)
+
+        async def set(self, key, value):
+            raise NotImplementedError("read-only mirror")
+
+        async def delete(self, key):
+            raise NotImplementedError("read-only mirror")
+
+        def list(self):
+            return self.inner.list()
+
+        def list_prefix(self, prefix):
+            return self.inner.list_prefix(prefix)
+
+        def list_dir(self, prefix):
+            return self.inner.list_dir(prefix)
+
+        async def getsize(self, key):
+            return await self.inner.getsize(key)
+
+    return (MirrorStore,)
+
+
+@app.cell
+def _(ANALYSIS_BUCKET, ANALYSIS_PREFIX, CHUNK_CACHE_GB, MIRROR_DIR, MirrorStore, READ_RAIN, READ_WIND, np, xr):
     # THE STORE, opened once; only metadata and the 2-D lat/lon are read here. NO DASK:
     # chunks=None leaves it lazily indexed and xarray-sql cuts it into blocks itself.
     import time as _stime
@@ -1359,12 +1492,26 @@ def _(ANALYSIS_BUCKET, ANALYSIS_PREFIX, CHUNK_CACHE_GB, READ_RAIN, READ_WIND, np
             caching=icechunk.CachingConfig(num_bytes_chunks=int(CHUNK_CACHE_GB * (1 << 30)))
         ),
     ).readonly_session("main")
-    _ds = xr.open_zarr(_sess.store, consolidated=False, chunks=None)
     VARS = ["temperature_2m", "relative_humidity_2m"]
     if READ_RAIN:
         VARS.append("precipitation_surface")
     if READ_WIND:
         VARS += ["wind_u_10m", "wind_v_10m"]
+    # THE DISK MIRROR (MIRROR_DIR): full time shards of the read variables are read
+    # from disk after the first kernel that fetched them; the youngest shard (index
+    # _young) grows hourly and is never mirrored, nor is anything else in the store.
+    import zarr as _zarr
+
+    _T = _zarr.open_group(_sess.store, mode="r")["time"].shape[0]
+    _young = (_T - 1) // 2160
+    _mvars = set(VARS)
+
+    def _mirrorable(key, _young=_young, _mvars=_mvars):
+        p = key.split("/")
+        return len(p) == 5 and p[0] in _mvars and p[1] == "c" and p[2].isdigit() and int(p[2]) < _young
+
+    mirror = MirrorStore(_sess.store, MIRROR_DIR, _mirrorable) if MIRROR_DIR else None
+    _ds = xr.open_zarr(mirror if mirror is not None else _sess.store, consolidated=False, chunks=None)
     cube_all = _ds[VARS].rename({"time": "t"})
     all_times = cube_all["t"].values.astype("datetime64[m]")
     lat = _ds["latitude"].values.astype("float64")
@@ -1376,6 +1523,7 @@ def _(ANALYSIS_BUCKET, ANALYSIS_PREFIX, CHUNK_CACHE_GB, READ_RAIN, READ_WIND, np
         f"{source_note} · {len(VARS)} variables · grid {lat.shape[1]}x{lat.shape[0]} px · hourly "
         f"{np.datetime_as_string(all_times[0])} to {np.datetime_as_string(all_times[-1])} UTC "
         f"({all_times.size:,} steps) · open {_stime.perf_counter() - _st0:.1f}s"
+        + (f" · disk mirror of full shards in {MIRROR_DIR}" if mirror is not None else "")
     )
     return (
         VARS,
@@ -1385,6 +1533,7 @@ def _(ANALYSIS_BUCKET, ANALYSIS_PREFIX, CHUNK_CACHE_GB, READ_RAIN, READ_WIND, np
         grid_y,
         lat,
         lon,
+        mirror,
         source_note,
         store_stats,
     )
@@ -1620,6 +1769,7 @@ def _(
     coordinates_to_cells,
     cube_all,
     land_pred,
+    mirror,
     pa,
     pix2h,
     t0,
@@ -1717,6 +1867,7 @@ def _(
         fold_stats = (
             f"{_hours} hours · {len(VARS)} variables · {cell_hour.num_rows:,} cell-hour rows · "
             f"fold {_ftime.perf_counter() - _ft0:.1f}s on {ENGINE}"
+            + (f" · mirror {mirror.hits} ranges from disk, {mirror.misses} fetched" if mirror is not None else "")
         )
         HOLD["key"], HOLD["cell_hour"], HOLD["stats"] = _key, cell_hour, fold_stats
     return cell_hour, fold_stats

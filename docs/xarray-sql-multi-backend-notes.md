@@ -253,3 +253,33 @@ Alternatives NOT pursued (Stephen: "we're using dynamical"): per-hour archives
 (NODD GRIB2 with .idx byte ranges, Utah's HRRR-Zarr) would make a full-chunk dome
 week cost the same ~500 MB as a young-chunk week (4x fewer bytes) at the price of a
 different reader; the young-chunk case gains nothing from them.
+
+### The disk mirror (built 2026-08-18, in `xsql-hrrr-heat-domes.py`)
+
+`MirrorStore(inner, root, mirrorable)`: a read-only `zarr.abc.store.Store` around the
+icechunk session store. `get(key, prototype, byte_range)` and `get_ranges(key,
+byte_ranges, ...)` (zarr 3.3's coalescing batch read, which the sharding codec uses
+for inner chunks; the shard index comes through `get` as a `SuffixByteRequest`) serve
+from `root/<key with / as __>.<tag>` where tag is `r{start}-{end}` / `s{n}` / `o{n}` /
+`all`, fetch misses through the inner store (its own coalescing), and write each
+returned range under its exact request (atomic tmp + `os.replace`, unique tmp names:
+concurrent blocks request the same shard index and the same-pid name collided,
+`FileNotFoundError` inside a DataFusion partition). `mirrorable(key)` decides what is
+ever written: `{var}/c/{t}/{y}/{x}` with `var` in the read set and `t < young`, young
+= `(len(time)-1)//2160`; metadata, coordinates and the youngest shard stay live.
+Everything else (`exists`, `list*`, `getsize`) delegates; writes raise.
+
+Two-process test on 60 inner chunks (`scratchpad/mirror/test_mirror.py`): cold 11 s,
+warm 0.1 s, 170 MB in 61 files, identical mean. In the notebook, East dome week
+(2026-06-29 .. 07-05, full chunk), T + RH, res 6, DataFusion: cold notebook 183 s /
+fold 171.6 s / 1,020 ranges from disk (concurrent repeats within the run) + 1,072
+fetched; WARM NEW PROCESS 18 s / fold 7.0 s / 2,092 from disk, 0 fetched; dome table
+identical (9,510 blobs >= 500 km2, dissolve 3.2-3.7 s). Mirror 3.4 GB in tmp for the
+chunk (1,046 inner chunks + 16 shard indexes).
+
+marimo lesson: a cell may not import a name another cell already defines
+(`MultipleDefinitionError: asyncio`); the class cell takes `asyncio` as a ref and
+keeps `os`/`hashlib` private.
+
+Reminder recorded: port `CHUNK_CACHE_GB` and `MirrorStore` to the counties film and
+heat hex next session (Stephen: not now).

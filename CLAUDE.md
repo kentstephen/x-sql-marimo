@@ -272,6 +272,22 @@ marimo edit xsql-hrrr-heat-domes.py`, or `--sandbox`), with three additions:
   hour of the columns it touches; land pruning is the only filter. Portable by hand
   to the counties film and heat hex. Numbers in the notes doc.
 
+- **`MIRROR_DIR`: a disk mirror of full time shards** (`MirrorStore`, a read-only
+  zarr v3 Store cell wrapping the icechunk session store; keyed by (key, byte range)
+  exactly as the sharding codec asks; overrides `get` and `get_ranges`; only keys
+  the store cell marks mirrorable are written: the read variables' shards with time
+  index below the youngest, which grows hourly and stays live). Measured on the
+  East dome week, 2 variables, full chunk: cold 183 s (fold 172 s), a FRESH PROCESS
+  afterwards 18 s (fold 7.0 s, 2,092 ranges from disk, 0 fetched), same rows. 3.4 GB
+  in `$TMPDIR/x-sql-marimo/hrrr-mirror/<store version>/` per full chunk for two
+  variables (1,046 inner chunks + 16 shard indexes). `None` disables. `fold_stats`
+  reports hits/fetched. Lessons: tmp files need unique names (two blocks fetch the
+  same shard index at once; same-pid tmp names collided and `os.replace` raised
+  inside DataFusion), and a marimo cell may not re-import a name another cell
+  defines (`asyncio` is the imports cell's; the class cell takes it as a ref).
+  TO PORT next session (Stephen's instruction) to xsql-hrrr-counties.py and
+  xsql-hrrr-heat-hex.py, with `CHUNK_CACHE_GB`.
+
 The original `xsql-hrrr-heat-hex.py` is unchanged and stays on 0.3.x.
 
 `xsql-mapterhorn-explorer.py` (EXPERIMENTAL, open defects below) draws Mapterhorn terrain
