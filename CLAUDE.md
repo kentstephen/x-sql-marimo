@@ -230,6 +230,41 @@ to know:
   between counties at deep zoom (z8 geometry), left as is. `marimo export html` does
   not render the widget (same as lonboard).
 
+`xsql-hrrr-heat-domes.py` (2026-08-18, HEADLESS-PASSED, NOT YET FLOWN) is the heat hex
+film on the xarray-sql 0.4.0 PRE-RELEASE (`xarray-sql[duckdb]==0.4.0rc1` in its
+header; run it from the rc venv, `uv run --project xarray-sql-multi-backend-test
+marimo edit xsql-hrrr-heat-domes.py`, or `--sandbox`), with three additions:
+
+- **`ENGINE` in the constants cell**: `"datafusion"` (default; XarrayContext, the
+  h3ronpy UDF) or `"duckdb"` (the rc's `xql.register(con, "cube", ds, chunks=...)`,
+  a pushdown pyarrow dataset on the notebook's own DuckDB connection, duckdb-h3's
+  `h3_latlng_to_cell` in the GROUP BY). Same fold SQL text apart from the res literal.
+  Measured on the real cube, young chunk, 159 h, 2 variables: 39 s vs 179 s,
+  identical 33.5M rows and means. The DuckDB branch is verified by script
+  (`xarray-sql-multi-backend-test/fold_duckdb_real.py`), not yet inside the notebook.
+- **Boundaries of the sustained heat, moving with the film**: at each level in
+  `CONTOURS` (1, 3, 5, 10 degC of sustained excess) the browser draws the edge of the
+  set of cells at or above it, every frame, on either field, following the sliders.
+  Mechanism: a per-cell 6-neighbour index built once from h3-js
+  (`originToDirectedEdges` / `getDirectedEdgeDestination`, 0.55 s for 210k cells),
+  then a frame is one pass over the load matrix (edge on the boundary when the
+  destination is below the level or off land), edge coords cached lazily
+  (`directedEdgeToBoundary`), one PathLayer per level with binary attributes.
+  ~2 ms per level per frame warm; zero bytes across the bridge. Toggle: the
+  "boundaries" button in the fields row, or B. Light blue lines
+  ([120,200,255]), thin to thick by level.
+- **The dome table (DuckDB, kernel-side)**: numpy runs the accumulator at the
+  constants-cell defaults, DuckDB dissolves each cumulative (frame, level) set with
+  `h3_cells_to_multi_polygon_wkb`, `ST_Dump`s to blobs with Albers area
+  (`ST_Transform` to EPSG:5070; `ST_Area_Spheroid` returns NaN on these) and
+  centroid, drops blobs under `DOME_MIN_KM2` (500; the median blob is one cell of
+  speckle), and shows the largest blob per level plus the hour-by-hour track of the
+  second level's dome. 2.4 s for a week. `ST_Union_Agg` of hexagons is 30x slower on
+  the same input and is not used. Full numbers in
+  `docs/xarray-sql-multi-backend-notes.md`.
+
+The original `xsql-hrrr-heat-hex.py` is unchanged and stays on 0.3.x.
+
 `xsql-mapterhorn-explorer.py` (EXPERIMENTAL, open defects below) draws Mapterhorn terrain
 worldwide as extruded H3 columns: the DEM half of the parked
 `archive/xsql-duckdb-terrain-h3.py` standing alone, on the canopy notebook's chassis

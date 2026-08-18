@@ -183,3 +183,29 @@ overlap tracking of the surviving blobs (dome id, lifetime, track).
   representation, run the SQL, move back to an `xr.Dataset` (`xql.to_dataset` is that
   seam in the rc), then some xpublish variant serves the map (tiles). Stephen: "not
   sure if they're relevant at all". To discuss after the benchmarking.
+
+## `xsql-hrrr-heat-domes.py` (2026-08-18)
+
+The heat hex film rebuilt on the rc, Stephen's ask ("a new version of hrrr hex with this
+implementation ... see the boundaries move on their own for sustained heat, using the
+multi backend from the pre release"). Three additions, all recorded in CLAUDE.md's
+section for it: the `ENGINE` switch (DataFusion default, DuckDB via `xql.register`,
+same fold SQL), the browser-side moving boundaries (neighbour index + edge test +
+PathLayer, zero bridge bytes, slider-live), and the DuckDB dome table (A + D, size
+filtered, largest blob per level and the second level's track).
+
+The DuckDB-registered fold on the REAL cube (`fold_duckdb_real.py`): young chunk,
+159 h, 2 variables, `threads = 8`: 179.2 s against DataFusion's 38.8 s in the same
+process, identical 33,505,116 rows and mean temperature. Untuned (prefetch, coalesce,
+threads); the h3 step alone predicts ~4-5x from the synthetic ratio, so most of the
+gap is that, not the pushdown scan.
+
+Browser test in node on the real 210,724 cells (`scratchpad/bnd_test.mjs`, not kept):
+neighbour index 549 ms; boundary edges at frame 150 of the young-chunk film: level 1
+21,852 edges, 3: 11,320, 5: 9,450, 10: 2,570; 34 / 11 / 8 / 3 ms cold (coord cache
+filling), 1.7 ms warm.
+
+Headless export on the rc venv: fold 82 s on datafusion (5 variables, young chunk),
+dome dissolve + dump 2.4 s, tables built, no cell errors. NOT FLOWN: the flight is
+play with boundaries on over the sustained heat field, drag the threshold slider and
+watch the lines follow, B to toggle, then `ENGINE = "duckdb"` once for the record.
