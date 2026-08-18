@@ -1,0 +1,33 @@
+[project]
+name = "xarray-sql-multi-backend-test"
+version = "0.1.0"
+description = "Test bed for the xarray-sql 0.4.0 pre-release (multi-engine backends: DuckDB pushdown adapter alongside DataFusion)"
+requires-python = ">=3.13"
+
+# The root pyproject's dependency list, unchanged, except xarray-sql: here it is the
+# 0.4.0 release candidate (multi-engine backends, PR #227) with the [duckdb] extra so
+# xql.register(con, ...) works on a duckdb connection as well as a DataFusion
+# SessionContext. The rc pins datafusion==54.0.0 exactly.
+dependencies = [
+    "anywidget>=0.9",
+    "arro3-core",
+    "async-geotiff>=0.4",
+    "datafusion>=54.0.0",
+    "duckdb>=1.5.5",
+    "geoarrow-rust-core>=0.6",
+    "h3ronpy>=0.22.0",
+    "icechunk",
+    "lonboard[geotiff]>=0.16.0",
+    "marimo>=0.23.16",
+    "matplotlib==3.11.1",
+    "numpy==2.5.1",
+    "obstore>=0.9.2",
+    "pillow>=11",
+    "pyarrow>=25.0.0",
+    "xarray",
+    "xarray-sql[duckdb]==0.4.0rc1",
+    "zarr>=3",
+]
+
+[tool.uv]
+prerelease = "explicit"
