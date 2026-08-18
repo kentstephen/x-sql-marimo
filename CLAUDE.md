@@ -251,8 +251,8 @@ marimo edit xsql-hrrr-heat-domes.py`, or `--sandbox`), with three additions:
   destination is below the level or off land), edge coords cached lazily
   (`directedEdgeToBoundary`), one PathLayer per level with binary attributes.
   ~2 ms per level per frame warm; zero bytes across the bridge. Toggle: the
-  "boundaries" button in the fields row, or B. Light blue lines
-  ([120,200,255]), thin to thick by level.
+  "boundaries" button in the fields row, or B. Gold lines (inferno's
+  #f7d13d, Stephen's call), thin to thick and more opaque by level.
 - **The dome table (DuckDB, kernel-side)**: numpy runs the accumulator at the
   constants-cell defaults, DuckDB dissolves each cumulative (frame, level) set with
   `h3_cells_to_multi_polygon_wkb`, `ST_Dump`s to blobs with Albers area
@@ -262,6 +262,15 @@ marimo edit xsql-hrrr-heat-domes.py`, or `--sandbox`), with three additions:
   second level's dome. 2.4 s for a week. `ST_Union_Agg` of hexagons is 30x slower on
   the same input and is not used. Full numbers in
   `docs/xarray-sql-multi-backend-notes.md`.
+
+- **`CHUNK_CACHE_GB` (6): the store is opened with an icechunk chunk-bytes cache.**
+  icechunk's default retains nothing (a repeat read of the same shard measured the
+  same as cold, 19.7 s); with the budget the repeat is 0.3-0.5 s, and through
+  xarray-sql a second 168-h window in the same 90-day store chunk measured 2.1 s
+  against 120 s cold. The layout itself cannot be filtered finer: inner chunks are
+  (2160, 45, 45), the whole time depth, so a window always fetches every filled
+  hour of the columns it touches; land pruning is the only filter. Portable by hand
+  to the counties film and heat hex. Numbers in the notes doc.
 
 The original `xsql-hrrr-heat-hex.py` is unchanged and stays on 0.3.x.
 

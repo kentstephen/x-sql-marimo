@@ -209,3 +209,47 @@ Headless export on the rc venv: fold 82 s on datafusion (5 variables, young chun
 dome dissolve + dump 2.4 s, tables built, no cell errors. NOT FLOWN: the flight is
 play with boundaries on over the sustained heat field, drag the threshold slider and
 watch the lines follow, B to toggle, then `ENGINE = "duckdb"` once for the record.
+
+## Reading the cube faster: what was measured (2026-08-18, Stephen: "find a way to hold the store and filter it better")
+
+Store layout, `noaa-hrrr-analysis/v0.2.0.icechunk`, `temperature_2m`: shape
+(104151, 1059, 1799) float32, zarr v3 ShardingCodec, shards (2160, 540, 450), inner
+chunks (2160, 45, 45), bytes + blosc zstd-3 shuffle, crc32c index at the end, morton
+subchunk order. THE INNER CHUNK SPANS ALL 2,160 HOURS: no time window can ever be a
+partial read, so "filter it better" cannot reduce bytes below one full inner chunk per
+(45 x 45) column per variable. The land predicate (523 of 960 columns) is the only
+filter the layout allows and it is already in.
+
+Per-object costs from home (24 MB/s link), one variable, a full chunk: one inner chunk
+cold 1.8 s (a 17.5 MB decoded column, ~2 MB compressed); a neighbour inner chunk in
+the same shard 0.4 s (index cached); the whole shard, 120 inner chunks / 2 GB
+decoded, 19.1 s; the same shard again with the chunk cache 0.47 s. The very first
+read in a fresh Repository was ~20 s regardless of size (manifest fetch, paid once).
+
+**icechunk's default chunk cache does not retain bytes**: `CachingConfig()` is all
+None, and a repeat read of the same inner chunk was 19.7 s after 20.5 s cold. With
+`RepositoryConfig(caching=CachingConfig(num_bytes_chunks=N))` the repeat is
+0.3-0.5 s. The cache is per Repository in the Rust core and shared across the threads
+DataFusion opens.
+
+Through xarray-sql (`bench_chunk_cache.py`), 168-h windows over the WHOLE CONUS box
+of a full chunk, one variable, no land pruning: without the cache 125 s then 120 s
+(two windows in the same chunk, both cold, as the notebook behaves today); with a
+6 GB cache 168 s cold then **2.1 s** for the second window. The 168-vs-125 cold
+difference is one shot on a home link and is not yet repeated.
+
+Adopted in `xsql-hrrr-heat-domes.py`: `CHUNK_CACHE_GB = 6` (constants cell), the
+store cell opens the Repository with that CachingConfig. Effect: a second window
+inside the same 90-day store chunk, a res change, or rain/wind added later refetch
+nothing already held; the fold becomes decode + SQL, seconds. Budget arithmetic: a
+full chunk is ~1.1 GB compressed per variable over CONUS land, so 6 GB holds a full
+quarter of T + RH + rain + u + v. Portable by hand to the counties film and heat hex
+(same store cell). Not adopted: a disk cache across restarts (a zarr Store wrapper
+that mirrors byte ranges to CACHE_DIR would make repeats free after a kernel
+restart; ~40 lines, unbuilt) and a parquet memo of the fold output per window
+(35M rows, ~300 MB, instant repeats of a preset week across restarts; unbuilt).
+
+Alternatives NOT pursued (Stephen: "we're using dynamical"): per-hour archives
+(NODD GRIB2 with .idx byte ranges, Utah's HRRR-Zarr) would make a full-chunk dome
+week cost the same ~500 MB as a young-chunk week (4x fewer bytes) at the price of a
+different reader; the young-chunk case gains nothing from them.

@@ -265,6 +265,9 @@ def _():
     # h3_latlng_to_cell in the same SQL. Measured, young chunk, 159 h, 2 variables:
     # 39 s vs 179 s, identical rows. DataFusion is the default for that reason.
     ENGINE = "datafusion"
+    # icechunk chunk-bytes cache, GB (store cell): what the process holds of the store
+    # after a read. 0 disables. See the store cell for the measurement.
+    CHUNK_CACHE_GB = 6
     # Boundary levels: degC of sustained excess; the browser outlines the set of
     # cells at or above each, every frame, and the dome table dissolves the same sets.
     CONTOURS = [1.0, 3.0, 5.0, 10.0]
@@ -324,6 +327,7 @@ def _():
         ANALYSIS_PREFIX,
         BOX,
         CACHE_DIR,
+        CHUNK_CACHE_GB,
         CONTOURS,
         COUNTY_Z,
         DAYS,
@@ -534,7 +538,7 @@ def _(anywidget, traitlets):
           // boundary at level lvl is every directed edge whose origin is at/above lvl and
           // whose destination is not: cellsToMultiPolygon before the ring walk.
           let nbr = null, edgeXY = new Map(), showBounds = true;
-          const BND_RGB = [120, 200, 255];  // light blue: reads on the dark low end and the yellow top
+          const BND_RGB = [247, 209, 61];  // gold, inferno's #f7d13d stop (Stephen: "a gold similar to the cmap"); alpha steps by level
           function buildNbr() {
             if (nbr || !N) return;
             const t0 = performance.now();
@@ -1331,7 +1335,7 @@ async def _(
 
 
 @app.cell
-def _(ANALYSIS_BUCKET, ANALYSIS_PREFIX, READ_RAIN, READ_WIND, np, xr):
+def _(ANALYSIS_BUCKET, ANALYSIS_PREFIX, CHUNK_CACHE_GB, READ_RAIN, READ_WIND, np, xr):
     # THE STORE, opened once; only metadata and the 2-D lat/lon are read here. NO DASK:
     # chunks=None leaves it lazily indexed and xarray-sql cuts it into blocks itself.
     import time as _stime
@@ -1342,7 +1346,19 @@ def _(ANALYSIS_BUCKET, ANALYSIS_PREFIX, READ_RAIN, READ_WIND, np, xr):
     _storage = icechunk.s3_storage(
         bucket=ANALYSIS_BUCKET, prefix=ANALYSIS_PREFIX, region="us-west-2", anonymous=True
     )
-    _sess = icechunk.Repository.open(_storage).readonly_session("main")
+    # HOLD THE STORE: icechunk's default chunk cache does not retain bytes (a repeat
+    # read of the same shard measured 19.7 s, the same as cold); with a chunk-bytes
+    # budget the repeat is 0.3-0.5 s (docs/xarray-sql-multi-backend-notes.md). The
+    # cache is per Repository in the Rust core, shared by every thread DataFusion
+    # opens, so a second window in the same 90-day store chunk, a res change, or
+    # rain/wind added later refetch nothing already held. Budget: a full chunk is
+    # ~1.1 GB compressed per variable over CONUS land.
+    _sess = icechunk.Repository.open(
+        _storage,
+        config=icechunk.RepositoryConfig(
+            caching=icechunk.CachingConfig(num_bytes_chunks=int(CHUNK_CACHE_GB * (1 << 30)))
+        ),
+    ).readonly_session("main")
     _ds = xr.open_zarr(_sess.store, consolidated=False, chunks=None)
     VARS = ["temperature_2m", "relative_humidity_2m"]
     if READ_RAIN:
