@@ -165,8 +165,8 @@ def _(mo):
     pixel column is 2,160 hours = 90 days deep), so a window fetches every filled hour
     of the chunk it falls in, whatever its length, and the link, not the code, sets
     the pace. A week in the current, part-filled chunk is about thirty seconds for
-    two variables on a ~200 Mbit link; the opening window (the eastern heat dome of
-    Jun 29 to Jul 5, 2026) sits in a full chunk and is about two minutes; the panel
+    two variables on a ~200 Mbit link; the opening window (the Plains heat dome of
+    Jul 23 to 29, 2026) sits in a full chunk and is about two minutes; the panel
     states the estimate for whatever dates you pick. Rain and wind are off by default
     because each variable is another chunk read; flip `READ_RAIN` / `READ_WIND` in
     the constants cell to have them. All of that is the distance to the bucket, which

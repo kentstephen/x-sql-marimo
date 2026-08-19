@@ -195,8 +195,8 @@ def _(mo):
     pixel column is 2,160 hours = 90 days deep), so a window fetches every filled hour
     of the chunk it falls in, whatever its length, and the link, not the code, sets
     the pace. A week in the current, part-filled chunk is about thirty seconds for
-    two variables on a ~200 Mbit link; the opening window (the eastern heat dome of
-    Jun 29 to Jul 5, 2026) sits in a full chunk and is about two minutes; the panel
+    two variables on a ~200 Mbit link; the opening window (the Plains heat dome of
+    Jul 23 to 29, 2026) sits in a full chunk and is about two minutes; the panel
     states the estimate for whatever dates you pick. Rain and wind are off by default
     because each variable is another chunk read; flip `READ_RAIN` / `READ_WIND` in
     the constants cell to have them. All of that is the distance to the bucket, which
@@ -237,13 +237,18 @@ def _():
     #       35 degC (0.22-0.24 on Jul 25-27 against 0.13 for the West dome's Jul 8-12)
     #       and the highest CONUS-mean day (Jul 27)
     #   DAYS = 7                              # the last week: the current chunk, ~30 s while young
-    # The opening window is the eastern dome, the summer's worst by the human numbers
+    # The eastern dome (the opening window until 2026-08-19) is the summer's worst by the human numbers
     # (Wikipedia, 2026 North American heat wave: at least 44 heat deaths Jul 1-4, 180
     # million people under major or extreme heat risk, Atlantic City 106 F on Jul 4,
     # daily records in Boston, Philadelphia and Washington on Jul 2; storms broke it up
     # Jul 4-6). Humid, so the heat index is the right lens, and the nights are the story.
-    DAYS = 7   # the last week (the young chunk, ~40 s for two variables); the dome
-    #            presets above are full chunks, ~2 min
+    # Since 2026-08-19 it opens on the Plains dome (same as heat hex since 2026-08-17):
+    # the hottest 7-day CONUS-wide stretch in the store's span (Oct 2014 on). July 2026
+    # is NOAA's hottest CONUS month in the 132-year record (76.9 F), and the store's own
+    # scan puts the CONUS-wide peak at Jul 25-27. A full chunk, ~2 min cold; seconds
+    # once the MirrorStore holds it.
+    DAYS = ("2026-07-23", "2026-07-29")   # Plains dome; a full chunk, ~2 min
+    # DAYS = 7   # the last week (the young chunk, ~40 s for two variables)
     HOURLY_MAX_DAYS = 14  # 336 frames x 210k cells = 71 MB per field across the bridge
 
     # ------------------------------------------------------------------ the fold
@@ -417,7 +422,7 @@ def _(anywidget, traitlets):
                 font: 12px/1.35 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--ink); background: #0f1216; }
           .hf * { box-sizing: border-box; }
           .hf .hf-num { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
-          .hf .hf-map { position: relative; width: 100%; background: #0b0d10; overflow: hidden; }
+          .hf .hf-map { position: relative; width: 100%; background: #000; overflow: hidden; }
           .hf .hf-map:fullscreen { height: 100vh !important; width: 100vw; }
           .hf .hf-hud { position: absolute; z-index: 5; }
           .hf .hf-hud.hf-tl { top: .6rem; left: .6rem; width: 22rem; max-width: calc(100% - 1.2rem); }
@@ -437,7 +442,11 @@ def _(anywidget, traitlets):
           .hf .hf-cell { margin-top: .35rem; display: none; }
           .hf.hf-picked .hf-cell { display: block; }
           .hf .hf-chart { display: block; width: 100%; height: 96px; margin-top: .3rem; cursor: crosshair; }
-          .hf.hf-collapsed .hf-body, .hf.hf-collapsed .hf-sub { display: none; }  /* hide folds the panel; the field switch and the ramp stay */
+          /* hide collapses the panel completely (Stephen, 2026-08-19): only the show button
+             remains, the card shrinks around it; a pick reopens it (select()) */
+          .hf.hf-collapsed .hf-panel > :not(.hf-head), .hf.hf-collapsed .hf-head > span { display: none; }
+          .hf.hf-collapsed .hf-hud.hf-tl { width: auto; }
+          .hf.hf-collapsed .hf-panel { padding: .25rem .5rem; }
           .hf .hf-toggle, .hf .hf-clear { background: none; border: 0; color: var(--dim); cursor: pointer; font: inherit; padding: 0 .1rem; }
           .hf .hf-toggle:hover, .hf .hf-clear:hover { color: var(--ink); }
           .hf .hf-params { margin-top: .45rem; padding-top: .4rem; border-top: 1px solid rgba(255,255,255,.08); }
@@ -715,14 +724,14 @@ def _(anywidget, traitlets):
               if (qv === 255) { target[0] = 40; target[1] = 44; target[2] = 50; target[3] = 60; return target; }
               let t = (qv / 10) / loadHi; if (t > 1) t = 1;
               const j = Math.round(t * 255) * 3;
-              target[0] = lutL[j]; target[1] = lutL[j + 1]; target[2] = lutL[j + 2]; target[3] = 60 + Math.round(175 * t);
+              target[0] = lutL[j]; target[1] = lutL[j + 1]; target[2] = lutL[j + 2]; target[3] = 255;
               return target;
             }
             const qv = frames[k];
             if (qv === 255) { target[0] = 40; target[1] = 44; target[2] = 50; target[3] = 60; return target; }
             let t = (HI_OF(qv) - cfg.lo) / (cfg.hi - cfg.lo); t = t < 0 ? 0 : t > 1 ? 1 : t;
             const j = Math.round(t * 255) * 3;
-            target[0] = lutI[j]; target[1] = lutI[j + 1]; target[2] = lutI[j + 2]; target[3] = 225;
+            target[0] = lutI[j]; target[1] = lutI[j + 1]; target[2] = lutI[j + 2]; target[3] = 255;
             return target;
           }
           const tiles = (id, url, opacity) => new TileLayer({
@@ -733,10 +742,14 @@ def _(anywidget, traitlets):
             },
           });
           function layers() {
-            // Dark matter (Stephen's call after a Positron round: the sustained-heat ramp
-            // runs down to black, but the low end is drawn faint, alpha 60, and the dark
-            // ground reads better under the film).
-            const out = [tiles("base", "https://basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}.png", 1.0)];
+            // No basemap tiles (Stephen, 2026-08-19, ported from heat hex): a blank
+            // true-black canvas (the .hf-map background, #000) and the cells drawn at
+            // alpha 255 (Stephen: "opacity 1"), so the bottom of the inferno load ramp,
+            // black, melts into the ground and only the heat shows; the no-pixel
+            // cells keep their faint grey. The Carto dark-matter base it replaced was
+            // one line here
+            // (tiles("base", ".../dark_nolabels/{z}/{x}/{y}.png", 1.0)).
+            const out = [];
             if (N && frames) {
               out.push(new H3HexagonLayer({
                 id: "cells",
@@ -758,7 +771,8 @@ def _(anywidget, traitlets):
               }));
             }
             if (N && frames) out.push(...boundaryLayers());
-            out.push(tiles("labels", "https://basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}.png", 0.6));
+            // Carto place labels off too (Stephen, 2026-08-19); the line to bring them
+            // back: out.push(tiles("labels", ".../dark_only_labels/{z}/{x}/{y}.png", 0.6)).
             return out;
           }
 
@@ -911,6 +925,8 @@ def _(anywidget, traitlets):
               parent: mapEl,
               initialViewState: HOME,
               controller: true,
+              // Blank canvas, cleared to true black like .hf-map (no basemap).
+              parameters: {clearColor: [0, 0, 0, 1]},
               layers: layers(),
               onError: e => { ruler.textContent = "deck: " + (e && e.message ? e.message : e); },
             });
