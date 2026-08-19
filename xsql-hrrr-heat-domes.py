@@ -427,7 +427,7 @@ def _(anywidget, traitlets):
           .hf .hf-ttl { font-weight: 600; }
           .hf .hf-sub { color: var(--dim); display: block; margin-top: .1rem; }
           .hf .hf-fields { display: flex; gap: .3rem; margin-top: .5rem; }
-          .hf .hf-fields button { flex: 1; }
+          .hf .hf-fields button.hf-b { flex: 0 0 auto; font-size: 11px; padding: .12rem .4rem; min-width: 0; }
           .hf .hf-fields button.hf-on { background: #3a3f2a; border-color: var(--accent); color: #fff; }
           .hf .hf-legend { display: flex; align-items: center; gap: .45rem; margin-top: .45rem; }
           .hf .hf-grad { height: .55rem; flex: 1; border: 1px solid rgba(255,255,255,.12); }
