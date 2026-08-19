@@ -285,8 +285,12 @@ marimo edit xsql-hrrr-heat-domes.py`, or `--sandbox`), with three additions:
   same shard index at once; same-pid tmp names collided and `os.replace` raised
   inside DataFusion), and a marimo cell may not re-import a name another cell
   defines (`asyncio` is the imports cell's; the class cell takes it as a ref).
-  TO PORT next session (Stephen's instruction) to xsql-hrrr-counties.py and
-  xsql-hrrr-heat-hex.py, with `CHUNK_CACHE_GB`.
+  PORTED 2026-08-19 with `CHUNK_CACHE_GB` to xsql-hrrr-counties.py (analysis
+  source only; the forecast branch sets `mirror = None`) and xsql-hrrr-heat-hex.py,
+  same class by copy, same dir: heat hex's East dome week then read T + RH from the
+  mirror heat-domes had written (3,618 ranges from disk, 1,612 fetched for rain +
+  wind), fold 108.9 s against 263 s measured before. Counties' opening window is in
+  the youngest shard, so it reports 0/0 until a window reaches an older shard.
 
 The original `xsql-hrrr-heat-hex.py` is unchanged and stays on 0.3.x.
 

@@ -281,5 +281,10 @@ marimo lesson: a cell may not import a name another cell already defines
 (`MultipleDefinitionError: asyncio`); the class cell takes `asyncio` as a ref and
 keeps `os`/`hashlib` private.
 
-Reminder recorded: port `CHUNK_CACHE_GB` and `MirrorStore` to the counties film and
-heat hex next session (Stephen: not now).
+Ported 2026-08-19: `CHUNK_CACHE_GB` and `MirrorStore` (by copy) in
+`xsql-hrrr-counties.py` (analysis source; forecast branch `mirror = None`) and
+`xsql-hrrr-heat-hex.py`. Headless: counties 7-day window fold + join 23.1 s, mirror
+0/0 (youngest shard, not mirrorable); heat hex East dome week, 5 variables, fold
+108.9 s with 3,618 ranges from disk (T + RH written by heat-domes the day before,
+shared dir) and 1,612 fetched (rain + wind), against 263 s measured for the same
+window before.
