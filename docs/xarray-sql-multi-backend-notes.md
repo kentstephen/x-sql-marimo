@@ -288,3 +288,34 @@ Ported 2026-08-19: `CHUNK_CACHE_GB` and `MirrorStore` (by copy) in
 108.9 s with 3,618 ranges from disk (T + RH written by heat-domes the day before,
 shared dir) and 1,612 fetched (rain + wind), against 263 s measured for the same
 window before.
+
+### Both engines sequentially in one process (`fold_both_engines.py`, 2026-08-19)
+
+The question was whether the notebook could run both engines at once. It cannot as
+written (ENGINE is one constant, the fold cell branches), and concurrently there is
+no win (both would split the same wire and decode the same bytes). What was worth
+measuring is the sequential case now that the mirror exists: fold on DataFusion,
+then the identical window and SQL on DuckDB in the same process
+(`xarray-sql-multi-backend-test/fold_both_engines.py`, the heat domes notebook
+patched to the East dome week 2026-06-28 .. 07-04, T + RH only, res 6, 168 h).
+
+| leg | fold | mirror |
+|---|---|---|
+| DataFusion (notebook default) | 6.2 s | 2,092 ranges from disk, 0 fetched |
+| DuckDB, same window, right after | 107.4 s | 2,586 from disk, 494 fetched |
+
+Rows and means identical (35,401,632; tc 23.3390, rh 60.0261). Two findings:
+
+- **The young-chunk gap (DataFusion 38.8 s, DuckDB 179.2 s, ~4.6x) WIDENS to ~17x
+  off the mirror**: DataFusion's leg collapses to 6.2 s once the bytes are local,
+  DuckDB's stays pipeline-bound at ~107 s. DataFusion as the default engine is
+  even more clearly right on a warm machine.
+- **The mirror is keyed by exact (key, byte range), and the DuckDB pushdown
+  dataset groups its range requests differently than the DataFusion block path**,
+  so 494 of its ranges missed a mirror that fully served DataFusion and went to
+  the wire. Those misses are written on the way through, so a repeat DuckDB fold
+  reads all-disk; but the bulk of the 107 s is the DuckDB pipeline itself, not
+  the fetch.
+
+So the sequential A/B is cheap on the DataFusion side and correct on both, but the
+DuckDB leg is not "nearly free": budget ~2 min for it even fully warm.
