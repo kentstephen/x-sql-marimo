@@ -99,7 +99,7 @@ replacement scan cannot see them). Design notes in docs/hrrr-heat-hex-notes.md.
 
 import marimo
 
-__generated_with = "0.23.16"
+__generated_with = "0.24.0"
 app = marimo.App(width="full")
 
 
@@ -247,7 +247,7 @@ def _():
     # is NOAA's hottest CONUS month in the 132-year record (76.9 F), and the store's own
     # scan puts the CONUS-wide peak at Jul 25-27. A full chunk, ~2 min cold; seconds
     # once the MirrorStore holds it.
-    DAYS = ("2026-07-23", "2026-07-29")   # Plains dome; a full chunk, ~2 min
+    DAYS = ("2026-07-01", "2026-07-07")   # Plains dome; a full chunk, ~2 min
     # DAYS = 7   # the last week (the young chunk, ~40 s for two variables)
     HOURLY_MAX_DAYS = 14  # 336 frames x 210k cells = 71 MB per field across the bridge
 
@@ -1484,7 +1484,17 @@ def _(asyncio):
 
 
 @app.cell
-def _(ANALYSIS_BUCKET, ANALYSIS_PREFIX, CHUNK_CACHE_GB, MIRROR_DIR, MirrorStore, READ_RAIN, READ_WIND, np, xr):
+def _(
+    ANALYSIS_BUCKET,
+    ANALYSIS_PREFIX,
+    CHUNK_CACHE_GB,
+    MIRROR_DIR,
+    MirrorStore,
+    READ_RAIN,
+    READ_WIND,
+    np,
+    xr,
+):
     # THE STORE, opened once; only metadata and the 2-D lat/lon are read here. NO DASK:
     # chunks=None leaves it lazily indexed and xarray-sql cuts it into blocks itself.
     import time as _stime
@@ -2012,9 +2022,7 @@ def _(
     THRESHOLD,
     WIND_VENT,
     film,
-    fold_stats,
     frame_labels,
-    frame_stats,
     has_rain,
     has_wind,
     hi_q,
@@ -2050,7 +2058,7 @@ def _(
             "height": MAP_HEIGHT,
             "title": f"heat index · {source_note}",
             "subtitle": f"{window_note} · {n_days} days · hourly",
-            "meta": f"{fold_stats} · {frame_stats}",
+            # "meta": f"{fold_stats} · {frame_stats}",
             "win": win_cfg,
             "autoplay": False,
         }
@@ -2079,7 +2087,24 @@ def _(mo):
 
 
 @app.cell
-def _(CONTOURS, DOME_MIN_KM2, HALF_LIFE, RAIN_FLUSH, THRESHOLD, WIND_VENT, cells, con, frame_labels, has_rain, has_wind, hi_q, mo, np, pa, wx_q):
+def _(
+    CONTOURS,
+    DOME_MIN_KM2,
+    HALF_LIFE,
+    RAIN_FLUSH,
+    THRESHOLD,
+    WIND_VENT,
+    cells,
+    con,
+    frame_labels,
+    has_rain,
+    has_wind,
+    hi_q,
+    mo,
+    np,
+    pa,
+    wx_q,
+):
     import time as _dtime
 
     _dt0 = _dtime.perf_counter()
@@ -2148,7 +2173,7 @@ def _(CONTOURS, DOME_MIN_KM2, HALF_LIFE, RAIN_FLUSH, THRESHOLD, WIND_VENT, cells
         mo.ui.table(_rows, selection=None, label="largest blob per level over the film"),
         mo.ui.table(_trk, selection=None, page_size=12, label=f"the ≥ {_track_level:g} °C dome, hour by hour (largest blob: area and centroid)"),
     ])
-    return dome_stats, dome_summary, dome_track
+    return
 
 
 @app.cell
