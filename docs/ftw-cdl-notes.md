@@ -149,12 +149,11 @@ CDL class change, county roll-ups.
 
 ## Rebuild the same day (Stephen's review)
 
-His points, verbatim in substance: no analysis button (I had moved it); "no way
-to show data that isn't crops even though that's default unselected" (the
-polygon layer replaced the pixels); "fields' shapes can change over time, so
-it's not super helpful to have just 2024 and 2025 if we're looking at fields
-from back to 2008"; "we can either mask for FTW or not"; the P(field) leg was
-only a table, not on the map; and a worry that the dashboard would be confusing.
+Review points: no analysis button (it had been moved); no way to show
+non-crop data (the polygon layer replaced the pixels); field shapes change over
+time, so 2024/2025 polygons cannot frame 2008; FTW is a mask or not; the
+P(field) leg was only a table, not on the map; and the dashboard risked being
+confusing.
 The rebuild is the crops notebook plus ONE control, `FTW: off / mask / fields /
 disagreement`: the map is always CDL pixels; mask keeps pixels inside a field
 (2024 footprint for older years, stated in the status); fields and disagreement
@@ -176,15 +175,15 @@ on the rc backend too.
 
 ## Third shape the same day (the one that stands)
 
-Stephen on build 2: "the fields are the mask", and he wanted to see the
-disagreement WITH the fields. Final controls: the crops notebook's, plus two
+Review of build 2: the fields ARE the mask, and the disagreement had to be
+visible WITH the fields. Final controls: the crops notebook's, plus two
 checkboxes, `fields` (clip + outlines, one deck layer: outline rows appended to
 the pixel table with transparent fill, 4-channel colours, stroked only while
 on) and `disagreement` (repaint; 2024-2025 only, greyed out otherwise with the
 reason). 2024 and 2025 are served from CDL's 10 m group (his call: FTW's own
 resolution); older years 30 m, fields still clip them. The fields-majority fill
-mode is gone. His todo: picking ("who says who's growing what"), not now; the
-route is the HRRR film's geometric picking in JS, not the bundle patch.
+mode is gone. Todo: picking (which dataset says what at a point), not now; the route is the
+HRRR film's geometric picking in JS, not the bundle patch.
 
 Driven (playwright, root venv, 1500x950), third shape: open `4x · 40 m pixels ·
 99,820 drawn · year 2025 · FTW 2025 fields` 6.6 s (cold: the first serve builds
@@ -200,7 +199,7 @@ from the root venv.
 
 ## Serve cost round (2026-08-20, evening)
 
-Stephen: warm moves still "several seconds". Driven pans with fields on, before:
+Warm moves still took several seconds. Driven pans with fields on, before:
 kernel 2.0-3.4 s per pan when the polygons had to be re-fetched (the fetch was
 per serve box), 18 s on a pan that left a 2.5x-padded box (the parquet read is
 row-group bound: ~48 row groups of ~13 MB per state file, spatially sorted, so
@@ -216,9 +215,8 @@ is fewer rows on the 10 m ladder (PX_PER / ROW_BUDGET), a resolution trade.
 
 ## Bitmap (2026-08-20, night)
 
-Stephen: the polygon squares buy nothing (not even picking, which needs the
-same JS route either way); "is there any way we can change the data less
-coming into lonboard?" Yes: the picture. Same SQL and caches; the serve ends
+The polygon squares bought nothing (not even picking, which needs the same JS
+route either way); less data into lonboard means the picture. Same SQL and caches; the serve ends
 in a PNG of the view (numpy Albers forward, closed form, mm-exact vs DuckDB;
 PIL draws the FTW rings), one BitmapLayer, bounds = the view box. 0.4-1.1 MB
 per serve at any resolution (was 12-18 MB of polygons), ROW_BUDGET 3M so the
@@ -234,13 +232,12 @@ the Kings River foothill pasture as large blue (FTW fields, CDL non-crop).
 
 ## End of 2026-08-20
 
-Stephen flew the bitmap serve (edit and run): moves are fast when cached and
-~10 s when not; "the polygons were faster"; "I don't see the benefit"; he ended
-the conversation. The 10 s is the FTW parquet read on a miss (row groups of
-13 MB, 3-10 s from home), independent of the layer type. The proposed fix,
-undecided: download each state file once into the tmp cache in the background
-when fields is ticked (CA 629 MB, ~25-30 s once), then all fields moves are
-local. Also undecided: polygons back (6b816ac) vs bitmap with ROW_BUDGET 420k,
-capped fetch threads, no prefetch. Nothing from the night's serve work is
-validated by him; the driven harness measured kernel and paint times and did
-not capture what he felt (likely CPU saturation). See CLAUDE.md.
+Flown (edit and run): moves are fast when the FTW cache hits and ~10 s when it
+misses. The 10 s is the FTW parquet read on a miss (row groups of 13 MB,
+3-10 s from home), independent of the layer type. Proposed fix, undecided:
+download each state file once into the tmp cache in the background when
+fields is ticked (CA 629 MB, ~25-30 s once), then all fields moves are local.
+Also undecided: polygons back (6b816ac) vs bitmap with ROW_BUDGET 420k, capped
+fetch threads, no prefetch. The bitmap serve is not validated interactively;
+the driven harness measured kernel and paint times and did not capture the
+interactive feel (likely CPU saturation). See CLAUDE.md.
