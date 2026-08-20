@@ -570,6 +570,22 @@ duckdb as a backend"). Full recon and numbers in `docs/ftw-cdl-notes.md`.
   `ST_Contains` into 5k fields 0.5 s, rings 0.1 s, WKB parse 0.0 s. marimo
   mangling lesson again: an underscore helper must be DEFINED ABOVE the
   generator that calls it in the same cell (`_ftw_warm`).
+- **Night round, after Stephen flew the bitmap ("slower, more sluggish",
+  "camera… nothing happens"; opening on fields over a city made no sense; a
+  first "everything" frame then snapping to the clip read as wrong):** (1) the
+  serve generator held `con_lock` across its stages and a camera move between
+  them abandoned it unclosed, so every later serve blocked forever: it is now
+  closed in a `finally`; (2) the whole serve ran ON the kernel loop and froze
+  the page for its duration: it now runs in a worker thread
+  (`run_in_executor(None, next, gen)`), only the image swap on the loop;
+  (3) `OVERSAMPLE` 1.5 -> 1.0 (4M output pixels per serve was seconds on a
+  laptop); (4) HOME is the Delta WEST OF STOCKTON at zoom 12, fields OFF at
+  open (plain CDL first, as crops), and the two-stage paint is gone: a cold
+  FTW miss keeps the previous picture with `· fetching FTW…` until the frame
+  is ready; (5) an in-flight prefetch that covers the box is awaited instead
+  of starting a second read. Driven after (1)-(4): warm pans with fields
+  0.6-0.8 s kernel / ~2 s wall, PNGs 150-350 KB; cold misses 3.5-17 s, all
+  parquet network time from home.
 - **TODO, Stephen's (not now): picking.** Click a pixel or field to see who says
   what ("who says who's growing what"). He expects it to need the lonboard
   bundle patch (two-layer ids) and does not want that; the HRRR counties film's

@@ -203,15 +203,16 @@ def _():
     # years are served from the 10 m group, FTW's own resolution (Stephen).
     YEARS = list(range(2008, 2026))
     YEAR0 = 2025                  # CDL year at open
-    FIELDS0 = True                # the fields checkbox at open
+    FIELDS0 = False               # the fields checkbox at open: plain CDL first
 
     ACRES_PER_KM2 = 247.10538
 
     PX_PER = 1.0                  # level floor: largest k with pixel <= PX_PER screen px
     ROW_BUDGET = 3_000_000        # max pixels per serve (numpy rows, not polygons; the
     # picture is the same size whatever the count); over it, coarsen a level
-    OVERSAMPLE = 1.5              # picture px per screen px (deck filters the bitmap
-    # linearly; 1.5 keeps level pixels crisp without 4x the bytes)
+    OVERSAMPLE = 1.0              # picture px per screen px (1.5 looked crisper but
+    # pushed ~4M output pixels through the Albers transform + PNG encode per
+    # serve, seconds on a laptop; 1.0 is the screen's own resolution)
     FTW_BOX_DEG2 = 0.35           # FTW modes only when the (padded) box is under this
     FTW_PAD = 1.6                 # the FTW fetch covers PAD x the serve box each side
     FTW_FETCH_DEG2 = 0.4          # ... capped at this area. Measured: the state file
@@ -220,7 +221,7 @@ def _():
     # a modest pad makes small pans and zoom-ins hits without that bill
     MARGIN = 0.35                 # fold box slack beyond the viewport
     VIEW_W, VIEW_H = 1400, 700    # the usual guess; no ruler
-    HOME = {"longitude": -119.78, "latitude": 36.72, "zoom": 12.0}  # Fresno County
+    HOME = {"longitude": -121.45, "latitude": 37.95, "zoom": 12.0}  # the Delta west of Stockton
 
     # disagreement paint (protan-safe: grey / orange / blue, no red-green axis)
     DIS = {
@@ -727,7 +728,6 @@ def _(anywidget, traitlets):
             return [l, i];
           };
           const [labF, fld] = mk("fields");
-          fld.checked = true;
           const [labD, dis] = mk("disagreement");
           const syncFtw = () => {
             const ok = +range.value >= 2024;
@@ -944,8 +944,8 @@ def _(
     # from SQL, outlines drawn on top), so the payload is a few hundred KB at
     # any resolution instead of a polygon per pixel (Stephen, 2026-08-20: the
     # squares bought nothing, not even picking). The opening image is HOME
-    # (Fresno County) as plain pixels from the 10 m group's 40 m level; the
-    # wiring's first forced serve replaces it with the fields-clipped view.
+    # as plain pixels from the 10 m group's 40 m level; the wiring's first
+    # forced serve replaces it with the served level.
     # NEVER image="" (deck's whole update pass dies, repo lesson): the opening
     # image is a real PNG.
     _W, _S, _E, _N = bbox4326(HOME)
@@ -1176,7 +1176,10 @@ def _(
         row groups warm in fcon's httpfs cache and lands as a table."""
         cache = HOLD.setdefault("fcache", {})
         pf = HOLD.get("prefetch")
-        if pf is not None and pf[0].done():
+        if pf is not None and (pf[0].done() or (
+                pf[1] == _fyear and pf[2] <= W and pf[3] <= S and pf[4] >= E and pf[5] >= N)):
+            # finished, or still in flight but covering this box: adopt it
+            # (waiting beats starting a second read of the same row groups)
             HOLD["prefetch"] = None
             try:
                 _adopt_fetch(*pf)
@@ -1391,14 +1394,11 @@ def _(
                 return (f"{k}x · {_B * k} m pixels · {npx:,} px · {nbytes / 1e3:,.0f} KB png"
                         f" · year {_year}{stage_note} · {int((time.time() - _t0) * 1000)} ms")
 
-            # ---- stage 1: plain pixels, only when FTW is wanted and COLD (the
-            # fetch would otherwise leave the old picture up for seconds)
-            cold = (fields or dis) and not _ftw_warm(W, S, E, N, k, dis)
-            if cold:
-                mcon.sql(f"CREATE OR REPLACE TABLE cur AS {_crop_sql('')}")
-                url, bounds, npx, nbytes = _paint(k, x0, y0, x1, y1, W, S, E, N, _sel_px if not dis else "", False, None)
-                yield url, bounds, _crop_legend(), _line(npx, nbytes, " · fetching FTW…") + note
-                _t0 = time.time()
+            # a cold FTW miss keeps the previous picture up and says so; the
+            # frame lands when the fetch does (a first "everything" frame that
+            # then snapped to the clipped one read as wrong: Stephen)
+            if (fields or dis) and not _ftw_warm(W, S, E, N, k, dis):
+                _say((HOLD.get("last_line") or "") + " · fetching FTW…")
             # ---- stage 2 (or the only stage): the real frame
             _join, _fbt = "", None
             if fields:
@@ -1470,8 +1470,18 @@ def _(
                 # every later serve blocked: "camera…" and nothing; Stephen,
                 # 2026-08-20 night)
                 _gen = _stages(vs)
+                _loop = asyncio.get_running_loop()
                 try:
-                    for url, bounds, _legend, _line in _gen:
+                    while True:
+                        # the SQL + numpy + PNG work runs in a WORKER THREAD so
+                        # the kernel loop keeps servicing the camera and the
+                        # widgets meanwhile (on the loop it froze the page for
+                        # the whole serve: Stephen, "slower, more sluggish");
+                        # only the image swap below happens on the loop
+                        _frame = await _loop.run_in_executor(None, next, _gen, None)
+                        if _frame is None:
+                            break
+                        url, bounds, _legend, _line = _frame
                         if HOLD.get("pending") is not None:
                             HOLD["served"] = None
                             break
