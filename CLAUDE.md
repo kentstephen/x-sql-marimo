@@ -526,6 +526,23 @@ duckdb as a backend"). Full recon and numbers in `docs/ftw-cdl-notes.md`.
   pure fields, agreement 2x2, FTW misses / false fields) are same-year joins on
   the 10 m group, re-run by a `run_button` on the last served box. No 18-year
   per-field history: the framing he rejected.
+- **Serve cost, measured 2026-08-20 (evening) after Stephen felt "several
+  seconds" on every move.** The FTW polygons are now fetched ONCE for a
+  PADDED box (`FTW_PAD` 1.6x each side, capped `FTW_FETCH_DEG2` 0.4 deg²) on a
+  THIRD connection `fcon` in a thread while `mcon` scans the CDL centres, cached
+  per (year, box) with a contains check; the pixel -> field lookup is built per
+  (year, base, level, serve box) from the cache; the disagreement grid rows are
+  cached the same way (`g_n`). DO NOT pad wider: the state parquet is ~48 row
+  groups of ~13 MB, spatially sorted, so a wide box touches many of them and
+  the read is NOT flat (2.5x pad measured 13 s at open and 18 s on a miss; 1.6x
+  gives 11 s open, then pans at 1.4-4.7 s kernel time as cache hits). The field
+  outline rows are `ST_SimplifyPreserveTopology` to half a serve pixel. The
+  status line now prints the table's MB: a 40 m serve on the 10 m ladder is
+  120-175k squares = 12-18 MB per move, and in the (CPU-loaded) headless Chrome
+  the paint landed 12-18 s after the drag against 1.4-4.7 s of kernel time, so
+  the floor is the payload, not the SQL. The lever left is fewer rows per
+  serve on the 10 m ladder (PX_PER / ROW_BUDGET, coarser pixels), Stephen's
+  call. A pan or zoom-in inside the served box is "held" (no re-serve).
 - **TODO, Stephen's (not now): picking.** Click a pixel or field to see who says
   what ("who says who's growing what"). He expects it to need the lonboard
   bundle patch (two-layer ids) and does not want that; the HRRR counties film's

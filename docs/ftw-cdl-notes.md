@@ -197,3 +197,19 @@ analyze panel (6 timelapse lines, 30 m group under the clip) 5.1 s; year 2023:
 needs 2024 or 2025`, checkbox disabled; six wheel notches out: 64x/1920 m with
 "zoom in for FTW". Zero non-assertion console errors; headless export passes
 from the root venv.
+
+## Serve cost round (2026-08-20, evening)
+
+Stephen: warm moves still "several seconds". Driven pans with fields on, before:
+kernel 2.0-3.4 s per pan when the polygons had to be re-fetched (the fetch was
+per serve box), 18 s on a pan that left a 2.5x-padded box (the parquet read is
+row-group bound: ~48 row groups of ~13 MB per state file, spatially sorted, so
+a wide box reads most of the file). After: padded fetch 1.6x each side capped at
+0.4 deg² on a third connection in a thread, concurrent with the CDL centre
+scan; lookups per serve box from the cache; grid rows cached; outline rings
+simplified to half a pixel. Driven: open 11.1 s (cold: fetch + lookup), pans
+1.4 / 2.1 / 2.9 / 1.4 / 4.7 s kernel, tables 12-18 MB each (120-175k squares
+at 40 m on the 10 m ladder). Wall clock from drag to paint in the loaded
+headless Chrome was 12-18 s: the payload is the floor, not the SQL. Zoom-in
+and small pans inside the served box are held (no re-serve). The next lever
+is fewer rows on the 10 m ladder (PX_PER / ROW_BUDGET), a resolution trade.

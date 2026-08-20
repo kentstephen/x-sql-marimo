@@ -96,6 +96,7 @@ def _():
     import math
     import threading
     import time
+    from concurrent.futures import ThreadPoolExecutor
 
     import anywidget
     import duckdb
@@ -121,6 +122,7 @@ def _():
         MaplibreBasemap,
         PolygonLayer,
         S3Store,
+        ThreadPoolExecutor,
         anywidget,
         asyncio,
         duckdb,
@@ -199,6 +201,11 @@ def _():
     PX_PER = 1.0                  # level floor: largest k with pixel <= PX_PER screen px
     ROW_BUDGET = 420_000          # max pixel squares per serve; over it, coarsen a level
     FTW_BOX_DEG2 = 0.35           # FTW modes only when the (padded) box is under this
+    FTW_PAD = 1.6                 # the FTW fetch covers PAD x the serve box each side
+    FTW_FETCH_DEG2 = 0.4          # ... capped at this area. Measured: the state file
+    # has ~48 row groups of ~13 MB, spatially sorted, so a wider box touches more
+    # of them and the read is NOT flat (2.5x pad: 13 s open, 18 s on a miss);
+    # a modest pad makes small pans and zoom-ins hits without that bill
     MARGIN = 0.35                 # fold box slack beyond the viewport
     VIEW_W, VIEW_H = 1400, 700    # the usual guess; no ruler
     HOME = {"longitude": -119.78, "latitude": 36.72, "zoom": 12.0}  # Fresno County
@@ -219,6 +226,8 @@ def _():
         FIELDS0,
         FTW_BOX_DEG2,
         FTW_BUCKET,
+        FTW_FETCH_DEG2,
+        FTW_PAD,
         FTW_LEVELS,
         FTW_RES,
         FTW_VEC,
@@ -426,8 +435,13 @@ def _(
     mcon.sql(_STATES_DDL)
     mcon.executemany("INSERT INTO ftw_states VALUES (?,?,?,?,?)", _STATES)
 
+    # a THIRD connection for the FTW parquet fetch on a thread (httpfs +
+    # spatial only, no registrations): it runs concurrently with the CDL
+    # centre scan on mcon and hands the polygons back as Arrow (WKB)
+    fcon = _connect()
+
     NONCROP_CODES = sorted(r[0] for r in _rows if r[7])
-    return NONCROP_CODES, con, con_lock, mcon
+    return NONCROP_CODES, con, con_lock, fcon, mcon
 
 
 @app.cell
@@ -891,10 +905,14 @@ def _(
     ROW_BUDGET,
     VIEW_W,
     YEAR0,
+    FTW_FETCH_DEG2,
+    FTW_PAD,
+    ThreadPoolExecutor,
     asyncio,
     bbox4326,
     con_lock,
     deck,
+    fcon,
     fields_sql,
     ftw_files,
     ftw_grid_sql,
@@ -1000,58 +1018,135 @@ def _(
             break
         return k, x0, y0, x1, y1, drop
 
-    # ---- the FTW tables for a box: fields (fb_n) + pixel -> field lookup
-    # (lk_n) at the serve level, built once per (frame year, level, box) ----
-    def _ftw_tables(W, S, E, N, k):
-        key = (_fyear, _B, k, round(W, 3), round(S, 3), round(E, 3), round(N, 3))
-        fb = HOLD.setdefault("fb", {})
-        hit = fb.get(key)
-        if hit is not None:
-            return hit
-        for (_fy, _bb, _k, _w, _s, _e, _n), _v in fb.items():
-            # a box already built that CONTAINS this one, same year and level
-            if (_fy, _bb, _k) == (_fyear, _B, k) and _w <= W and _s <= S and _e >= E and _n >= N:
-                return _v
-        x0, y0, x1, y1 = to5070(mcon, W, S, E, N)
-        n = HOLD.get("fb_n", 0)
-        HOLD["fb_n"] = n + 1
-        fbt, lkt = f"fb_{n}", f"lk_{n}"
-        mcon.sql(f"CREATE OR REPLACE TABLE {fbt} AS "
-                 + fields_sql(ftw_files(mcon, W, S, E, N), W, S, E, N, _fyear))
-        mcon.sql(f"CREATE OR REPLACE TABLE {lkt} AS "
-                 + lookup_sql(f"{_T}{k}", x0, y0, x1, y1, fbt))
-        fb[key] = (fbt, lkt)
-        if len(fb) > 8:
-            _old = next(iter(fb))
-            _ot = fb.pop(_old)
-            try:
-                mcon.sql(f"DROP TABLE IF EXISTS {_ot[0]}; DROP TABLE IF EXISTS {_ot[1]}")
-            except Exception:
-                pass
-        return fb[key]
+    # ---- the FTW tables. Two caches: (1) polygons fetched ONCE for a PADDED
+    # box (FTW_PAD x the serve box each side, capped at FTW_FETCH_DEG2; one
+    # parquet read costs ~3 s whatever the box, so fetching wide makes pans
+    # and zoom-ins cache hits), (2) the pixel -> field lookup per (table,
+    # level, serve box), built from the cached polygons. A cold miss fetches
+    # the parquet on fcon in a thread WHILE mcon scans the CDL centres. -----
+    _pool = HOLD.setdefault("pool", ThreadPoolExecutor(max_workers=2))
+
+    def _padded(W, S, E, N):
+        cw, ch = (W + E) / 2, (S + N) / 2
+        dw, dh = (E - W) / 2, (N - S) / 2
+        f = FTW_PAD
+        if (2 * dw * f) * (2 * dh * f) > FTW_FETCH_DEG2:
+            f = max(1.0, (FTW_FETCH_DEG2 / (4 * dw * dh)) ** 0.5)
+        return cw - dw * f, ch - dh * f, cw + dw * f, ch + dh * f
+
+    def _fetch_fields(files, fyear, W, S, E, N):
+        """Blocking parquet read on fcon -> Arrow (geometry as WKB)."""
+        _sql = fields_sql(files, W, S, E, N, fyear)
+        return fcon.sql(
+            f"SELECT id, area_m2, ST_AsWKB(geometry) AS wkb FROM ({_sql})"
+        ).arrow()
+
+    def _fields_cache(W, S, E, N):
+        """Name of a polygon table on mcon covering the box for _fyear (a
+        cached padded fetch that contains it, else a new padded fetch, made
+        concurrently with whatever `while_waiting` the caller wants run on
+        mcon). Returns (table, future_or_None)."""
+        cache = HOLD.setdefault("fcache", {})
+        for (_fy, _w, _s, _e, _n), _t in cache.items():
+            if _fy == _fyear and _w <= W and _s <= S and _e >= E and _n >= N:
+                return _t, None
+        pw, ps, pe, pn = _padded(W, S, E, N)
+        _files = ftw_files(mcon, pw, ps, pe, pn)   # ftw_states lives on mcon
+        fut = _pool.submit(_fetch_fields, _files, _fyear, pw, ps, pe, pn)
+        return (pw, ps, pe, pn), fut
 
     def _ftw_tables_at(T, k, W, S, E, N):
-        """Same as _ftw_tables but for an explicit table prefix / level (the
-        analyze timelapse reads the 30 m group while the serve is on 10 m)."""
+        """(fields table, lookup table) for table prefix T at level k over
+        the serve box: lookup cached per (year, base, level, box)."""
         B = 10 if T == "cdl10_" else 30
         key = (_fyear, B, k, round(W, 3), round(S, 3), round(E, 3), round(N, 3))
-        fb = HOLD.setdefault("fb", {})
-        hit = fb.get(key)
+        lk = HOLD.setdefault("fb", {})
+        hit = lk.get(key)
         if hit is not None:
             return hit
-        for (_fy, _bb, _k, _w, _s, _e, _n), _v in fb.items():
+        for (_fy, _bb, _k, _w, _s, _e, _n), _v in lk.items():
             if (_fy, _bb, _k) == (_fyear, B, k) and _w <= W and _s <= S and _e >= E and _n >= N:
                 return _v
         x0, y0, x1, y1 = to5070(mcon, W, S, E, N)
+        fbt, fut = _fields_cache(W, S, E, N)
         n = HOLD.get("fb_n", 0)
         HOLD["fb_n"] = n + 1
-        fbt, lkt = f"fb_{n}", f"lk_{n}"
-        mcon.sql(f"CREATE OR REPLACE TABLE {fbt} AS "
-                 + fields_sql(ftw_files(mcon, W, S, E, N), W, S, E, N, _fyear))
-        mcon.sql(f"CREATE OR REPLACE TABLE {lkt} AS "
-                 + lookup_sql(f"{T}{k}", x0, y0, x1, y1, fbt))
-        fb[key] = (fbt, lkt)
-        return fb[key]
+        # the CDL centres of the serve box, scanned while the parquet read
+        # (if any) is in flight on the other connection
+        pxt = f"px_{n}"
+        mcon.sql(
+            f"""CREATE OR REPLACE TABLE {pxt} AS
+                SELECT DISTINCT y, x,
+                       ST_Transform(ST_Point(x, y), 'EPSG:5070', 'EPSG:4326',
+                                    always_xy := true) AS pt
+                FROM {T}{k}
+                WHERE year = 2025
+                  AND x BETWEEN {x0} AND {x1} AND y BETWEEN {y0} AND {y1}"""
+        )
+        if fut is not None:
+            pw, ps, pe, pn = fbt
+            arrow = fut.result()
+            fbt = f"fb_{n}"
+            mcon.register(f"_arrow_{n}", arrow)
+            mcon.sql(
+                f"""CREATE OR REPLACE TABLE {fbt} AS
+                    SELECT id, area_m2, ST_GeomFromWKB(wkb) AS geometry
+                    FROM _arrow_{n}"""
+            )
+            mcon.unregister(f"_arrow_{n}")
+            cache = HOLD.setdefault("fcache", {})
+            cache[(_fyear, round(pw, 3), round(ps, 3), round(pe, 3), round(pn, 3))] = fbt
+            if len(cache) > 6:
+                _old = next(iter(cache))
+                _ot = cache.pop(_old)
+                try:
+                    mcon.sql(f"DROP TABLE IF EXISTS {_ot}")
+                except Exception:
+                    pass
+        lkt = f"lk_{n}"
+        mcon.sql(
+            f"""CREATE OR REPLACE TABLE {lkt} AS
+                SELECT f.id, p.y, p.x
+                FROM {fbt} f JOIN {pxt} p ON ST_Contains(f.geometry, p.pt)"""
+        )
+        mcon.sql(f"DROP TABLE IF EXISTS {pxt}")
+        lk[key] = (fbt, lkt)
+        if len(lk) > 8:
+            _old = next(iter(lk))
+            _ot = lk.pop(_old)
+            try:
+                mcon.sql(f"DROP TABLE IF EXISTS {_ot[1]}")
+            except Exception:
+                pass
+        return lk[key]
+
+    def _ftw_tables(W, S, E, N, k):
+        return _ftw_tables_at(_T, k, W, S, E, N)
+
+    def _ftw_grid(px_m, W, S, E, N):
+        """The FTW field cells (P >= 0.5) for a PADDED box, cached per (year,
+        level, box) as a table of grid indexes; the disagreement query joins
+        it. Returns (table, res, factor)."""
+        f = 4 if px_m < 120 else 16
+        cache = HOLD.setdefault("gcache", {})
+        for (_fy, _f, _w, _s, _e, _n), _t in cache.items():
+            if (_fy, _f) == (_fyear, f) and _w <= W and _s <= S and _e >= E and _n >= N:
+                return _t, ftw_grid_sql(px_m, _fyear, W, S, E, N)[1], f
+        pw, ps, pe, pn = _padded(W, S, E, N)
+        _gsql, _res, _f = ftw_grid_sql(px_m, _fyear, pw, ps, pe, pn)
+        n = HOLD.get("g_n", 0)
+        HOLD["g_n"] = n + 1
+        gt = f"g_{n}"
+        mcon.sql(f"CREATE OR REPLACE TABLE {gt} AS {_gsql}")
+        cache[(_fyear, f, round(pw, 3), round(ps, 3), round(pe, 3), round(pn, 3))] = gt
+        if len(cache) > 6:
+            _old = next(iter(cache))
+            _ot = cache.pop(_old)
+            try:
+                mcon.sql(f"DROP TABLE IF EXISTS {_ot}")
+            except Exception:
+                pass
+        return gt, _res, _f
 
     def _frame(vs):
         """Blocking: one table for a view. Pixel squares painted by crop (or
@@ -1106,13 +1201,13 @@ def _(
                     # the pixel rows: disagreement class from the FTW grid.
                     # CASE cannot return a UTINYINT[4] (duckdb), so the colour
                     # comes from a VALUES join
-                    _gsql, _res, _f = ftw_grid_sql(_B * k, _fyear, W, S, E, N)
+                    _gt, _res, _f = _ftw_grid(_B * k, W, S, E, N)
                     _rgb = ", ".join(
                         f"({code}, [{r}, {g}, {b}, 255]::UTINYINT[4])"
                         for code, (_nm, _hx, (r, g, b)) in DIS.items()
                     )
                     _px = (f"""
-                        WITH g AS ({_gsql}),
+                        WITH g AS (SELECT ix, iy FROM {_gt}),
                         p AS (
                             SELECT t.x, t.y, t.crop_type, c.noncrop,
                                    ST_Transform(ST_Point(t.x, t.y), 'EPSG:5070', 'EPSG:4326',
@@ -1136,10 +1231,17 @@ def _(
                                   t.crop_type
                            FROM cur t WHERE TRUE{_sel_px}"""
                 if fields:
-                    # the field outlines, same table: transparent fill, drawn line
+                    # the field outlines, same table: transparent fill, drawn
+                    # line. SIMPLIFIED to ~half a serve pixel: FTW's raw 10 m
+                    # rings carry hundreds of vertices per field and were most
+                    # of the bytes shipped per serve (the ms in the status is
+                    # kernel time; the browser only paints once the table
+                    # lands)
+                    _tol = _B * k / 2 / 111_000
                     _out += f"""
                         UNION ALL
-                        SELECT f.geometry, [0, 0, 0, 0]::UTINYINT[4],
+                        SELECT ST_SimplifyPreserveTopology(f.geometry, {_tol}),
+                               [0, 0, 0, 0]::UTINYINT[4],
                                [40, 40, 40, 210]::UTINYINT[4], NULL
                         FROM {_fbt} f
                         WHERE ST_XMin(f.geometry) < {E} AND ST_XMax(f.geometry) > {W}
@@ -1168,7 +1270,8 @@ def _(
                         for code, (nm, hx, _c3) in DIS.items()
                     ]
                     HOLD["dis_split"] = {code: 100 * _cnt.get(code, 0) / _tot for code in DIS}
-                line = (f"{k}x · {_B * k} m pixels · {_npx:,} drawn · year {_year}"
+                _mb = sum(tbl.column(i).nbytes for i in range(tbl.num_columns)) / 1e6
+                line = (f"{k}x · {_B * k} m pixels · {_npx:,} drawn · {_mb:.0f} MB · year {_year}"
                         + (f" · FTW {_fyear} fields" if fields else "")
                         + (f" · disagreement vs P(field) at {10 * _f} m" if dis else ""))
                 memo[key] = (tbl, legend, line)
