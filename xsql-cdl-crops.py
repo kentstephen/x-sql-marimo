@@ -108,6 +108,8 @@ def _():
 @app.cell(hide_code=True)
 def _(mo):
     mo.md("""
+    [![Open in molab](https://molab.marimo.io/molab-shield.svg)](https://molab.marimo.io/github/github.com/kentstephen/x-sql-marimo/blob/main/xsql-cdl-crops.py)
+
     # USDA Cropland Data Layer, in SQL
 
     Every query below runs on **DuckDB**, against the icechunk store's pyramid
