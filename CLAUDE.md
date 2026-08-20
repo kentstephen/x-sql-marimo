@@ -586,6 +586,29 @@ duckdb as a backend"). Full recon and numbers in `docs/ftw-cdl-notes.md`.
   of starting a second read. Driven after (1)-(4): warm pans with fields
   0.6-0.8 s kernel / ~2 s wall, PNGs 150-350 KB; cold misses 3.5-17 s, all
   parquet network time from home.
+- **WHERE IT STANDS AT THE END OF 2026-08-20 (read before touching the serve).**
+  Stephen flew the bitmap version in both `marimo edit` and `marimo run`:
+  "when I move again it's very fast, but sometimes it's extremely slow", ~10 s.
+  That pattern is the FTW PARQUET READ on a cache miss (fields or disagreement
+  on, a pan into row groups not yet touched: 13 MB each, 3-10 s from home),
+  not polygons vs picture and not the SQL; plain CDL moves never stall. His
+  verdict on the night's performance work: "the polygons were faster", "I don't
+  see the benefit"; he stopped the conversation ("I'm tired of talking with
+  this model"). NOTHING of tonight's serve work is validated by him; the
+  driven harness on this Mac measured kernel/paint times and could not see
+  what he felt (likely CPU saturation: DuckDB on every core across two
+  connections + a background prefetch + a 7x larger ROW_BUDGET). Two open
+  choices he has NOT decided: (a) put the POLYGON serve back from `6b816ac`
+  (keeping the held-key reset, HOME west of Stockton, fields off at open), or
+  keep the bitmap with ROW_BUDGET back at 420k, fetch threads capped, prefetch
+  off; (b) the fix for the 10 s stalls either way: download the whole state
+  parquet ONCE into the tmp cache the first time a state is touched (CA 629 MB,
+  ~25-30 s once; IA/KS similar; TX 1.4 GB), in the background from the moment
+  fields is ticked, then every fields move reads from disk in <0.5 s. He was
+  told this and did not answer. Do not "improve" the serve again without a
+  measurement from HIS screen (which of: the map drags on pan = browser; the
+  status sits on "camera…" = kernel; the picture lands then the page stutters
+  = CPU).
 - **TODO, Stephen's (not now): picking.** Click a pixel or field to see who says
   what ("who says who's growing what"). He expects it to need the lonboard
   bundle patch (two-layer ids) and does not want that; the HRRR counties film's

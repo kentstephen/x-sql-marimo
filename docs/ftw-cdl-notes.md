@@ -231,3 +231,16 @@ Measured pieces: fetch cold 3-10 s / warm 0.4 s, WKB parse 0.0 s, rings
 lazy `.arrow()` reader was why the "concurrent" fetch was not concurrent.
 Screenshots: pixels clipped inside crisp outlines; disagreement + fields shows
 the Kings River foothill pasture as large blue (FTW fields, CDL non-crop).
+
+## End of 2026-08-20
+
+Stephen flew the bitmap serve (edit and run): moves are fast when cached and
+~10 s when not; "the polygons were faster"; "I don't see the benefit"; he ended
+the conversation. The 10 s is the FTW parquet read on a miss (row groups of
+13 MB, 3-10 s from home), independent of the layer type. The proposed fix,
+undecided: download each state file once into the tmp cache in the background
+when fields is ticked (CA 629 MB, ~25-30 s once), then all fields moves are
+local. Also undecided: polygons back (6b816ac) vs bitmap with ROW_BUDGET 420k,
+capped fetch threads, no prefetch. Nothing from the night's serve work is
+validated by him; the driven harness measured kernel and paint times and did
+not capture what he felt (likely CPU saturation). See CLAUDE.md.
