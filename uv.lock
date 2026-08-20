@@ -1896,7 +1896,7 @@ dependencies = [
     { name = "pillow" },
     { name = "pyarrow" },
     { name = "xarray" },
-    { name = "xarray-sql" },
+    { name = "xarray-sql", extra = ["duckdb"] },
     { name = "zarr" },
 ]
 
@@ -1911,14 +1911,14 @@ requires-dist = [
     { name = "h3ronpy", specifier = ">=0.22.0" },
     { name = "icechunk" },
     { name = "lonboard", extras = ["geotiff"], specifier = ">=0.16.0" },
-    { name = "marimo", specifier = ">=0.23.16" },
+    { name = "marimo", specifier = "==0.23.16" },
     { name = "matplotlib", specifier = "==3.11.1" },
     { name = "numpy", specifier = "==2.5.1" },
     { name = "obstore", specifier = ">=0.9.2" },
     { name = "pillow", specifier = ">=11" },
     { name = "pyarrow", specifier = ">=25.0.0" },
     { name = "xarray" },
-    { name = "xarray-sql", specifier = ">=0.3.2" },
+    { name = "xarray-sql", extras = ["duckdb"], specifier = "==0.4.0rc1" },
     { name = "zarr", specifier = ">=3" },
 ]
 
@@ -1938,21 +1938,26 @@ wheels = [
 
 [[package]]
 name = "xarray-sql"
-version = "0.3.2"
+version = "0.4.0rc1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "dask" },
     { name = "datafusion" },
     { name = "xarray" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/05/e0/c9a225742ade88b76a7798765d28e7449c0757b83fe016b066f7492140f4/xarray_sql-0.3.2.tar.gz", hash = "sha256:325e1dd38629ee5e0130587d2771f7d7847eaaa8a18b6b4f9586d2ed1762f3bb", size = 149621, upload-time = "2026-07-17T02:10:52.901Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ff/68/299b4430db14544d7b989f00e0096e66ad61da69fad2b45f3e60ccdee6fd/xarray_sql-0.4.0rc1.tar.gz", hash = "sha256:298659a5ec187e0efc95e45f6d438999d4c0fb965d90c1580fea8081d37c4f76", size = 234653, upload-time = "2026-08-18T16:03:35.888Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/86/e8/3d775f3f14e906a200d6c27880c5d9f410c0c985a187ee6d57d538fb8793/xarray_sql-0.3.2-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:0e0558fd4dcc1da9d71cfb2b8c96713d43ba3240a73775f6482ceb97cac688e6", size = 18433115, upload-time = "2026-07-17T02:10:31.815Z" },
-    { url = "https://files.pythonhosted.org/packages/2b/56/85ec15094a064af5ab49b4f914eca3db172bbac7032de6064b0408234b96/xarray_sql-0.3.2-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:541be572f5acdf0e8f20192017f353922d4f792602bb3eaa9d13eedac6890c94", size = 17654558, upload-time = "2026-07-17T02:10:35.48Z" },
-    { url = "https://files.pythonhosted.org/packages/5c/b9/d3bd526b4f1174b439acd6ceaecfc8a8940de2bb5b1295e3fd69529004d5/xarray_sql-0.3.2-cp310-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:5f3f0f930e437e7739bf894aa088d31d5dcc1f9c5bfed8fc9be9d0a786340b9a", size = 18661949, upload-time = "2026-07-17T02:10:39.264Z" },
-    { url = "https://files.pythonhosted.org/packages/ac/e5/0943708eae2deaa23175d6bbaa4175aa1e7c22df2ee089c9b561f8269cff/xarray_sql-0.3.2-cp310-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:1cc5252e54904cdbaa75a777387e9d9eb44f727988dbef16737c595550d7ec5d", size = 20088220, upload-time = "2026-07-17T02:10:43.221Z" },
-    { url = "https://files.pythonhosted.org/packages/5c/01/2cc22a25f520ce2e4d4cec7dd12d4d94d4e574dc89e10a9f8f0ba7a11da6/xarray_sql-0.3.2-cp310-abi3-manylinux_2_34_x86_64.whl", hash = "sha256:0f2b5bf1b6cf2a5d498b39443a232af205c78c2d26dbac5c879eb3ea4a9a6d2f", size = 22580647, upload-time = "2026-07-17T02:10:47.249Z" },
-    { url = "https://files.pythonhosted.org/packages/d6/61/4dc75818e8f0cee973826164d999c2b5f26d0ee2b3f2e757d73b9f390d12/xarray_sql-0.3.2-cp310-abi3-win_amd64.whl", hash = "sha256:305e78c84be6fd742f314d5f64478148969d855168d9557db4e4623da8ce8075", size = 19243951, upload-time = "2026-07-17T02:10:50.805Z" },
+    { url = "https://files.pythonhosted.org/packages/58/e6/f683be3679f6a1d1f3039f50f5022cdb41bb1a6785ec956eb0f9d1a2f5c4/xarray_sql-0.4.0rc1-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:c1c083f663c5567edae0a7fe469f6bdadb141856f6bec56c11eb8affc3e8d3e0", size = 18476637, upload-time = "2026-08-18T16:03:14.555Z" },
+    { url = "https://files.pythonhosted.org/packages/ad/79/e42e9a243a4439bcab77582df446b159b2cf04d2f6d2cfb164a8b6ece791/xarray_sql-0.4.0rc1-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:f5fedd28219620bb95c7f628032a5bb093c9a328f3c622db3e7da9d585adf17b", size = 17696589, upload-time = "2026-08-18T16:03:18.209Z" },
+    { url = "https://files.pythonhosted.org/packages/0a/ae/8440c58b5e1b88f314fad2864974fc96577b92d471c1c5e0cc8a2105d301/xarray_sql-0.4.0rc1-cp310-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:8e46db4f3125060c36035caac12cb9ef51ca57e91725aa761f8da4e81a297eac", size = 18703925, upload-time = "2026-08-18T16:03:21.817Z" },
+    { url = "https://files.pythonhosted.org/packages/2f/03/3525528db15a3386f8496fa293ba8cae42801fe476d91b693f0870b19fee/xarray_sql-0.4.0rc1-cp310-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:04e7dd31b918812c3ace6d00d9e27b00a9356b639df536b0b40451acc91d3706", size = 20130302, upload-time = "2026-08-18T16:03:25.492Z" },
+    { url = "https://files.pythonhosted.org/packages/f6/14/102e0fd4c0e92e30ba14be536108fe094f61d6d3500f8978e41b44804e72/xarray_sql-0.4.0rc1-cp310-abi3-manylinux_2_34_x86_64.whl", hash = "sha256:5430c2cd9d8752ba97d783d37db9179af58a3eb8f5325f6f5ac2f4763dbd539d", size = 22622993, upload-time = "2026-08-18T16:03:29.377Z" },
+    { url = "https://files.pythonhosted.org/packages/2e/3e/e05fe0871d22f7503e025f5e42e015838551d6ce9b905302e86259b3ccca/xarray_sql-0.4.0rc1-cp310-abi3-win_amd64.whl", hash = "sha256:9ae362240710d7e8bc3afc43173bb909fa87ce94523306fc5ab10513fd0c197b", size = 19286352, upload-time = "2026-08-18T16:03:33.512Z" },
+]
+
+[package.optional-dependencies]
+duckdb = [
+    { name = "duckdb" },
 ]
 
 [[package]]

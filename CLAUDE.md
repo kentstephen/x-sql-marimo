@@ -485,6 +485,78 @@ Things to know:
   ΔE 3.9; a validated crop-evocative 8-hue order exists in the session log
   if ever wanted).
 
+`xsql-cdl-fields.py` (2026-08-20, BUILT, REBUILT THE SAME DAY AFTER STEPHEN'S
+REVIEW, HEADLESS + PLAYWRIGHT-PASSED, NOT YET FLOWN BY HIM) is the crops notebook
+plus ONE control, `FTW`, for Fields of the World (`source.coop/ftw/global-data`,
+CC-BY 4.0, Robinson et al. 2026: the PRUE model's field polygons from Sentinel-2,
+10 m, 2024 and 2025). Runs FROM THE ROOT (`uv run marimo edit xsql-cdl-fields.py`;
+the root pyproject moved to `xarray-sql[duckdb]==0.4.0rc1` + `marimo==0.23.16`
+for it, Stephen: "this can run in the root, this is NOT multi backend, it's just
+duckdb as a backend"). Full recon and numbers in `docs/ftw-cdl-notes.md`.
+
+- **Two builds were wrong before this one, and Stephen said why each time**
+  (same day). Build 1 REPLACED the pixel map with FTW polygons at fine zooms
+  (non-crop land vanished, "crops only" had nothing to act on), moved the analyze
+  button out of the strip, and framed 18 years of CDL history inside 2024
+  polygons ("fields' shapes can change over time"). Build 2 was a four-way
+  `FTW: off / mask / fields / disagreement` selector; he could not see the
+  disagreement WITH the fields, and "the fields ARE the mask" (the mask/fields
+  split was a distinction without a difference to him). The shape that stands:
+  the crops notebook's controls (year, crops only, analyze, search, legend) plus
+  TWO CHECKBOXES: **fields** (pixels clipped to inside the FTW fields AND the
+  field outlines drawn, in the SAME deck layer: the outline rows are appended
+  to the pixel table with fill alpha 0 / line alpha 210, 4-channel
+  `UTINYINT[4]` colours; `stroked` on only while fields is on, so pixels-only
+  views pay no path tessellation) and **disagreement** (pixels repainted by
+  CDL crop/not-crop x FTW P(field) >= 0.5: agree grey, CDL crop no FTW field
+  orange, FTW field on CDL non-crop blue; legend shows the three with acres;
+  works with fields on or off). Opens at Fresno with fields on.
+- **2024 and 2025 are served from CDL's 10 m GROUP** (Stephen: "2024 and 2025
+  can only be seen in the 10 m, keep it that way"): `_ftw_ok = year in (2024,
+  2025)` switches base 10 m / `LEVELS10` / `cdl10_` tables (registered on both
+  connections, whole-plane at k >= 128), and those are the only years with
+  disagreement (the JS greys the checkbox with the reason; the kernel reports a
+  stale request in the status, never honours it). Older years: 30 m group,
+  fields still clip them (the 2024 footprint, `· FTW 2024 fields` in the
+  status). FTW modes need a box under `FTW_BOX_DEG2` (0.35 deg² padded); wider
+  views serve plain pixels with "zoom in for FTW". The analyze panel's
+  timelapse is always the 30 m group's 18 years at the nearest level, under
+  the same clip (its own lookup at that level, `_ftw_tables_at`). The SQL cells
+  under the map (fields_view, px2field, field_crop, crop_by_field, the least
+  pure fields, agreement 2x2, FTW misses / false fields) are same-year joins on
+  the 10 m group, re-run by a `run_button` on the last served box. No 18-year
+  per-field history: the framing he rejected.
+- **TODO, Stephen's (not now): picking.** Click a pixel or field to see who says
+  what ("who says who's growing what"). He expects it to need the lonboard
+  bundle patch (two-layer ids) and does not want that; the HRRR counties film's
+  GEOMETRIC picking in JS (unproject the click, test against geometry the
+  browser already holds; no deck picking, no patch) is the route when it comes.
+- **Three legs, all DuckDB** (the intro table says which is which; Stephen was
+  "confused as to what data is coming from where"): CDL = icechunk Zarr v3 via
+  `xql.register` (`cdl_<k>`); FTW fields = fiboa GeoParquet, ONE FILE PER STATE
+  with both years inside (`.../tge-labs/ftw-global-data/predictions/vectors/alpha/
+  results-by-admin-conf/admin:country_code=US/US_<ST>.parquet`; S3 prefix is
+  `tge-labs/`, not `ftw/`; the `admin:` path 403s over HTTPS), `read_parquet`
+  over httpfs, the `bbox` struct predicate prunes row groups; FTW probabilities
+  = PLAIN Zarr v3 (not icechunk) via `xql.register` (`ftw_4`, `ftw_16`), blocks
+  = the INNER chunk (512), never the shard (4096): shard-sized blocks expand
+  whole, 19.5 s vs 1.2 s for one 20 km box. Not used: per-state PMTiles
+  (draw-only, decimated, no id) and the confidence COGs: **`confidence` is NULL
+  for the entire US**. State file extents are EMBEDDED (`ftw_states`), derived
+  from each file's row-group stats (the STAC items' bbox is WRONG: US_CA reports
+  Montana). `geometry` arrives typed `GEOMETRY('OGC:CRS84')`, which lonboard's
+  `from_duckdb` does not recognise: cast `::GEOMETRY`. DuckDB `CASE` cannot
+  return a `UTINYINT[3]` ("Unimplemented type for case expression"): colour
+  lookups go through a VALUES join.
+- **The join**: ONE `ST_Contains` pass per (frame year, serve level, box) of the
+  CDL pixel centres into the polygons -> `lk_n(id, y, x)` on the serve
+  connection (fields in `fb_n`); mask is `JOIN lk USING (y, x)`, fields is the
+  same join + `row_number()` majority + purity into `cur`, disagreement bins the
+  centres into the 40 m / 160 m FTW grid by index arithmetic. A built box that
+  CONTAINS the new one serves it. Measured: fields 2.8 s, pixels 0.7 s, join
+  0.1 s. DuckDB `CASE` cannot return a `UTINYINT[N]`: colours go through a
+  VALUES join.
+
 `xsql-mapterhorn-explorer.py` (EXPERIMENTAL, open defects below) draws Mapterhorn terrain
 worldwide as extruded H3 columns: the DEM half of the parked
 `archive/xsql-duckdb-terrain-h3.py` standing alone, on the canopy notebook's chassis
@@ -972,7 +1044,10 @@ uv run --project archive marimo edit archive/xsql-nlcd-imagery.py
 ```
 
 **Two pyprojects, deliberately.** The root `pyproject.toml` is the union of the two
-maintained notebooks' PEP 723 headers and nothing more, so it stays honest about what is
+maintained notebooks' PEP 723 headers and nothing more (since 2026-08-20 its
+xarray-sql is `xarray-sql[duckdb]==0.4.0rc1`, the DuckDB backend, with marimo pinned
+==0.23.16, so xsql-cdl-fields.py runs from the root; XarrayContext is unchanged
+in the rc and deforest passes headless on it), so it stays honest about what is
 actually imported (`async-geotiff` for the COG reader, `pillow` for the terrarium WebP
 decode). `archive/pyproject.toml` is the union of every archived
 notebook's header (adds `aiohttp`, `arro3-io`, `geoarrow-rust-io`, `geopy`, `morecantile`,
