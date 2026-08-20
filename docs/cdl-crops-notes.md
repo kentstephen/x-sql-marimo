@@ -321,3 +321,56 @@ conversion, 18-year persistence map. A
 /dataviz-validated crop palette for the chart was drafted and dropped (NASS
 colors fail CVD validation: Spring Wheat vs Fallow ΔE 3.9; the validated 8-hue
 order is in the 2026-08-20 session log if wanted).
+
+## The "random crop lines / noise" flash on year step, zoom, pan (2026-08-20, evening)
+
+Stephen: after a year step (and sometimes a camera move) the map briefly fills
+with crop-coloured hatching and noise, "like duckdb is returning garbled
+data". His video (`cdl-test-noise-toggle-years`, 30 m fields, 290,725 drawn
+for EVERY year) shows each step painting twice: a hatched frame the instant
+the table lands, the clean one ~0.5 s later. Reproduced headless at 10 m/32x
+(289,500 rows both years) with CDP `Page.startScreencast`.
+
+Mechanism, in lonboard's bundled `@geoarrow/deck.gl-layers`
+`GeoArrowSolidPolygonLayer` (the fill sublayer of PolygonLayer):
+`updateData()` triangulates a new table in a worker (~0.5 s at 300k rows)
+and only then `setState({batch, triangles})`; until then `renderLayers`
+still builds the sublayer from the OLD batch but with the NEW accessor props.
+What keeps the old sublayer on screen meanwhile is its validator
+(`Wn -> Due`: `batch.numRows === accessor.length`) THROWING, which is the
+`deck: update of GeoArrowSolidPolygonLayer ... assertion failed` console line
+every serve produces; deck logs it and leaves the old sublayer in place. When
+the new table has the SAME row count as the one on screen (a year step at
+deep zoom over land: every pixel has a class every year, so the count never
+changes) the check passes and deck paints the OLD squares with the NEW colour
+column, misaligned by index: the hatching. The camera case is the same with
+equal counts, plus a second, rarer race: `setState({batch: this.props.data,
+triangles})` after the await pairs whatever table is current with the
+triangles it computed, so two tables inside one earcut window garble too.
+
+Fix, kernel side, no bundle patch:
+- NEVER THE SAME ROW COUNT TWICE IN A ROW: when the new table's length equals
+  `pixels.table.num_rows`, one duplicate row (row 0, drawn twice) is appended
+  (`arro3 Table.from_batches([...batches, b0.slice(0, 1)]).combine_chunks()`,
+  still ONE chunk; the geoarrow extension metadata survives). The assertion
+  then throws as for any other serve and the old view stands until the new
+  geometry is whole. Driven: same-count year step -> one assertion line, one
+  clean paint, no intermediate frame.
+- SWAP SPACING for the second race: the loop does not send a table until the
+  previous one has had time to triangulate (`SWAP_GAP0 + SWAP_GAP_ROW * n`,
+  0.4 s + 2e-6 s/row; first run seeds 1.5 s for the map cell's own table),
+  and drops a table if the camera moved on during the wait (`HOLD["served"] =
+  None` so the held check stays honest; the memo keeps it). The wait is
+  excluded from the status ms.
+
+So the console assertion is load-bearing, not noise: if a lonboard upgrade
+removes `_validate` or the check, this comes back and the way out is to
+stop swapping tables in place (or a bundle patch). Also back to
+`PolygonLayer` (`stroked=False`) from the SolidPolygonLayer try.
+
+`pickable` was tried the same evening and DROPPED (Stephen: "pickable doesnt
+work", then agreed it is not needed): no tooltip appeared under marimo (GPU
+picking has returned null in this repo before, the HRRR film picks
+geometrically in JS), the legend already names every class in view, and
+below native a square is a majority vote so a per-pixel readout would
+mislead. A `c.name AS crop` column added for the tooltip went out with it.

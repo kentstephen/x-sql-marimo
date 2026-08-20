@@ -11,6 +11,7 @@
 #     "numpy",
 #     "anywidget>=0.9",
 #     "lonboard>=0.16.0",
+#     "arro3-core",
 #     "altair>=5.4",
 # ]
 # ///
@@ -78,12 +79,14 @@ def _():
     import urllib.parse
     import urllib.request
 
+    from arro3.core import Table as ArrowTable
     from lonboard import Map, PolygonLayer
     from lonboard.basemap import CartoStyle, MaplibreBasemap
 
     import marimo as mo
 
     return (
+        ArrowTable,
         CartoStyle,
         Map,
         MaplibreBasemap,
@@ -702,15 +705,7 @@ def _(anywidget, traitlets):
 
 
 @app.cell
-def _(
-    CartoStyle,
-    HOME,
-    Map,
-    MaplibreBasemap,
-    PolygonLayer,
-    YEAR0,
-    mcon,
-):
+def _(CartoStyle, HOME, Map, MaplibreBasemap, PolygonLayer, YEAR0, mcon):
     # ---- map cell: builds the Map and the ONE pixels layer, must never
     # re-run (repo rule). Labels come from the BASEMAP (Positron WITH labels,
     # Stephen's call after the second-layer id collision killed every overlay
@@ -765,7 +760,8 @@ def _(HudControls, mo):
 @app.cell
 def _(
     ACRES_PER_KM2,
-    HOLD,
+    ArrowTable,
+    HOLD: dict,
     HOME,
     LEVELS,
     LEVELS10,
@@ -816,6 +812,7 @@ def _(
         f" AND crop_type IN ({', '.join(str(v) for v in _sel)})" if _sel else ""
     )
     SETTLE = 0.35
+    SWAP_GAP0, SWAP_GAP_ROW = 0.4, 2e-6   # s, s/row: see the swap spacing note
 
     try:
         HOLD["loop"] = asyncio.get_running_loop()
@@ -1015,15 +1012,56 @@ def _(
                     _say((HOLD.get("last_line") or "") + " · held")
                 else:
                     tbl, k, _legend = _out
+                    n = tbl.num_rows
+                    # SPACE THE SWAPS (2026-08-20, Stephen's "random crop
+                    # lines / noise" flash on zoom, pan and year): the browser
+                    # triangulates each new table in a worker and, when the
+                    # next table lands before that finishes, pairs the new
+                    # vertices and colors with the PREVIOUS table's triangle
+                    # indices (geoarrow layer: setState({batch: props.data,
+                    # triangles}) after an await). Memo hits made two tables
+                    # land ~0.3 s apart. So never send a table until the one
+                    # before it has had time to triangulate (~0.2-0.5 s per
+                    # 370k rows measured headless; 2e-6 s/row plus 0.4 s is a
+                    # several-fold margin), and if the camera moved on while
+                    # waiting, drop this table rather than paint a view the
+                    # user already left.
+                    _wait = HOLD.get("swap_ok_at", 0.0) - time.time()
+                    if _wait > 0:
+                        await asyncio.sleep(_wait)
+                        _t0 += _wait  # the status ms is serve time, not the wait
+                    if HOLD.get("pending") is not None:
+                        HOLD["served"] = None  # never drawn: not held
+                        vs, HOLD["pending"] = HOLD["pending"], None
+                        continue
                     try:
                         hud.widget.legend = json.dumps(_legend)
                     except Exception:
                         pass
-                    n = tbl.num_rows
-                    pixels._rows_per_chunk = max(1, n)
+                    # NEVER THE SAME ROW COUNT TWICE IN A ROW (2026-08-20, the
+                    # real cause of the flash, found in Stephen's video and
+                    # reproduced headless): the geoarrow fill layer triangulates
+                    # a new table in a worker (~0.5 s at 300k rows) and keeps
+                    # the OLD sublayer on screen meanwhile ONLY because its
+                    # length assertion throws (new color column vs old batch;
+                    # the benign `assertion failed` console line every serve).
+                    # When the new table has the SAME number of rows as the one
+                    # on screen (a year step at deep zoom over land: every
+                    # pixel has a class every year) the check passes and deck
+                    # paints the old squares with the new colors, misaligned
+                    # by index: crop-colored hatching until the earcut lands.
+                    # One duplicate row (row 0 drawn twice) keeps the lengths
+                    # apart, so the old view stands until the new one is whole.
+                    if n and n == pixels.table.num_rows:
+                        _bs = tbl.to_batches()
+                        tbl = ArrowTable.from_batches(
+                            [*_bs, _bs[0].slice(0, 1)]
+                        ).combine_chunks()   # ONE chunk, still (drive7)
+                    pixels._rows_per_chunk = max(1, tbl.num_rows)
                     with pixels.hold_sync():
                         pixels.table = tbl
                         pixels.get_fill_color = tbl["color"]
+                    HOLD["swap_ok_at"] = time.time() + SWAP_GAP0 + SWAP_GAP_ROW * n
                     HOLD["k"] = k
                     _ms = int((time.time() - _t0) * 1000)
                     _line = (
@@ -1263,6 +1301,9 @@ def _(
     # replacing it makes deck re-triangulate 400k quads (a visible blank). Only a
     # set commit (year/crops) or the first run serves.
     if _act != "analyze" or "k" not in HOLD:
+        # first run: the map cell's own table is still being triangulated in
+        # the loading page, so the opening serve waits the same gap
+        HOLD.setdefault("swap_ok_at", time.time() + 1.5)
         HOLD["task0"] = _spawn(_refresh(_vsd(HOLD.get("vs")) or dict(HOME), force=True))
     return
 

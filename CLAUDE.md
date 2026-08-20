@@ -466,6 +466,17 @@ Things to know:
   changing the year; `_hires` (not the checkbox) keys memo/held/served.
   Same camera serves ~a rung-and-a-half finer, native 10 m at street-level
   zooms. Driven: 10 m fill 246k drawn 2.0 s, fallback note verified.
+- **THE "GARBLED PIXELS" FLASH IS FIXED (2026-08-20, evening)**: the geoarrow
+  fill layer triangulates a new table in a worker (~0.5 s at 300k rows) and
+  holds the old sublayer on screen meanwhile ONLY because its length check
+  throws (the benign `assertion failed` console line every serve, load-
+  bearing); a new table with the SAME row count (year step at deep zoom over
+  land) passed the check and deck painted the old squares with the new colors
+  misaligned. The serve now appends one duplicate row when the count would
+  repeat, spaces swaps by the earcut time (`SWAP_GAP0/SWAP_GAP_ROW`) and drops
+  a table the camera already left. Back on `PolygonLayer`, `pickable` tried
+  and dropped (no tooltip under marimo, legend covers it). Record in
+  `docs/cdl-crops-notes.md`.
 - Unbuilt, agreed as later: county stats (duckdb spatial against the Overture
   counties reader), the 10m-vs-30m 2024/2025 comparison, cropland->developed
   conversion, and an 18-year persistence map. A /dataviz pass on the altair
