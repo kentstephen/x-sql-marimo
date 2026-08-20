@@ -389,7 +389,15 @@ Things to know:
   reports the shadow HOST) as a docked bottom bar with its own white
   backdrop. Commits on `change` + 250 ms debounce, never `input`. Year has
   ◀ ▶ step arrows; crops-only STARTS OFF; lonboard's draw-box toolbar is
-  hidden by deforest's aria-label walk.
+  hidden by deforest's aria-label walk. A PICKABLE LEGEND fills the strip's
+  right side (2026-08-20 late): top-14 classes in view with shares, refreshed
+  per serve via a `legend` Unicode trait; clicking a chip ISOLATES that class
+  (selection joins serve/count/analyze as `crop_type IN`, busts held/memo),
+  multi-select toggles, `× all` resets; the legend always shows the
+  unfiltered view mix so chips stay reachable. It replaced the static
+  bottom-legend cell. JS lesson: the legend renders at widget build, so its
+  state must be declared before the render call (a TDZ error there kills the
+  whole widget with no visible sign).
 - **The camera round trip is VERIFIED headless via playwright** (marimo `run`
   --headless + chromium driving wheel/drag on the canvas, reading the HUD status
   through the shadow DOM): load serves 128x · 72k cells · 0.7 s; wheel-zoom fires
@@ -439,7 +447,10 @@ Things to know:
   reinstall re-links the edit.
 - Unbuilt, agreed as later: county stats (duckdb spatial against the Overture
   counties reader), the 10m-vs-30m 2024/2025 comparison, cropland->developed
-  conversion, an 18-year persistence map. A /dataviz pass on the altair
+  conversion, an 18-year persistence map, SEGMENTING the pixels with DuckDB
+  (dissolve same-class regions into boundary outlines, the NLCD move;
+  Stephen queued it 2026-08-20), and the 10m group (unused; could serve the
+  deepest rungs for 2024/2025). A /dataviz pass on the altair
   chart's series colors was started 2026-08-20 and DROPPED at Stephen's
   direction (the NASS colors fail the validator: Spring Wheat vs Fallow
   ΔE 3.9; a validated crop-evocative 8-hue order exists in the session log

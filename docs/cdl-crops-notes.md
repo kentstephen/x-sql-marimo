@@ -150,10 +150,53 @@ dropdown years. Block-majority pyramid counts are approximate (corn at 64x
 reads ~119M acres vs ~90M planted): trends and transitions at a fixed level are
 honest, absolute acreage wants native over a window.
 
+## The legend (pickable, per-view)
+
+The strip's right side holds a legend of the classes actually in view (top 14
+by count, unfiltered mix so every chip stays reachable), refreshed by each
+serve via a `legend` Unicode trait (JSON). Chips are BUTTONS: click isolates
+that class on the map (the selection joins the serve/count/analyze predicates
+as `crop_type IN (...)`, busts held views and memo keys), multi-select
+toggles, `× all` resets. Measured: Corn from the CONUS view = 9,015 px in
+678 ms; unpick restores from memo in 284 ms. JS gotcha that cost a round: the
+legend renders once at build time, so its state (`sel`) must be declared
+BEFORE the render call — a TDZ ReferenceError there kills the whole widget
+silently (no status line, nothing).
+
 ## Unbuilt / later
 
-County stats (duckdb spatial x Overture counties), 10m-vs-30m 2024/2025
-comparison, cropland->developed conversion, 18-year persistence map. A
+- **Segment the pixels with DuckDB** (Stephen, 2026-08-20). THE PLAN:
+  - Two candidate mechanisms, both pure DuckDB:
+    1. DISSOLVE: `ST_Union_Agg(ST_MakeEnvelope(...))` per class over the
+       view's pixels -> multipolygons, drawn transparent-fill + stroked.
+       The result is still POLYGONS, so it rides the existing single
+       persistent PolygonLayer as a "boundaries" MODE TOGGLE in the strip
+       (fill vs outlines) and never trips the one-layer constraint.
+       `ST_Dump` on the unions gives per-blob identity (area, centroid) for
+       free, the heat-domes dome-table pattern; a blob table cell could rank
+       the largest contiguous fields of each crop in view.
+    2. NEIGHBOR-JOIN edge extraction: an edge is a boundary where the
+       adjacent pixel differs (self-join on x +/- 30k, y +/- 30k at level k);
+       emits segments directly, no union, near-linear. BLOCKED for drawing:
+       segments want a PathLayer, i.e. a SECOND deck layer, which cannot
+       coexist with the updating pixels layer without the declined layer-id
+       bundle patch (see the id saga above).
+  - Therefore v1 = route 1 as a mode toggle. Build order: (a) 15-minute
+    BENCHMARK of ST_Union_Agg at realistic viewport sizes (50k / 200k / 400k
+    squares, few classes vs many) -- this is the go/no-go; the repo has a
+    prior of ST_Union_Agg being 30x slower than alternatives on hexagons;
+    (b) `boundaries` flag through `ctl` -> serve branch: dissolve query,
+    `get_line_color` from the class color column, transparent fill,
+    line_width_units "pixels" (repo lesson: metres is the default and floors
+    the width); (c) memo/held keys gain the mode; (d) playwright pass.
+  - Estimate: ~1-2 h of iteration after a sane benchmark; if the union is
+    too slow, route 2 reopens the second-layer/patch question first.
+  - Pairs with the pickable legend: isolate a class, outline its regions.
+- **The 10m group**: only `30m` is read today; 10 m (2024-2025) could serve
+  the deepest zoom rungs for those years, or the 10m-vs-30m comparison.
+
+County stats (duckdb spatial x Overture counties), cropland->developed
+conversion, 18-year persistence map. A
 /dataviz-validated crop palette for the chart was drafted and dropped (NASS
 colors fail CVD validation: Spring Wheat vs Fallow ΔE 3.9; the validated 8-hue
 order is in the 2026-08-20 session log if wanted).

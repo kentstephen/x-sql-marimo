@@ -121,8 +121,10 @@ def _(mo):
 
     Data: USDA NASS CDL 2008-2025, US public domain, via
     [source.coop/chill/usda-cropland-data-layer](https://source.coop/chill/usda-cropland-data-layer).
-    30 m for 2024+ is NASS's own resampling of the native 10 m product.
-    Pyramid counts are block-majority approximations; dominant crops read high.
+    **Only the 30 m group is read for now**: the store also carries the native
+    10 m product (2024-2025), unused here yet. 30 m for 2024+ is NASS's own
+    resampling of that 10 m product. Pyramid counts are block-majority
+    approximations; dominant crops read high.
     """)
     return
 
@@ -434,6 +436,7 @@ def _(anywidget, traitlets):
         ctl = traitlets.Unicode("").tag(sync=True)
         status = traitlets.Unicode("").tag(sync=True)
         panel = traitlets.Unicode("").tag(sync=True)
+        legend = traitlets.Unicode("").tag(sync=True)
 
         _esm = r"""
         function render({ model, el }) {
@@ -490,7 +493,7 @@ def _(anywidget, traitlets):
             if (e.key === "Enter" && q) {
               model.set("ctl", JSON.stringify({
                 act: "search", q: q, year: +range.value,
-                crops: c.checked, n: ++seq }));
+                crops: c.checked, sel: Array.from(sel), n: ++seq }));
               model.save_changes();
             }
           });
@@ -500,7 +503,58 @@ def _(anywidget, traitlets):
             "font:12px ui-sans-serif,system-ui,sans-serif;cursor:pointer;" +
             "padding:.15rem .6rem;border-radius:4px;border:1px solid " +
             "rgba(127,127,127,.45);background:transparent;color:inherit";
-          box.append(yl, prevB, range, nextB, yv, lab, btn, search);
+          // THE LEGEND: classes actually in the current view (kernel sends
+          // them per serve), each chip PICKABLE: click isolates that class on
+          // the map (multi-select toggles), the x chip restores. The legend
+          // itself always shows the UNFILTERED view mix so every chip stays
+          // reachable while a selection is active.
+          const sel = new Set();
+          const legendBox = document.createElement("div");
+          legendBox.style.cssText =
+            "display:flex;flex-wrap:wrap;align-items:center;" +
+            "gap:.1rem .55rem;flex:1;min-width:14rem";
+          const renderLegend = () => {
+            let items = [];
+            try { items = JSON.parse(model.get("legend") || "[]"); }
+            catch (e) { items = []; }
+            legendBox.innerHTML = "";
+            if (sel.size) {
+              const x = document.createElement("button");
+              x.textContent = "\u00d7 all";
+              x.style.cssText =
+                "font:11px ui-sans-serif,system-ui,sans-serif;cursor:pointer;" +
+                "padding:.05rem .35rem;border-radius:4px;border:1px solid " +
+                "#2b6cb0;background:transparent;color:inherit";
+              x.onclick = () => { sel.clear(); send("set"); renderLegend(); };
+              legendBox.appendChild(x);
+            }
+            items.forEach((it) => {
+              const b = document.createElement("button");
+              const on = sel.has(it.code);
+              b.style.cssText =
+                "display:inline-flex;align-items:center;gap:.3rem;" +
+                "font:12px ui-sans-serif,system-ui,sans-serif;cursor:pointer;" +
+                "padding:.05rem .35rem;border-radius:4px;background:transparent;" +
+                "color:inherit;border:1px solid " +
+                (on ? "#2b6cb0" : "transparent") +
+                (on ? ";font-weight:600" : "");
+              b.title = it.pct + "% of view";
+              b.innerHTML =
+                '<span style="width:10px;height:10px;border-radius:2px;' +
+                "background:" + it.hex + ';display:inline-block"></span>' +
+                it.name;
+              b.onclick = () => {
+                if (sel.has(it.code)) sel.delete(it.code);
+                else sel.add(it.code);
+                send("set");
+                renderLegend();
+              };
+              legendBox.appendChild(b);
+            });
+          };
+          model.on("change:legend", renderLegend);
+          renderLegend();
+          box.append(yl, prevB, range, nextB, yv, lab, btn, search, legendBox);
           const status = document.createElement("div");
           status.style.cssText =
             "font:12.5px ui-monospace,SFMono-Regular,Menlo,monospace;" +
@@ -548,7 +602,8 @@ def _(anywidget, traitlets):
           let seq = 0, deb = null;
           const send = (act) => {
             model.set("ctl", JSON.stringify({
-              act: act, year: +range.value, crops: c.checked, n: ++seq }));
+              act: act, year: +range.value, crops: c.checked,
+              sel: Array.from(sel), n: ++seq }));
             model.save_changes();
           };
           const commit = () => {
@@ -715,6 +770,10 @@ def _(
     _crops_only = bool(_c.get("crops", False))
     _act = _c.get("act", "set")
     _q = str(_c.get("q", "")).strip()
+    _sel = tuple(sorted(int(v) for v in (_c.get("sel") or [])))
+    _sel_sql = (
+        f" AND crop_type IN ({', '.join(str(v) for v in _sel)})" if _sel else ""
+    )
     SETTLE = 0.35
 
     try:
@@ -814,7 +873,7 @@ def _(
                 continue
             _n = mcon.sql(
                 f"""SELECT count(*) FROM cdl_{k}
-                    WHERE year = {_year} AND crop_type NOT IN {drop}
+                    WHERE year = {_year} AND crop_type NOT IN {drop}{_sel_sql}
                       AND x BETWEEN {x0} AND {x1}
                       AND y BETWEEN {y0} AND {y1}"""
             ).fetchone()[0]
@@ -835,12 +894,12 @@ def _(
             _served = HOLD.get("served")
             if (
                 _served is not None
-                and _served[:3] == (k, _year, _crops_only)
-                and x0 >= _served[3] and y0 >= _served[4]
-                and x1 <= _served[5] and y1 <= _served[6]
+                and _served[:4] == (k, _year, _crops_only, _sel)
+                and x0 >= _served[4] and y0 >= _served[5]
+                and x1 <= _served[6] and y1 <= _served[7]
             ):
                 return None  # held: deck already shows every pixel this view has
-            key = (k, _year, _crops_only,
+            key = (k, _year, _crops_only, _sel,
                    round(x0, -3), round(y0, -3), round(x1, -3), round(y1, -3))
             memo = HOLD.setdefault("memo", {})
             tbl = memo.get(key)
@@ -855,7 +914,7 @@ def _(
                            t.crop_type
                     FROM cdl_{k} t JOIN classes c ON c.code = t.crop_type
                     WHERE t.year = {_year}
-                      AND t.crop_type NOT IN {drop}
+                      AND t.crop_type NOT IN {drop}{_sel_sql.replace("crop_type", "t.crop_type")}
                       AND t.x BETWEEN {x0} AND {x1}
                       AND t.y BETWEEN {y0} AND {y1}
                     """
@@ -872,8 +931,24 @@ def _(
                 memo[key] = tbl
                 if len(memo) > 24:
                     memo.pop(next(iter(memo)))
-            HOLD["served"] = (k, _year, _crops_only, x0, y0, x1, y1)
-            return tbl, k
+            # the legend: the UNFILTERED mix of the view (so every chip stays
+            # clickable while a selection isolates the map), top 14 by count
+            _lg = mcon.sql(
+                f"""SELECT c.code, c.name, c.hex, count(*) AS n
+                    FROM cdl_{k} t JOIN classes c ON c.code = t.crop_type
+                    WHERE t.year = {_year} AND t.crop_type NOT IN {drop}
+                      AND t.x BETWEEN {x0} AND {x1}
+                      AND t.y BETWEEN {y0} AND {y1}
+                    GROUP BY 1, 2, 3 ORDER BY n DESC"""
+            ).fetchall()
+            _tot = sum(r[3] for r in _lg) or 1
+            legend = [
+                {"code": int(r[0]), "name": r[1], "hex": r[2],
+                 "pct": round(100 * r[3] / _tot, 1)}
+                for r in _lg[:14]
+            ]
+            HOLD["served"] = (k, _year, _crops_only, _sel, x0, y0, x1, y1)
+            return tbl, k, legend
 
     async def _refresh(vs, force=False):
         """Serve once the camera settles; coalesce whatever piled up meanwhile."""
@@ -897,7 +972,11 @@ def _(
                 if _out is None:
                     _say((HOLD.get("last_line") or "") + " · held")
                 else:
-                    tbl, k = _out
+                    tbl, k, _legend = _out
+                    try:
+                        hud.widget.legend = json.dumps(_legend)
+                    except Exception:
+                        pass
                     n = tbl.num_rows
                     pixels._rows_per_chunk = max(1, n)
                     with pixels.hold_sync():
@@ -1017,7 +1096,7 @@ def _(
                 SELECT c.name, c.hex, count(*) AS n, c.code
                 FROM cdl_{k} t JOIN classes c ON c.code = t.crop_type
                 WHERE t.year = {_year}
-                  AND t.crop_type NOT IN {drop}
+                  AND t.crop_type NOT IN {drop}{_sel_sql.replace("crop_type", "t.crop_type")}
                   AND t.x BETWEEN {x0} AND {x1}
                   AND t.y BETWEEN {y0} AND {y1}
                 GROUP BY 1, 2, 4 ORDER BY n DESC LIMIT 10
@@ -1139,24 +1218,6 @@ def _(
     # set commit (year/crops) or the first run serves.
     if _act != "analyze" or "k" not in HOLD:
         HOLD["task0"] = _spawn(_refresh(_vsd(HOLD.get("vs")) or dict(HOME), force=True))
-    return
-
-
-@app.cell(hide_code=True)
-def _(TOP_N, con, mo):
-    _rows = con.sql(
-        f"""
-        SELECT c.name, c.hex FROM crop_rank r JOIN classes c USING (code)
-        LIMIT {TOP_N + 5}
-        """
-    ).fetchall()
-    _chips = " ".join(
-        f'<span style="display:inline-block;margin:2px 8px 2px 0;white-space:nowrap">'
-        f'<span style="display:inline-block;width:11px;height:11px;border-radius:2px;'
-        f'background:{hx};vertical-align:-1px"></span> {nm}</span>'
-        for nm, hx in _rows
-    )
-    mo.Html(f'<div style="font-size:12px;opacity:.85">{_chips}</div>')
     return
 
 
