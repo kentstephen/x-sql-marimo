@@ -598,7 +598,23 @@ def _(anywidget, traitlets):
           res.style.cssText =
             "font:12px ui-sans-serif,system-ui,sans-serif;padding:.1rem 0";
           const wrap = document.createElement("div");
+          wrap.dataset.cdlStrip = "1";
           wrap.append(box, status, res);
+          // ONE STRIP ONLY (2026-08-20, Stephen saw three: under marimo edit
+          // a re-run of this cell makes a new widget, and the old render's
+          // fullscreen listener kept re-attaching ITS strip to the map, a
+          // zombie bound to a dead model). Remove every earlier strip in the
+          // page, through shadow roots, before adding ours.
+          const killOld = (root) => {
+            if (!root || !root.querySelectorAll) return;
+            root.querySelectorAll("[data-cdl-strip]").forEach((w) => {
+              if (w !== wrap) { w.dataset.dead = "1"; w.remove(); }
+            });
+            root.querySelectorAll("*").forEach((n) => {
+              if (n.shadowRoot) killOld(n.shadowRoot);
+            });
+          };
+          killOld(document);
           el.appendChild(wrap);
           // FULLSCREEN: lonboard's own control fullscreens ITS widget element,
           // and the strip must ride along into the white area under the map
@@ -615,6 +631,13 @@ def _(anywidget, traitlets):
             return fe;
           };
           const onFs = () => {
+            if (wrap.dataset.dead || !el.isConnected) {
+              // this render is gone (cell re-ran, output replaced): never
+              // bring its strip back, and stop listening
+              wrap.remove();
+              document.removeEventListener("fullscreenchange", onFs);
+              return;
+            }
             const fe = realFs();
             if (fe && fe !== el && !el.contains(fe)) {
               // docked bar at the bottom edge of the fullscreen element: when
