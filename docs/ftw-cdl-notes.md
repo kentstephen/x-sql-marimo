@@ -213,3 +213,21 @@ at 40 m on the 10 m ladder). Wall clock from drag to paint in the loaded
 headless Chrome was 12-18 s: the payload is the floor, not the SQL. Zoom-in
 and small pans inside the served box are held (no re-serve). The next lever
 is fewer rows on the 10 m ladder (PX_PER / ROW_BUDGET), a resolution trade.
+
+## Bitmap (2026-08-20, night)
+
+Stephen: the polygon squares buy nothing (not even picking, which needs the
+same JS route either way); "is there any way we can change the data less
+coming into lonboard?" Yes: the picture. Same SQL and caches; the serve ends
+in a PNG of the view (numpy Albers forward, closed form, mm-exact vs DuckDB;
+PIL draws the FTW rings), one BitmapLayer, bounds = the view box. 0.4-1.1 MB
+per serve at any resolution (was 12-18 MB of polygons), ROW_BUDGET 3M so the
+20 m level serves at the Fresno opening. Two-stage paint on a cold FTW miss.
+Driven: pans with fields 0.7-0.9 s kernel / ~2 s wall; disagreement pans
+1.0 s; cold region 10-15 s (parquet from home, 3-10 s per new row groups;
+warm 0.4 s on the same connection; a wider ring is prefetched after a miss).
+Measured pieces: fetch cold 3-10 s / warm 0.4 s, WKB parse 0.0 s, rings
+0.1 s, 3.4M centre transforms 0.8 s, ST_Contains into 5k fields 0.5 s. The
+lazy `.arrow()` reader was why the "concurrent" fetch was not concurrent.
+Screenshots: pixels clipped inside crisp outlines; disagreement + fields shows
+the Kings River foothill pasture as large blue (FTW fields, CDL non-crop).

@@ -13,6 +13,7 @@
 #     "anywidget>=0.9",
 #     "lonboard>=0.16.0",
 #     "arro3-core",
+#     "pillow",
 # ]
 # ///
 """USDA Cropland Data Layer with Fields of the World, as DuckDB SQL in marimo.
@@ -92,11 +93,16 @@ app = marimo.App(width="full", sql_output="native")
 @app.cell
 def _():
     import asyncio
+    import base64
+    import io
     import json
     import math
     import threading
     import time
     from concurrent.futures import ThreadPoolExecutor
+
+    import numpy as np
+    from PIL import Image, ImageDraw
 
     import anywidget
     import duckdb
@@ -108,28 +114,31 @@ def _():
     import urllib.parse
     import urllib.request
 
-    from arro3.core import Table as ArrowTable
-    from lonboard import Map, PolygonLayer
+    from lonboard import BitmapLayer, Map
     from lonboard.basemap import CartoStyle, MaplibreBasemap
     from obstore.store import S3Store
 
     import marimo as mo
 
     return (
-        ArrowTable,
+        BitmapLayer,
         CartoStyle,
+        Image,
+        ImageDraw,
         Map,
         MaplibreBasemap,
-        PolygonLayer,
         S3Store,
         ThreadPoolExecutor,
         anywidget,
         asyncio,
+        base64,
         duckdb,
         icechunk,
+        io,
         json,
         math,
         mo,
+        np,
         threading,
         time,
         traitlets,
@@ -199,7 +208,10 @@ def _():
     ACRES_PER_KM2 = 247.10538
 
     PX_PER = 1.0                  # level floor: largest k with pixel <= PX_PER screen px
-    ROW_BUDGET = 420_000          # max pixel squares per serve; over it, coarsen a level
+    ROW_BUDGET = 3_000_000        # max pixels per serve (numpy rows, not polygons; the
+    # picture is the same size whatever the count); over it, coarsen a level
+    OVERSAMPLE = 1.5              # picture px per screen px (deck filters the bitmap
+    # linearly; 1.5 keeps level pixels crisp without 4x the bytes)
     FTW_BOX_DEG2 = 0.35           # FTW modes only when the (padded) box is under this
     FTW_PAD = 1.6                 # the FTW fetch covers PAD x the serve box each side
     FTW_FETCH_DEG2 = 0.4          # ... capped at this area. Measured: the state file
@@ -239,6 +251,7 @@ def _():
         LEVELS,
         LEVELS10,
         MARGIN,
+        OVERSAMPLE,
         PREFIX,
         PX_PER,
         ROW_BUDGET,
@@ -445,10 +458,108 @@ def _(
 
 
 @app.cell
-def _(FTW_BUCKET, FTW_RES, FTW_VEC, FTW_Y0, MARGIN, VIEW_H, VIEW_W, math):
+def _(
+    FTW_BUCKET,
+    FTW_RES,
+    FTW_VEC,
+    FTW_Y0,
+    Image,
+    ImageDraw,
+    MARGIN,
+    OVERSAMPLE,
+    VIEW_H,
+    VIEW_W,
+    base64,
+    io,
+    math,
+    np,
+):
     # ---- the serve helpers: pure functions of (connection, box, ...), shared
     # by the map cell (opening view) and the wiring cell. No HUD dependency, so
     # the map cell never re-runs on a control change.
+    def albers_xy(lon, lat):
+        """EPSG:5070 forward (Albers equal-area conic on GRS80), closed form in
+        numpy; verified against DuckDB ST_Transform to the millimetre at five
+        CONUS points (2026-08-20). No pyproj."""
+        a = 6378137.0
+        e2 = 0.00669438002290
+        e = math.sqrt(e2)
+        lat0, lon0 = math.radians(23.0), math.radians(-96.0)
+        lat1, lat2 = math.radians(29.5), math.radians(45.5)
+
+        def m(p):
+            return np.cos(p) / np.sqrt(1 - e2 * np.sin(p) ** 2)
+
+        def q(p):
+            sp = np.sin(p)
+            return (1 - e2) * (sp / (1 - e2 * sp * sp)
+                               - (1 / (2 * e)) * np.log((1 - e * sp) / (1 + e * sp)))
+
+        n = (m(lat1) ** 2 - m(lat2) ** 2) / (q(lat2) - q(lat1))
+        C = m(lat1) ** 2 + n * q(lat1)
+        rho0 = a * np.sqrt(C - n * q(lat0)) / n
+        lon = np.radians(lon)
+        lat = np.radians(lat)
+        rho = a * np.sqrt(C - n * q(lat)) / n
+        th = n * (lon - lon0)
+        return rho * np.sin(th), rho0 - rho * np.cos(th)
+
+    def render_view(px_x, px_y, rgb, x0, y0, x1, y1, pix_m, W, S, E, N, rings=None,
+                    line=(40, 40, 40, 210), scale=OVERSAMPLE):
+        """ONE PNG of the view: the drawn pixels (Albers centres + colours) are
+        dropped into a dense grid over the Albers box, every output pixel of
+        the lon/lat view box is forward-transformed into that grid (nearest),
+        then the FTW rings (already lon/lat) are drawn on top. Returns a data
+        URL and the bounds. Transparent where nothing is drawn."""
+        w = int(VIEW_W * (1 + MARGIN) * scale)
+        h = int(VIEW_H * (1 + MARGIN) * scale)
+        # dense Albers grid of the level's pixels
+        gw = int(round((x1 - x0) / pix_m)) + 1
+        gh = int(round((y1 - y0) / pix_m)) + 1
+        grid = np.zeros((gh, gw, 4), dtype=np.uint8)
+        if len(px_x):
+            ix = np.clip(((px_x - x0) / pix_m).astype(np.int64), 0, gw - 1)
+            iy = np.clip(((y1 - px_y) / pix_m).astype(np.int64), 0, gh - 1)
+            grid[iy, ix, :3] = rgb
+            grid[iy, ix, 3] = 255
+        # output lon/lat lattice -> Albers -> grid index
+        lons = W + (np.arange(w) + 0.5) * (E - W) / w
+        lats = N - (np.arange(h) + 0.5) * (N - S) / h
+        LON, LAT = np.meshgrid(lons, lats)
+        X, Y = albers_xy(LON, LAT)
+        jx = ((X - x0) / pix_m).astype(np.int64)
+        jy = ((y1 - Y) / pix_m).astype(np.int64)
+        ok = (jx >= 0) & (jx < gw) & (jy >= 0) & (jy < gh)
+        out = np.zeros((h, w, 4), dtype=np.uint8)
+        out[ok] = grid[jy[ok], jx[ok]]
+        img = Image.fromarray(out, "RGBA")
+        if rings:
+            d = ImageDraw.Draw(img)
+            sx, sy = w / (E - W), h / (N - S)
+            for ring in rings:
+                pts = [((lon - W) * sx, (N - lat) * sy) for lon, lat in ring]
+                if len(pts) >= 2:
+                    d.line(pts + [pts[0]], fill=line, width=1)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=False, compress_level=4)
+        url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+        return url, [W, S, E, N], len(buf.getvalue())
+
+    def rings_from_geojson(rows, json_loads):
+        """Every ring (outer and holes) of polygons / multipolygons from
+        ST_AsGeoJSON rows, as lists of (lon, lat)."""
+        rings = []
+        for (gj,) in rows:
+            if not gj:
+                continue
+            g = json_loads(gj)
+            if g.get("type") == "Polygon":
+                rings.extend(g["coordinates"])
+            elif g.get("type") == "MultiPolygon":
+                for poly in g["coordinates"]:
+                    rings.extend(poly)
+        return [[(c[0], c[1]) for c in r] for r in rings if len(r) >= 3]
+
     def bbox4326(vs):
         span = 360.0 / (512 * 2 ** vs["zoom"])
         dlon = VIEW_W * span * (1 + MARGIN) / 2
@@ -538,7 +649,8 @@ def _(FTW_BUCKET, FTW_RES, FTW_VEC, FTW_Y0, MARGIN, VIEW_H, VIEW_W, math):
             res, f,
         )
 
-    return bbox4326, fields_sql, ftw_files, ftw_grid_sql, lookup_sql, to5070
+    return (albers_xy, bbox4326, fields_sql, ftw_files, ftw_grid_sql, lookup_sql,
+            render_view, rings_from_geojson, to5070)
 
 
 @app.cell
@@ -814,59 +926,46 @@ def _(anywidget, traitlets):
 
 @app.cell
 def _(
+    BitmapLayer,
     CartoStyle,
     HOLD: dict,
     HOME,
     Map,
     MaplibreBasemap,
-    PolygonLayer,
     YEAR0,
     bbox4326,
     mcon,
+    np,
+    render_view,
     to5070,
 ):
     # ---- map cell: builds the Map and the ONE layer, must never re-run. The
-    # opening table is HOME (Fresno County) as plain pixel squares from the
-    # 10 m group's 40 m level (what the serve picks for that view); the
+    # layer is a BitmapLayer: the serve paints the view as one PNG (pixels
+    # from SQL, outlines drawn on top), so the payload is a few hundred KB at
+    # any resolution instead of a polygon per pixel (Stephen, 2026-08-20: the
+    # squares bought nothing, not even picking). The opening image is HOME
+    # (Fresno County) as plain pixels from the 10 m group's 40 m level; the
     # wiring's first forced serve replaces it with the fields-clipped view.
-    # Colours are 4-channel (fill and outline per row) because the serve
-    # appends the field outlines to the same table: one deck layer, always.
+    # NEVER image="" (deck's whole update pass dies, repo lesson): the opening
+    # image is a real PNG.
     _W, _S, _E, _N = bbox4326(HOME)
     _x0, _y0, _x1, _y1 = to5070(mcon, _W, _S, _E, _N)
-    # A NEW LAYER STARTS FROM THE OPENING TABLE, so nothing is "held": under
-    # marimo edit HOLD outlives a cell re-run, and a stale served-key here made
-    # the wiring's first serve return held (plain pixels on screen until the
-    # camera moved; Stephen, 2026-08-20, "fields dont load on map start").
     HOLD["served"] = None
     HOLD.pop("k", None)
-    HOLD.pop("swap_ok_at", None)
-    _tmp = PolygonLayer.from_duckdb(
-        mcon.sql(
-            f"""
-            SELECT ST_Transform(ST_MakeEnvelope(t.x - 20, t.y - 20, t.x + 20, t.y + 20),
-                                'EPSG:5070', 'EPSG:4326', always_xy := true) AS geometry,
-                   [c.r, c.g, c.b, 255]::UTINYINT[4] AS color,
-                   [0, 0, 0, 0]::UTINYINT[4] AS line, t.crop_type
-            FROM cdl10_4 t JOIN classes c ON c.code = t.crop_type
-            WHERE t.year = {YEAR0} AND t.crop_type NOT IN (0, 81)
-              AND t.x BETWEEN {_x0} AND {_x1} AND t.y BETWEEN {_y0} AND {_y1}
-            """
-        ),
-        con=mcon, crs="EPSG:4326",
+    _rows = mcon.sql(
+        f"""
+        SELECT t.x, t.y, c.r, c.g, c.b
+        FROM cdl10_4 t JOIN classes c ON c.code = t.crop_type
+        WHERE t.year = {YEAR0} AND t.crop_type NOT IN (0, 81)
+          AND t.x BETWEEN {_x0} AND {_x1} AND t.y BETWEEN {_y0} AND {_y1}
+        """
+    ).fetchnumpy()
+    _rgb = np.stack([_rows["r"], _rows["g"], _rows["b"]], axis=1).astype(np.uint8)
+    _url, _bounds, _nbytes = render_view(
+        np.asarray(_rows["x"], dtype=np.float64), np.asarray(_rows["y"], dtype=np.float64),
+        _rgb, _x0, _y0, _x1, _y1, 40.0, _W, _S, _E, _N,
     )
-    # SINGLE-CHUNK from the very first table (the serve keeps it so)
-    _t0 = _tmp.table.rechunk(max_chunksize=max(1, _tmp.table.num_rows))
-    pixels = PolygonLayer(
-        table=_t0,
-        _rows_per_chunk=max(1, _t0.num_rows),
-        stroked=False,
-        get_fill_color=_t0["color"],
-        get_line_color=_t0["line"],
-        line_width_units="pixels",
-        line_width_min_pixels=1,
-        line_width_max_pixels=0.7,
-        get_line_width=1,
-    )
+    pixels = BitmapLayer(image=_url, bounds=_bounds, opacity=1.0)
 
     deck = Map(
         layers=[pixels],
@@ -889,7 +988,6 @@ def _(HudControls, mo):
 @app.cell
 def _(
     ACRES_PER_KM2,
-    ArrowTable,
     DIS,
     FIELDS0,
     FTW_BOX_DEG2,
@@ -901,7 +999,6 @@ def _(
     LEVELS10,
     NONCROP_CODES,
     PX_PER,
-    PolygonLayer,
     ROW_BUDGET,
     VIEW_W,
     YEAR0,
@@ -921,7 +1018,10 @@ def _(
     lookup_sql,
     math,
     mcon,
+    np,
     pixels,
+    render_view,
+    rings_from_geojson,
     time,
     to5070,
     urllib,
@@ -960,7 +1060,6 @@ def _(
     HOLD["fields"] = _fields
     HOLD["dis"] = _dis
     SETTLE = 0.35
-    SWAP_GAP0, SWAP_GAP_ROW = 0.4, 2e-6
 
     try:
         HOLD["loop"] = asyncio.get_running_loop()
@@ -1037,41 +1136,89 @@ def _(
     def _fetch_fields(files, fyear, W, S, E, N):
         """Blocking parquet read on fcon -> Arrow (geometry as WKB)."""
         _sql = fields_sql(files, W, S, E, N, fyear)
+        # read_all(): .arrow() alone is a LAZY reader and the read would happen
+        # on the caller's thread at CREATE TABLE time (no concurrency at all)
         return fcon.sql(
             f"SELECT id, area_m2, ST_AsWKB(geometry) AS wkb FROM ({_sql})"
-        ).arrow()
+        ).arrow().read_all()
+
+    def _adopt_fetch(fut, fyear, pw, ps, pe, pn):
+        """A finished fetch future -> polygon table on mcon + cache entry.
+        Runs on the serve thread (mcon is single-threaded under con_lock)."""
+        arrow = fut.result()
+        n = HOLD.get("fb_n", 0)
+        HOLD["fb_n"] = n + 1
+        fbt = f"fb_{n}"
+        mcon.register(f"_arrow_{n}", arrow)
+        mcon.sql(
+            f"""CREATE OR REPLACE TABLE {fbt} AS
+                SELECT id, area_m2, ST_GeomFromWKB(wkb) AS geometry
+                FROM _arrow_{n}"""
+        )
+        mcon.unregister(f"_arrow_{n}")
+        cache = HOLD.setdefault("fcache", {})
+        cache[(fyear, round(pw, 3), round(ps, 3), round(pe, 3), round(pn, 3))] = fbt
+        if len(cache) > 6:
+            _old = next(iter(cache))
+            _ot = cache.pop(_old)
+            try:
+                mcon.sql(f"DROP TABLE IF EXISTS {_ot}")
+            except Exception:
+                pass
+        return fbt, (pw, ps, pe, pn)
 
     def _fields_cache(W, S, E, N):
-        """Name of a polygon table on mcon covering the box for _fyear (a
-        cached padded fetch that contains it, else a new padded fetch, made
-        concurrently with whatever `while_waiting` the caller wants run on
-        mcon). Returns (table, future_or_None)."""
+        """(polygon table on mcon, its box) covering the box for _fyear: a
+        cached padded fetch that contains it, a finished background prefetch
+        that does, else a new padded fetch (blocking; the caller runs the
+        CDL centre scan on mcon while it is in flight). Also queues a WIDER
+        prefetch (2x the padded box) in the pool so the next miss finds the
+        row groups warm in fcon's httpfs cache and lands as a table."""
         cache = HOLD.setdefault("fcache", {})
+        pf = HOLD.get("prefetch")
+        if pf is not None and pf[0].done():
+            HOLD["prefetch"] = None
+            try:
+                _adopt_fetch(*pf)
+            except Exception:
+                pass
         for (_fy, _w, _s, _e, _n), _t in cache.items():
             if _fy == _fyear and _w <= W and _s <= S and _e >= E and _n >= N:
-                return _t, None
+                return _t, (_w, _s, _e, _n), None
         pw, ps, pe, pn = _padded(W, S, E, N)
         _files = ftw_files(mcon, pw, ps, pe, pn)   # ftw_states lives on mcon
         fut = _pool.submit(_fetch_fields, _files, _fyear, pw, ps, pe, pn)
-        return (pw, ps, pe, pn), fut
+        return None, (pw, ps, pe, pn), fut
+
+    def _queue_prefetch(W, S, E, N):
+        """After a cold miss: fetch a ring twice as wide in the background."""
+        if HOLD.get("prefetch") is not None:
+            return
+        cw, ch = (W + E) / 2, (S + N) / 2
+        dw, dh = (E - W), (N - S)   # 2x each side of the padded box
+        pw, ps, pe, pn = cw - dw, ch - dh, cw + dw, ch + dh
+        cache = HOLD.setdefault("fcache", {})
+        if any(_fy == _fyear and _w <= pw and _s <= ps and _e >= pe and _n >= pn
+               for (_fy, _w, _s, _e, _n) in cache):
+            return
+        _files = ftw_files(mcon, pw, ps, pe, pn)
+        fut = _pool.submit(_fetch_fields, _files, _fyear, pw, ps, pe, pn)
+        HOLD["prefetch"] = (fut, _fyear, pw, ps, pe, pn)
 
     def _ftw_tables_at(T, k, W, S, E, N):
-        """(fields table, lookup table) for table prefix T at level k over
-        the serve box: lookup cached per (year, base, level, box)."""
+        """(fields table, lookup table) for table prefix T at level k. The
+        lookup is built ONCE over the cached polygon box (not the serve box),
+        so pans inside it are hits; keyed per (year, base, level, that box)."""
         B = 10 if T == "cdl10_" else 30
-        key = (_fyear, B, k, round(W, 3), round(S, 3), round(E, 3), round(N, 3))
         lk = HOLD.setdefault("fb", {})
-        hit = lk.get(key)
-        if hit is not None:
-            return hit
         for (_fy, _bb, _k, _w, _s, _e, _n), _v in lk.items():
             if (_fy, _bb, _k) == (_fyear, B, k) and _w <= W and _s <= S and _e >= E and _n >= N:
                 return _v
-        x0, y0, x1, y1 = to5070(mcon, W, S, E, N)
-        fbt, fut = _fields_cache(W, S, E, N)
-        n = HOLD.get("fb_n", 0)
-        HOLD["fb_n"] = n + 1
-        # the CDL centres of the serve box, scanned while the parquet read
+        fbt, (pw, ps, pe, pn), fut = _fields_cache(W, S, E, N)
+        x0, y0, x1, y1 = to5070(mcon, pw, ps, pe, pn)
+        n = HOLD.get("lk_n", 0)
+        HOLD["lk_n"] = n + 1
+        # the CDL centres of the padded box, scanned while the parquet read
         # (if any) is in flight on the other connection
         pxt = f"px_{n}"
         mcon.sql(
@@ -1083,26 +1230,9 @@ def _(
                 WHERE year = 2025
                   AND x BETWEEN {x0} AND {x1} AND y BETWEEN {y0} AND {y1}"""
         )
-        if fut is not None:
-            pw, ps, pe, pn = fbt
-            arrow = fut.result()
-            fbt = f"fb_{n}"
-            mcon.register(f"_arrow_{n}", arrow)
-            mcon.sql(
-                f"""CREATE OR REPLACE TABLE {fbt} AS
-                    SELECT id, area_m2, ST_GeomFromWKB(wkb) AS geometry
-                    FROM _arrow_{n}"""
-            )
-            mcon.unregister(f"_arrow_{n}")
-            cache = HOLD.setdefault("fcache", {})
-            cache[(_fyear, round(pw, 3), round(ps, 3), round(pe, 3), round(pn, 3))] = fbt
-            if len(cache) > 6:
-                _old = next(iter(cache))
-                _ot = cache.pop(_old)
-                try:
-                    mcon.sql(f"DROP TABLE IF EXISTS {_ot}")
-                except Exception:
-                    pass
+        cold = fut is not None
+        if cold:
+            fbt, _ = _adopt_fetch(fut, _fyear, pw, ps, pe, pn)
         lkt = f"lk_{n}"
         mcon.sql(
             f"""CREATE OR REPLACE TABLE {lkt} AS
@@ -1110,6 +1240,7 @@ def _(
                 FROM {fbt} f JOIN {pxt} p ON ST_Contains(f.geometry, p.pt)"""
         )
         mcon.sql(f"DROP TABLE IF EXISTS {pxt}")
+        key = (_fyear, B, k, round(pw, 3), round(ps, 3), round(pe, 3), round(pn, 3))
         lk[key] = (fbt, lkt)
         if len(lk) > 8:
             _old = next(iter(lk))
@@ -1118,6 +1249,8 @@ def _(
                 mcon.sql(f"DROP TABLE IF EXISTS {_ot[1]}")
             except Exception:
                 pass
+        if cold:
+            _queue_prefetch(pw, ps, pe, pn)
         return lk[key]
 
     def _ftw_tables(W, S, E, N, k):
@@ -1148,21 +1281,71 @@ def _(
                 pass
         return gt, _res, _f
 
-    def _frame(vs):
-        """Blocking: one table for a view. Pixel squares painted by crop (or
-        by disagreement), clipped to the FTW fields when `fields` is on, with
-        the field outlines APPENDED TO THE SAME TABLE (fill alpha 0, line
-        drawn) so one deck layer carries both. Colours are typed IN SQL
-        (UTINYINT[4] -> arrow FixedSizeList), `con -> from_duckdb`, nothing
-        in between (crops notebook's rule)."""
+    _LUT = HOLD.get("lut")
+    if _LUT is None:
+        _LUT = np.zeros((256, 3), dtype=np.uint8)
+        for _code, _r, _g, _b in mcon.sql("SELECT code, r, g, b FROM classes").fetchall():
+            _LUT[_code] = (_r, _g, _b)
+        HOLD["lut"] = _LUT
+    _DIS_LUT = np.zeros((4, 3), dtype=np.uint8)
+    for _code, (_nm, _hx, _c3) in DIS.items():
+        _DIS_LUT[_code] = _c3
+
+    def _paint(k, x0, y0, x1, y1, W, S, E, N, where, dis, fbt):
+        """One PNG from `cur` (x, y, crop_type, cls): colours by class LUT or
+        by disagreement class; FTW rings drawn when fbt is given."""
+        rows = mcon.sql(
+            f"SELECT x, y, {'cls' if dis else 'crop_type'} AS c FROM cur t WHERE TRUE{where}"
+        ).fetchnumpy()
+        codes = np.asarray(rows["c"])
+        rgb = (_DIS_LUT if dis else _LUT)[codes]
+        rings = None
+        if fbt is not None:
+            _tol = _B * k / 2 / 111_000
+            rings = rings_from_geojson(mcon.sql(
+                f"""SELECT ST_AsGeoJSON(ST_SimplifyPreserveTopology(geometry, {_tol}))
+                    FROM {fbt}
+                    WHERE ST_XMin(geometry) < {E} AND ST_XMax(geometry) > {W}
+                      AND ST_YMin(geometry) < {N} AND ST_YMax(geometry) > {S}"""
+            ).fetchall(), json.loads)
+        url, bounds, nbytes = render_view(
+            np.asarray(rows["x"], dtype=np.float64), np.asarray(rows["y"], dtype=np.float64),
+            rgb, x0, y0, x1, y1, float(_B * k), W, S, E, N, rings=rings,
+        )
+        return url, bounds, len(codes), nbytes
+
+    def _ftw_warm(W, S, E, N, k, dis):
+        """True when everything a FTW frame needs is already cached (no
+        parquet / grid fetch ahead), so stage 1 can be skipped."""
+        fc = HOLD.get("fcache", {})
+        poly = any(_fy == _fyear and _w <= W and _s <= S and _e >= E and _n >= N
+                   for (_fy, _w, _s, _e, _n) in fc)
+        pf = HOLD.get("prefetch")
+        if not poly and pf is not None and pf[0].done() and pf[1] == _fyear \
+                and pf[2] <= W and pf[3] <= S and pf[4] >= E and pf[5] >= N:
+            poly = True
+        if not poly and _fields:
+            return False
+        if dis:
+            f = 4 if _B * k < 120 else 16
+            gc = HOLD.get("gcache", {})
+            if not any((_fy, _f) == (_fyear, f) and _w <= W and _s <= S and _e >= E and _n >= N
+                       for (_fy, _f, _w, _s, _e, _n) in gc):
+                return False
+        return True
+
+    def _stages(vs):
+        """Blocking generator: one or two (url, bounds, legend, line) frames
+        for a view. SQL -> `cur` (x, y, class) -> one PNG. On a COLD FTW miss
+        the plain pixels are painted first and the fields-clipped (and/or
+        disagreement) frame follows when the fetch lands: two swaps of the
+        same layer, nothing blank in between."""
         with con_lock:
             W, S, E, N = bbox4326(vs)
             k, x0, y0, x1, y1, drop = _window(vs)
             fields, dis = _fields, _dis
             note = ""
             if (fields or dis) and (E - W) * (N - S) > FTW_BOX_DEG2:
-                # FTW needs a county-sized box or less (the state parquet
-                # fetch is the cost); wide views serve plain pixels and say so
                 fields, dis, note = False, False, " · zoom in for FTW"
             if _dis_req and not _ftw_ok:
                 note += " · disagreement needs 2024 or 2025"
@@ -1173,114 +1356,101 @@ def _(
                 and W >= _served[7] and S >= _served[8]
                 and E <= _served[9] and N <= _served[10]
             ):
-                return None  # held: deck already shows every row this view has
+                return  # held: the picture already covers this view
             key = (fields, dis, k, _year, _fyear, _crops_only, _sel,
                    round(x0, -3), round(y0, -3), round(x1, -3), round(y1, -3))
             memo = HOLD.setdefault("memo", {})
             hit = memo.get(key)
             if hit is not None:
-                tbl, legend, line = hit
+                HOLD["served"] = (fields, dis, k, _year, _fyear, _crops_only, _sel, W, S, E, N)
+                HOLD["box"] = (W, S, E, N)
+                HOLD["k"] = k
+                url, bounds, legend, line = hit
+                yield url, bounds, legend, line + note + " · memo"
+                return
+            _box = f"t.x BETWEEN {x0} AND {x1} AND t.y BETWEEN {y0} AND {y1}"
+            _sel_px = _sel_sql.replace(_sel_col, f"t.{_sel_col}")
+            _t0 = time.time()
+
+            def _crop_sql(join):
+                return (f"SELECT t.x, t.y, t.crop_type, t.crop_type::UTINYINT AS cls "
+                        f"FROM {_T}{k} t {join} JOIN classes c ON c.code = t.crop_type "
+                        f"WHERE t.year = {_year} AND t.crop_type NOT IN {drop} AND {_box}")
+
+            def _crop_legend():
+                _lg = mcon.sql(
+                    """SELECT c.code, c.name, c.hex, count(*) AS n
+                       FROM cur JOIN classes c ON c.code = cur.crop_type
+                       GROUP BY 1, 2, 3 ORDER BY n DESC"""
+                ).fetchall()
+                _tot = sum(r[3] for r in _lg) or 1
+                return [{"code": int(r[0]), "name": r[1], "hex": r[2],
+                         "pct": round(100 * r[3] / _tot, 1)} for r in _lg[:14]]
+
+            def _line(npx, nbytes, stage_note):
+                return (f"{k}x · {_B * k} m pixels · {npx:,} px · {nbytes / 1e3:,.0f} KB png"
+                        f" · year {_year}{stage_note} · {int((time.time() - _t0) * 1000)} ms")
+
+            # ---- stage 1: plain pixels, only when FTW is wanted and COLD (the
+            # fetch would otherwise leave the old picture up for seconds)
+            cold = (fields or dis) and not _ftw_warm(W, S, E, N, k, dis)
+            if cold:
+                mcon.sql(f"CREATE OR REPLACE TABLE cur AS {_crop_sql('')}")
+                url, bounds, npx, nbytes = _paint(k, x0, y0, x1, y1, W, S, E, N, _sel_px if not dis else "", False, None)
+                yield url, bounds, _crop_legend(), _line(npx, nbytes, " · fetching FTW…") + note
+                _t0 = time.time()
+            # ---- stage 2 (or the only stage): the real frame
+            _join, _fbt = "", None
+            if fields:
+                _fbt, _lkt = _ftw_tables(W, S, E, N, k)
+                _join = f"JOIN {_lkt} l USING (y, x)"
+            if not dis:
+                mcon.sql(f"CREATE OR REPLACE TABLE cur AS {_crop_sql(_join)}")
+                legend = _crop_legend()
             else:
-                half = _B * k / 2
-                _env = (f"ST_Transform(ST_MakeEnvelope(t.x - {half}, t.y - {half}, "
-                        f"t.x + {half}, t.y + {half}), 'EPSG:5070', 'EPSG:4326', "
-                        "always_xy := true) AS geometry")
-                _box = f"t.x BETWEEN {x0} AND {x1} AND t.y BETWEEN {y0} AND {y1}"
-                _join = ""
-                if fields:
-                    _fbt, _lkt = _ftw_tables(W, S, E, N, k)
-                    _join = f"JOIN {_lkt} l USING (y, x)"
-                _sel_px = _sel_sql.replace(_sel_col, f"t.{_sel_col}")
-                if not dis:
-                    # the pixel rows: crop colours
-                    _px = (f"SELECT t.x, t.y, t.crop_type, t.crop_type::UTINYINT AS cls, "
-                           f"[c.r, c.g, c.b, 255]::UTINYINT[4] AS color "
-                           f"FROM {_T}{k} t {_join} JOIN classes c ON c.code = t.crop_type "
-                           f"WHERE t.year = {_year} AND t.crop_type NOT IN {drop} AND {_box}")
-                else:
-                    # the pixel rows: disagreement class from the FTW grid.
-                    # CASE cannot return a UTINYINT[4] (duckdb), so the colour
-                    # comes from a VALUES join
-                    _gt, _res, _f = _ftw_grid(_B * k, W, S, E, N)
-                    _rgb = ", ".join(
-                        f"({code}, [{r}, {g}, {b}, 255]::UTINYINT[4])"
-                        for code, (_nm, _hx, (r, g, b)) in DIS.items()
+                _gt, _res, _f = _ftw_grid(_B * k, W, S, E, N)
+                mcon.sql(
+                    f"""
+                    CREATE OR REPLACE TABLE cur AS
+                    WITH g AS (SELECT ix, iy FROM {_gt}),
+                    p AS (
+                        SELECT t.x, t.y, t.crop_type, c.noncrop,
+                               ST_Transform(ST_Point(t.x, t.y), 'EPSG:5070', 'EPSG:4326',
+                                            always_xy := true) AS pt
+                        FROM {_T}{k} t {_join} JOIN classes c ON c.code = t.crop_type
+                        WHERE t.year = {_year} AND t.crop_type NOT IN {drop} AND {_box}
                     )
-                    _px = (f"""
-                        WITH g AS (SELECT ix, iy FROM {_gt}),
-                        p AS (
-                            SELECT t.x, t.y, t.crop_type, c.noncrop,
-                                   ST_Transform(ST_Point(t.x, t.y), 'EPSG:5070', 'EPSG:4326',
-                                                always_xy := true) AS pt
-                            FROM {_T}{k} t {_join} JOIN classes c ON c.code = t.crop_type
-                            WHERE t.year = {_year} AND t.crop_type NOT IN {drop} AND {_box}
-                        ),
-                        j AS (
-                            SELECT p.x, p.y, p.crop_type,
-                                   (CASE WHEN NOT p.noncrop AND g.ix IS NOT NULL THEN 1
-                                         WHEN NOT p.noncrop THEN 2
-                                         WHEN g.ix IS NOT NULL THEN 3 END)::UTINYINT AS cls
-                            FROM p LEFT JOIN g
-                              ON floor((ST_X(p.pt) + 180) / {_res})::BIGINT = g.ix
-                             AND floor(({FTW_Y0} - ST_Y(p.pt)) / {_res})::BIGINT = g.iy
-                        )
-                        SELECT t.x, t.y, t.crop_type, t.cls, d.color
-                        FROM j t JOIN (VALUES {_rgb}) AS d(cls, color) USING (cls)""")
-                mcon.sql(f"CREATE OR REPLACE TABLE cur AS {_px}")
-                _out = f"""SELECT {_env}, t.color, [0, 0, 0, 0]::UTINYINT[4] AS line,
-                                  t.crop_type
-                           FROM cur t WHERE TRUE{_sel_px}"""
-                if fields:
-                    # the field outlines, same table: transparent fill, drawn
-                    # line. SIMPLIFIED to ~half a serve pixel: FTW's raw 10 m
-                    # rings carry hundreds of vertices per field and were most
-                    # of the bytes shipped per serve (the ms in the status is
-                    # kernel time; the browser only paints once the table
-                    # lands)
-                    _tol = _B * k / 2 / 111_000
-                    _out += f"""
-                        UNION ALL
-                        SELECT ST_SimplifyPreserveTopology(f.geometry, {_tol}),
-                               [0, 0, 0, 0]::UTINYINT[4],
-                               [40, 40, 40, 210]::UTINYINT[4], NULL
-                        FROM {_fbt} f
-                        WHERE ST_XMin(f.geometry) < {E} AND ST_XMax(f.geometry) > {W}
-                          AND ST_YMin(f.geometry) < {N} AND ST_YMax(f.geometry) > {S}"""
-                _tmp = PolygonLayer.from_duckdb(mcon.sql(_out), con=mcon, crs="EPSG:4326")
-                tbl = _tmp.table.rechunk(max_chunksize=max(1, _tmp.table.num_rows))
-                _npx = mcon.sql(f"SELECT count(*) FROM cur t WHERE TRUE{_sel_px}").fetchone()[0]
-                # the legend: the unfiltered mix of the pixel rows
-                if not dis:
-                    _lg = mcon.sql(
-                        """SELECT c.code, c.name, c.hex, count(*) AS n
-                           FROM cur JOIN classes c ON c.code = cur.crop_type
-                           GROUP BY 1, 2, 3 ORDER BY n DESC"""
-                    ).fetchall()
-                    _tot = sum(r[3] for r in _lg) or 1
-                    legend = [{"code": int(r[0]), "name": r[1], "hex": r[2],
-                               "pct": round(100 * r[3] / _tot, 1)} for r in _lg[:14]]
-                else:
-                    _cnt = dict(mcon.sql("SELECT cls, count(*) FROM cur GROUP BY 1").fetchall())
-                    _tot = sum(_cnt.values()) or 1
-                    _pxa = (_B * k / 1000) ** 2 * ACRES_PER_KM2
-                    legend = [
-                        {"code": code, "name": nm, "hex": hx,
-                         "pct": round(100 * _cnt.get(code, 0) / _tot, 1),
-                         "note": f"{_cnt.get(code, 0) * _pxa / 1e3:,.1f}k ac"}
-                        for code, (nm, hx, _c3) in DIS.items()
-                    ]
-                    HOLD["dis_split"] = {code: 100 * _cnt.get(code, 0) / _tot for code in DIS}
-                _mb = sum(tbl.column(i).nbytes for i in range(tbl.num_columns)) / 1e6
-                line = (f"{k}x · {_B * k} m pixels · {_npx:,} drawn · {_mb:.0f} MB · year {_year}"
-                        + (f" · FTW {_fyear} fields" if fields else "")
-                        + (f" · disagreement vs P(field) at {10 * _f} m" if dis else ""))
-                memo[key] = (tbl, legend, line)
-                if len(memo) > 24:
-                    memo.pop(next(iter(memo)))
+                    SELECT p.x, p.y, p.crop_type,
+                           (CASE WHEN NOT p.noncrop AND g.ix IS NOT NULL THEN 1
+                                 WHEN NOT p.noncrop THEN 2
+                                 WHEN g.ix IS NOT NULL THEN 3 END)::UTINYINT AS cls
+                    FROM p LEFT JOIN g
+                      ON floor((ST_X(p.pt) + 180) / {_res})::BIGINT = g.ix
+                     AND floor(({FTW_Y0} - ST_Y(p.pt)) / {_res})::BIGINT = g.iy
+                    """
+                )
+                mcon.sql("DELETE FROM cur WHERE cls IS NULL")
+                _cnt = dict(mcon.sql("SELECT cls, count(*) FROM cur GROUP BY 1").fetchall())
+                _tot = sum(_cnt.values()) or 1
+                _pxa = (_B * k / 1000) ** 2 * ACRES_PER_KM2
+                legend = [
+                    {"code": code, "name": nm, "hex": hx,
+                     "pct": round(100 * _cnt.get(code, 0) / _tot, 1),
+                     "note": f"{_cnt.get(code, 0) * _pxa / 1e3:,.1f}k ac"}
+                    for code, (nm, hx, _c3) in DIS.items()
+                ]
+                HOLD["dis_split"] = {code: 100 * _cnt.get(code, 0) / _tot for code in DIS}
+            url, bounds, npx, nbytes = _paint(k, x0, y0, x1, y1, W, S, E, N, _sel_px, dis, _fbt)
+            line = _line(npx, nbytes,
+                         (f" · FTW {_fyear} fields" if fields else "")
+                         + (f" · disagreement vs P(field) at {10 * _f} m" if dis else ""))
+            memo[key] = (url, bounds, legend, line)
+            if len(memo) > 24:
+                memo.pop(next(iter(memo)))
             HOLD["served"] = (fields, dis, k, _year, _fyear, _crops_only, _sel, W, S, E, N)
             HOLD["box"] = (W, S, E, N)
             HOLD["k"] = k
-            return tbl, legend, line + note, fields
+            yield url, bounds, legend, line + note
 
     async def _refresh(vs, force=False):
         if HOLD.get("busy"):
@@ -1294,44 +1464,24 @@ def _(
                     if HOLD.get("pending") is not None:
                         vs, HOLD["pending"] = HOLD["pending"], None
                         continue
-                _t0 = time.time()
-                _out = _frame(vs)
-                if _out is None:
-                    _say((HOLD.get("last_line") or "") + " · held")
-                else:
-                    tbl, _legend, _line, _stroke = _out
-                    n = tbl.num_rows
-                    # space the swaps by the earcut time (crops notebook's flash fix)
-                    _wait = HOLD.get("swap_ok_at", 0.0) - time.time()
-                    if _wait > 0:
-                        await asyncio.sleep(_wait)
-                        _t0 += _wait
+                painted = False
+                for url, bounds, _legend, _line in _stages(vs):
                     if HOLD.get("pending") is not None:
                         HOLD["served"] = None
-                        vs, HOLD["pending"] = HOLD["pending"], None
-                        continue
+                        break
                     try:
                         hud.widget.legend = json.dumps(_legend)
                     except Exception:
                         pass
-                    # never the same row count twice in a row (the real cause
-                    # of the garbled flash; one duplicate row keeps them apart)
-                    if n and n == pixels.table.num_rows:
-                        _bs = tbl.to_batches()
-                        tbl = ArrowTable.from_batches(
-                            [*_bs, _bs[0].slice(0, 1)]
-                        ).combine_chunks()
-                    pixels._rows_per_chunk = max(1, tbl.num_rows)
                     with pixels.hold_sync():
-                        pixels.table = tbl
-                        pixels.get_fill_color = tbl["color"]
-                        pixels.get_line_color = tbl["line"]
-                        pixels.stroked = _stroke
-                    HOLD["swap_ok_at"] = time.time() + SWAP_GAP0 + SWAP_GAP_ROW * n
-                    _ms = int((time.time() - _t0) * 1000)
-                    _line = f"{_line} · {_ms} ms"
+                        pixels.image = url
+                        pixels.bounds = bounds
                     HOLD["last_line"] = _line
                     _say(_line)
+                    painted = True
+                    await asyncio.sleep(0)   # let the swap go out before stage 2
+                if not painted and HOLD.get("pending") is None:
+                    _say((HOLD.get("last_line") or "") + " · held")
                 vs, force = HOLD.get("pending"), False
                 if vs is None:
                     return
@@ -1580,7 +1730,6 @@ def _(
     # an analyze click must not repaint the map; only a set commit or the
     # first run serves
     if _act not in ("analyze", "search") or "k" not in HOLD:
-        HOLD.setdefault("swap_ok_at", time.time() + 1.5)
         HOLD["task0"] = _spawn(_refresh(_vsd(HOLD.get("vs")) or dict(HOME), force=True))
     return
 

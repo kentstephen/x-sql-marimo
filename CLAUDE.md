@@ -537,12 +537,39 @@ duckdb as a backend"). Full recon and numbers in `docs/ftw-cdl-notes.md`.
   the read is NOT flat (2.5x pad measured 13 s at open and 18 s on a miss; 1.6x
   gives 11 s open, then pans at 1.4-4.7 s kernel time as cache hits). The field
   outline rows are `ST_SimplifyPreserveTopology` to half a serve pixel. The
-  status line now prints the table's MB: a 40 m serve on the 10 m ladder is
+  status line printed the table's MB: a 40 m serve on the 10 m ladder was
   120-175k squares = 12-18 MB per move, and in the (CPU-loaded) headless Chrome
   the paint landed 12-18 s after the drag against 1.4-4.7 s of kernel time, so
-  the floor is the payload, not the SQL. The lever left is fewer rows per
-  serve on the 10 m ladder (PX_PER / ROW_BUDGET, coarser pixels), Stephen's
-  call. A pan or zoom-in inside the served box is "held" (no re-serve).
+  the floor was the payload, not the SQL. THAT is why the layer became a
+  bitmap the same night (next bullet). A pan or zoom-in inside the served box
+  is "held" (no re-serve).
+- **THE LAYER IS A BitmapLayer NOW (2026-08-20, night; Stephen: the squares
+  "aren't buying us anything", not even picking).** The SQL and caches are
+  unchanged; the serve ends in `cur(x, y, crop_type, cls)` -> numpy -> ONE PNG
+  of the view: the drawn pixels go into a dense Albers grid, every output pixel
+  of the lon/lat view box is forward-transformed into it (`albers_xy`, a
+  closed-form EPSG:5070 forward in numpy, verified to the mm against DuckDB;
+  no pyproj), the FTW rings (lon/lat, simplified to half a pixel, via
+  `ST_AsGeoJSON`) are drawn on top with PIL, and the data URL + bounds
+  `[W, S, E, N]` are assigned to the one `BitmapLayer` (`OVERSAMPLE` 1.5
+  picture px per screen px). Payload 0.4-1.1 MB at ANY resolution, so
+  `ROW_BUDGET` is 3M pixels and views serve a level finer than before (20 m at
+  the Fresno opening). NEVER `image=""` (deck's update pass dies; repo rule);
+  the map cell builds a real opening PNG. TWO-STAGE PAINT on a cold FTW miss:
+  plain pixels first (`· fetching FTW…`, ~0.8 s), then the clipped /
+  disagreement frame when the fetch lands; warm frames are one stage. The
+  polygon swap-spacing / duplicate-row machinery is gone with the polygons.
+  Driven: pans with fields on 0.7-0.9 s kernel, ~2 s wall; disagreement pans
+  1.0 s; cold FTW region 10-15 s (the parquet read from home, 3-10 s per new
+  set of row groups; warm row groups on the same DuckDB connection re-read
+  in 0.4 s, so a wider ring is PREFETCHED in the pool after each cold miss
+  and adopted at the next serve). `_fetch_fields` must `.arrow().read_all()`
+  in the thread: `.arrow()` alone is a lazy reader and nothing ran
+  concurrently. The lookup is built once over the PADDED polygon box (not the
+  serve box) so pans hit it; measured: 3.4M centre transforms 0.8 s,
+  `ST_Contains` into 5k fields 0.5 s, rings 0.1 s, WKB parse 0.0 s. marimo
+  mangling lesson again: an underscore helper must be DEFINED ABOVE the
+  generator that calls it in the same cell (`_ftw_warm`).
 - **TODO, Stephen's (not now): picking.** Click a pixel or field to see who says
   what ("who says who's growing what"). He expects it to need the lonboard
   bundle patch (two-layer ids) and does not want that; the HRRR counties film's
