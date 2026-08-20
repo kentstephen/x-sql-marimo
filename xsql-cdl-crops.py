@@ -109,6 +109,8 @@ def _():
 def _(mo):
     mo.md("""
     [![Open in molab](https://molab.marimo.io/molab-shield.svg)](https://molab.marimo.io/github/github.com/kentstephen/x-sql-marimo/blob/main/xsql-cdl-crops.py)
+    <small>the map may be more responsive run locally:
+    `uv run marimo edit xsql-cdl-crops.py --sandbox`</small>
 
     # USDA Cropland Data Layer, in SQL
 
@@ -121,10 +123,11 @@ def _(mo):
 
     Data: USDA NASS CDL 2008-2025, US public domain, via
     [source.coop/chill/usda-cropland-data-layer](https://source.coop/chill/usda-cropland-data-layer).
-    **Only the 30 m group is read for now**: the store also carries the native
-    10 m product (2024-2025), unused here yet. 30 m for 2024+ is NASS's own
-    resampling of that 10 m product. Pyramid counts are block-majority
-    approximations; dominant crops read high.
+    The map reads the 30 m group's 18 years; the **10 m toggle** switches the
+    serve to the store's native 10 m product (2024-2025 only; older years fall
+    back to 30 m). 30 m for 2024+ is NASS's own resampling of that 10 m
+    product. Pyramid counts are block-majority approximations; dominant crops
+    read high.
     """)
     return
 
@@ -137,6 +140,8 @@ def _():
     ENDPOINT = "https://data.source.coop"
 
     LEVELS = [1, 2, 4, 8, 16, 32, 64, 128, 256]  # pyramid factor; pixel = 30*k m
+    LEVELS10 = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]  # the 10m group's own
+    # ladder (native + majority pyramid, 2024-2025 only); pixel = 10*k m
     YEARS = list(range(2008, 2026))
     YEAR0 = 2025
 
@@ -161,6 +166,7 @@ def _():
         HOLD,
         HOME,
         LEVELS,
+        LEVELS10,
         MARGIN,
         PIX_KM2,
         PREFIX,
@@ -180,6 +186,7 @@ def _(
     BUCKET,
     ENDPOINT,
     LEVELS,
+    LEVELS10,
     PREFIX,
     duckdb,
     icechunk,
@@ -278,6 +285,20 @@ def _(
         " hex VARCHAR, r UTINYINT, g UTINYINT, b UTINYINT, noncrop BOOLEAN)"
     )
     mcon.executemany("INSERT INTO classes VALUES (?,?,?,?,?,?,?,?)", _rows)
+
+    # ---- the 10 m group (2024-2025): a full mirror of 30m's structure ------
+    # (native + 2x..512x majority pyramid, same extent, same attrs). Serve-path
+    # registrations only (mcon): the analytics cells stay on 30m's 18 years.
+    # Whole-plane threshold sits at k >= 128 (plane <= 9.3M cells), matching
+    # 30m's k >= 32 by plane size.
+    for _k in LEVELS10:
+        _grp = "10m" if _k == 1 else f"10m/{_k}x"
+        _ds = xr.open_zarr(_session.store, group=_grp, chunks=None)
+        if _k >= 128:
+            _chunks = {"year": 1, "y": _ds.sizes["y"], "x": _ds.sizes["x"]}
+        else:
+            _chunks = {"year": 1, "y": 2048, "x": 2048}
+        xql.register(mcon, f"cdl10_{_k}", _ds, chunks=_chunks)
 
     # crop ranking for the analytics cells (2025 CONUS pixel counts at 64x)
     con.sql(
@@ -481,6 +502,16 @@ def _(anywidget, traitlets):
           c.checked = false;
           lab.appendChild(c);
           lab.appendChild(document.createTextNode("crops only"));
+          // 10 m: read the native-10m group's ladder (2024-2025 only; older
+          // years fall back to 30 m kernel-side with a status note)
+          const labT = document.createElement("label");
+          labT.style.cssText =
+            "display:inline-flex;align-items:center;gap:.35rem;cursor:pointer";
+          const hi = document.createElement("input");
+          hi.type = "checkbox";
+          hi.checked = false;
+          labT.appendChild(hi);
+          labT.appendChild(document.createTextNode("10 m"));
           const search = document.createElement("input");
           search.type = "search";
           search.placeholder = "find a place\u2026";
@@ -493,7 +524,8 @@ def _(anywidget, traitlets):
             if (e.key === "Enter" && q) {
               model.set("ctl", JSON.stringify({
                 act: "search", q: q, year: +range.value,
-                crops: c.checked, sel: Array.from(sel), n: ++seq }));
+                crops: c.checked, res10: hi.checked,
+                sel: Array.from(sel), n: ++seq }));
               model.save_changes();
             }
           });
@@ -554,7 +586,7 @@ def _(anywidget, traitlets):
           };
           model.on("change:legend", renderLegend);
           renderLegend();
-          box.append(yl, prevB, range, nextB, yv, lab, btn, search, legendBox);
+          box.append(yl, prevB, range, nextB, yv, lab, labT, btn, search, legendBox);
           const status = document.createElement("div");
           status.style.cssText =
             "font:12.5px ui-monospace,SFMono-Regular,Menlo,monospace;" +
@@ -603,7 +635,7 @@ def _(anywidget, traitlets):
           const send = (act) => {
             model.set("ctl", JSON.stringify({
               act: act, year: +range.value, crops: c.checked,
-              sel: Array.from(sel), n: ++seq }));
+              res10: hi.checked, sel: Array.from(sel), n: ++seq }));
             model.save_changes();
           };
           const commit = () => {
@@ -613,6 +645,7 @@ def _(anywidget, traitlets):
           range.addEventListener("input", () => { yv.textContent = range.value; });
           range.addEventListener("change", commit);
           c.addEventListener("change", commit);
+          hi.addEventListener("change", commit);
           btn.addEventListener("click", () => {
             res.innerHTML = '<span style="opacity:.6">analyzing…</span>';
             send("analyze");
@@ -735,6 +768,7 @@ def _(
     HOLD,
     HOME,
     LEVELS,
+    LEVELS10,
     MARGIN,
     NONCROP_CODES,
     PX_PER,
@@ -768,6 +802,13 @@ def _(
         _c = {}
     _year = int(_c.get("year", YEAR0))
     _crops_only = bool(_c.get("crops", False))
+    _res10 = bool(_c.get("res10", False))
+    # the 10m group only has 2024-2025: older years fall back to 30 m and the
+    # status line says so rather than silently changing the year
+    _hires = _res10 and _year >= 2024
+    _B = 10 if _hires else 30                    # base pixel, metres
+    _LV = LEVELS10 if _hires else LEVELS         # the group's ladder
+    _T = "cdl10_" if _hires else "cdl_"          # table prefix
     _act = _c.get("act", "set")
     _q = str(_c.get("q", "")).strip()
     _sel = tuple(sorted(int(v) for v in (_c.get("sel") or [])))
@@ -802,9 +843,9 @@ def _(
     def _pick_level(vs):
         # floor rule: the finest level whose pixel is still >= PX_PER screen px
         mpp = 156543.03392 * math.cos(math.radians(vs["latitude"])) / 2 ** vs["zoom"]
-        want = max(mpp * PX_PER / 30.0, 1.0)
-        ks = [k for k in LEVELS if k <= want]
-        return ks[-1] if ks else LEVELS[0]
+        want = max(mpp * PX_PER / _B, 1.0)
+        ks = [k for k in _LV if k <= want]
+        return ks[-1] if ks else _LV[0]
 
     def _bbox4326(vs):
         span = 360.0 / (512 * 2 ** vs["zoom"])
@@ -855,6 +896,7 @@ def _(
 
     def _window(vs):
         """Level + Albers box for a view: floor pick, then the count-based budget."""
+        budget = ROW_BUDGET
         k = _pick_level(vs)
         x0, y0, x1, y1 = _to5070(*_bbox4326(vs))
         drop = _drop_list()
@@ -864,21 +906,21 @@ def _(
         # Only a box that COULD exceed the budget pays for a real count, which
         # serves a level or two finer than geometry alone (background dominates:
         # CONUS crops at 128x is 68k rows against a 1.2M-cell box).
-        while k < LEVELS[-1]:
-            _est = (x1 - x0) * (y1 - y0) / (30 * k) ** 2
-            if _est <= ROW_BUDGET:
+        while k < _LV[-1]:
+            _est = (x1 - x0) * (y1 - y0) / (_B * k) ** 2
+            if _est <= budget:
                 break
-            if _est > 24 * ROW_BUDGET:
-                k = LEVELS[LEVELS.index(k) + 1]
+            if _est > 24 * budget:
+                k = _LV[_LV.index(k) + 1]
                 continue
             _n = mcon.sql(
-                f"""SELECT count(*) FROM cdl_{k}
+                f"""SELECT count(*) FROM {_T}{k}
                     WHERE year = {_year} AND crop_type NOT IN {drop}{_sel_sql}
                       AND x BETWEEN {x0} AND {x1}
                       AND y BETWEEN {y0} AND {y1}"""
             ).fetchone()[0]
-            if _n > ROW_BUDGET:
-                k = LEVELS[LEVELS.index(k) + 1]
+            if _n > budget:
+                k = _LV[_LV.index(k) + 1]
                 continue
             break
         return k, x0, y0, x1, y1, drop
@@ -894,17 +936,17 @@ def _(
             _served = HOLD.get("served")
             if (
                 _served is not None
-                and _served[:4] == (k, _year, _crops_only, _sel)
-                and x0 >= _served[4] and y0 >= _served[5]
-                and x1 <= _served[6] and y1 <= _served[7]
+                and _served[:5] == (k, _year, _crops_only, _sel, _hires)
+                and x0 >= _served[5] and y0 >= _served[6]
+                and x1 <= _served[7] and y1 <= _served[8]
             ):
                 return None  # held: deck already shows every pixel this view has
-            key = (k, _year, _crops_only, _sel,
+            key = (k, _year, _crops_only, _sel, _hires,
                    round(x0, -3), round(y0, -3), round(x1, -3), round(y1, -3))
             memo = HOLD.setdefault("memo", {})
             tbl = memo.get(key)
             if tbl is None:
-                half = 15 * k
+                half = _B * k / 2
                 rel = mcon.sql(
                     f"""
                     SELECT ST_Transform(
@@ -912,7 +954,7 @@ def _(
                              'EPSG:5070', 'EPSG:4326', always_xy := true) AS geometry,
                            [c.r, c.g, c.b]::UTINYINT[3] AS color,
                            t.crop_type
-                    FROM cdl_{k} t JOIN classes c ON c.code = t.crop_type
+                    FROM {_T}{k} t JOIN classes c ON c.code = t.crop_type
                     WHERE t.year = {_year}
                       AND t.crop_type NOT IN {drop}{_sel_sql.replace("crop_type", "t.crop_type")}
                       AND t.x BETWEEN {x0} AND {x1}
@@ -935,7 +977,7 @@ def _(
             # clickable while a selection isolates the map), top 14 by count
             _lg = mcon.sql(
                 f"""SELECT c.code, c.name, c.hex, count(*) AS n
-                    FROM cdl_{k} t JOIN classes c ON c.code = t.crop_type
+                    FROM {_T}{k} t JOIN classes c ON c.code = t.crop_type
                     WHERE t.year = {_year} AND t.crop_type NOT IN {drop}
                       AND t.x BETWEEN {x0} AND {x1}
                       AND t.y BETWEEN {y0} AND {y1}
@@ -947,7 +989,7 @@ def _(
                  "pct": round(100 * r[3] / _tot, 1)}
                 for r in _lg[:14]
             ]
-            HOLD["served"] = (k, _year, _crops_only, _sel, x0, y0, x1, y1)
+            HOLD["served"] = (k, _year, _crops_only, _sel, _hires, x0, y0, x1, y1)
             return tbl, k, legend
 
     async def _refresh(vs, force=False):
@@ -984,7 +1026,11 @@ def _(
                         pixels.get_fill_color = tbl["color"]
                     HOLD["k"] = k
                     _ms = int((time.time() - _t0) * 1000)
-                    _line = f"{k}x · {30 * k} m pixels · {n:,} drawn · {_ms} ms · year {_year}"
+                    _line = (
+                        f"{k}x · {_B * k} m pixels · {n:,} drawn · "
+                        f"{_ms} ms · year {_year}"
+                        + (" · 10 m needs 2024+" if _res10 and not _hires else "")
+                    )
                     HOLD["last_line"] = _line
                     _say(_line)
                 vs, force = HOLD.get("pending"), False
@@ -1094,7 +1140,7 @@ def _(
             rows = mcon.sql(
                 f"""
                 SELECT c.name, c.hex, count(*) AS n, c.code
-                FROM cdl_{k} t JOIN classes c ON c.code = t.crop_type
+                FROM {_T}{k} t JOIN classes c ON c.code = t.crop_type
                 WHERE t.year = {_year}
                   AND t.crop_type NOT IN {drop}{_sel_sql.replace("crop_type", "t.crop_type")}
                   AND t.x BETWEEN {x0} AND {x1}
@@ -1108,7 +1154,7 @@ def _(
             tl = mcon.sql(
                 f"""
                 SELECT year, crop_type, count(*) AS n
-                FROM cdl_{k}
+                FROM {_T}{k}
                 WHERE crop_type IN ({", ".join(str(c) for c in _tl_codes)})
                   AND x BETWEEN {x0} AND {x1}
                   AND y BETWEEN {y0} AND {y1}
@@ -1117,10 +1163,10 @@ def _(
             ).fetchall() if _tl_codes else []
             tl_ms = int((time.time() - _t_tl) * 1000)
         total = sum(r[2] for r in rows) or 1
-        px_km2 = (0.03 * k) ** 2
+        px_km2 = (_B * k / 1000) ** 2
         out = [
             f'<span style="opacity:.65;margin-right:.9rem;white-space:nowrap">'
-            f"in view · {k}x · year {_year} · approx (majority pyramid)</span>"
+            f"in view · {k}x ({_B * k} m) · year {_year} · approx (majority pyramid)</span>"
         ]
         for nm, hx, n, _code in rows:
             macres = n * px_km2 * ACRES_PER_KM2 / 1e6

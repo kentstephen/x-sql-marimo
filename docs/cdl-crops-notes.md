@@ -100,7 +100,8 @@ that does, established by a minimal repro + playwright console capture:
 
 Deforest Controls/Status idiom: 12px ui-sans-serif flex row, transparent
 bordered buttons, 12.5px ui-monospace status line. year slider (native range,
-no locale commas) + ◀ ▶ step arrows, crops-only checkbox (starts OFF), analyze
+no locale commas) + ◀ ▶ step arrows, crops-only and 10 m checkboxes (both
+start OFF), analyze
 button, and a Photon SEARCH FIELD (flood's client moved into the strip: urllib
 on a thread, camera-biased, first hit flies via `deck.fly_to` — assigning
 `view_state` kernel-side is ignored — extent picks the zoom, and the refold
@@ -113,7 +114,7 @@ shadow HOST) as a docked bottom bar with its own white backdrop. lonboard's
 draw-box toolbar is hidden by deforest's aria-label walk.
 
 Trait contract (proven types only): `ctl` Unicode browser->kernel, JSON
-{act: set|analyze|search, year, crops, q, n}; `status`/`panel` Unicode
+{act: set|analyze|search, year, crops, res10, sel, q, n}; `status`/`panel` Unicode
 kernel->browser. marimo re-running the wiring cell (which reads hud.widget.ctl)
 IS the year/toggle/search dispatch.
 
@@ -163,9 +164,98 @@ legend renders once at build time, so its state (`sel`) must be declared
 BEFORE the render call — a TDZ ReferenceError there kills the whole widget
 silently (no status line, nothing).
 
+## Boundaries mode (2026-08-20: built, playwright-verified, and REMOVED the
+same day)
+
+Stephen's verdict after flying it: "the boundaries don't really add anything
+... they only really kind of work when it's zoomed all the way in", and the
+pixels are already polygons, so stroking them adds nothing. The mechanism's
+honest problem: the dissolve outlines whatever raster is on screen, so at
+pyramid levels it outlines majority-vote blocks (rendering artifacts), and
+even at native two touching same-crop fields merge into one blob, so it is
+not field delineation either. Removed from the notebook (never committed);
+this section is the record and the way back. If it returns it should return
+as DATA, not paint: the ST_Dump blobs carry area/centroid free (largest
+contiguous patch in view, persistence outlines over N years, 10m-vs-30m
+edge comparison). What was built and verified:
+
+- The serve dissolves the view's pixels per class kernel-side:
+  `ST_Union_Agg(ST_MakeEnvelope(...))` GROUP BY crop_type, then
+  `UNNEST(ST_Dump(g), recursive := true)` into per-blob rows, then ONE
+  `ST_Transform` per blob to 4326 and the `[r,g,b]::UTINYINT[3]` color join.
+  ST_Dump is not only free (benchmark above): it also guarantees ONE geometry
+  type (POLYGON) in the WKB column, which `from_duckdb`'s parse wants (the
+  Overture buildings polygon/multipolygon lesson).
+- The layer is RESTYLED, never replaced: under `hold_sync`, boundaries sets
+  `stroked=True`, KEEPS the class-color fill on the dissolved regions, and
+  strokes them `BND_STROKE` light silver ([205, 205, 210, 230], a constants
+  knob). First iteration drew outlines-only (transparent fill by color,
+  class-colored strokes); Stephen: cool, keep on hand, but segments on
+  their own read unintuitive, "maybe a light silver outline around the
+  crops". Outlines-only is `get_fill_color=[0,0,0,0]` in the same branch.
+  `filled` stays True throughout (the fill-is-an-alpha lesson); width
+  traits are seeded at build (`line_width_units="pixels"`,
+  `line_width_min_pixels=1`). The `stroked` FLIP WORKS both directions,
+  screenshot-verified (vivid-pixel fraction 0.346 fill -> 0.055
+  outlines-only -> 0.222 silver-on-fill -> 0.970 restored); the fill-flag
+  caveat does not extend to it. Known look: at CONUS/256x the hairlines
+  gray the busy regions a little; at 64x and finer it reads as fields
+  with borders.
+- Boundaries SHARES ROW_BUDGET (no own budget): built first with a 100k
+  `BND_BUDGET` per the benchmark verdict, REMOVED after Stephen flew it
+  ("the boundaries coarsen the polygons significantly. i dont see why they
+  should"): the outlines must delineate the same pixels the fill drew, so
+  level parity wins over latency. The price is the wide-view union (7-9 s
+  at 420k rows, benchmarked), paid once per view and then absorbed by the
+  memo and held-view checks; deep zooms under the budget never feel it.
+  The memo key, held-view key and served tuple all carry the mode flag, so
+  toggling busts held views and both modes memoise independently.
+- Status line says `N regions` and appends `· boundaries`.
+- Measured in the driven Chrome (marimo run --headless + chromium, shadow-DOM
+  status reads): opening CONUS fill 256x 137k drawn 0.7 s; toggle on -> 10,472
+  regions 5.5-6.1 s (the CONUS worst case: 137k rows at 256x with no coarser
+  rung to fall to, and every landcover class in the union); wheel-zoom to 64x
+  -> 4,742 regions 3.3 s; toggle off -> 32x fill restored 1.8 s. Screenshots:
+  wide view reads as class-colored outlines with the basemap's labels
+  legible through it; deep views outline individual field clusters.
+- Pairs with the pickable legend as planned: isolate a class, outline its
+  regions (the selection predicate joins the dissolve WHERE like any serve).
+- Driver gotchas (beyond the repo's scrollIntoView/version ones): an element
+  screenshot of `locator("canvas").first` measured the ALTAIR chart, not the
+  map (the deck canvas is LAST); and waits must not accept the transient
+  `· held` status the zoom animation passes through when the target is a
+  fresh serve at a finer level.
+
+## The 10 m toggle (2026-08-20, BUILT; playwright-verified same day)
+
+The store's `10m` group is a FULL MIRROR of `30m`'s structure: native
+(316,295 x 480,509) + a 2x..512x majority pyramid, years 2024-2025 only, same
+Albers extent (within 25 m of the 30m clamp constants), same attrs. So the
+toggle is one parametrization, not a second pipeline: `_hires` picks
+(base pixel `_B` 10|30, ladder `_LV` LEVELS10|LEVELS, table prefix `_T`
+`cdl10_`|`cdl_`) and the serve, count, legend and analyze queries all read
+`{_T}{k}`. Registered on mcon only (`cdl10_1..512`; the analytics cells stay
+on 30m's 18 years); whole-plane blocks at k >= 128, matching 30m's k >= 32 by
+plane size (<= ~9.3M cells).
+
+- **Years before 2024 fall back to 30 m** with `· 10 m needs 2024+` appended
+  to the status line; the year is never changed silently. `_hires` (not the
+  raw checkbox) joins the memo/held/served keys, so a fallback serve is keyed
+  as the 30 m serve it is.
+- The level floor picks from the 10 m ladder, so the same camera serves ~a
+  rung-and-a-half finer ground (e.g. the driven pass: 32x/960 m on 30 m ->
+  128x/1280 m on 10 m at the same view); native 10 m arrives at street-level
+  zooms.
+- Driven-Chrome numbers: 10 m fill 64x 246k drawn 2.0 s at the same camera
+  where 30 m served 32x/960 m; year 2020 with the toggle on serves 30 m
+  with the note. Pixel-size %30 in the status line is the driver's mode
+  oracle. (The removed boundaries mode's 10 m numbers live in its section
+  above.)
+
 ## Unbuilt / later
 
-- **Segment the pixels with DuckDB** (Stephen, 2026-08-20). THE PLAN:
+- **Segment the pixels with DuckDB** (Stephen, 2026-08-20). BUILT as route 1
+  (boundaries mode above); the plan record kept:
   - Two candidate mechanisms, both pure DuckDB:
     1. DISSOLVE: `ST_Union_Agg(ST_MakeEnvelope(...))` per class over the
        view's pixels -> multipolygons, drawn transparent-fill + stroked.
@@ -184,7 +274,38 @@ silently (no status line, nothing).
   - Therefore v1 = route 1 as a mode toggle. Build order: (a) 15-minute
     BENCHMARK of ST_Union_Agg at realistic viewport sizes (50k / 200k / 400k
     squares, few classes vs many) -- this is the go/no-go; the repo has a
-    prior of ST_Union_Agg being 30x slower than alternatives on hexagons;
+    prior of ST_Union_Agg being 30x slower than alternatives on hexagons.
+    RUN 2026-08-20 (`xarray-sql-multi-backend-test/bench_cdl_segment.py`,
+    real store, native 30 m, window materialized so the union is timed
+    apart from the fetch):
+
+      | site                | rows | cls | union  | blobs  | wkb 4326 | iso top-2 |
+      |---------------------|------|-----|--------|--------|----------|-----------|
+      | Iowa                |  50k |  23 | 0.67 s |  2,709 |  0.6 MB  | 0.45 s    |
+      | Iowa                | 200k |  26 | 2.85 s | 10,957 |  2.7 MB  | 1.63 s    |
+      | Iowa                | 400k |  26 | 6.81 s | 22,777 |  5.4 MB  | 3.82 s    |
+      | Central Valley      |  50k |  53 | 0.91 s |  7,607 |  1.4 MB  | 0.33 s    |
+      | Central Valley      | 200k |  54 | 4.44 s | 30,496 |  5.5 MB  | 1.38 s    |
+      | Central Valley      | 400k |  56 | 9.10 s | 57,691 | 10.4 MB  | 2.90 s    |
+
+    Readings: the union is the WHOLE cost and it is row-bound, slightly
+    superlinear (0.67 -> 6.81 s for 8x rows); class count barely matters
+    (53 vs 23 classes adds ~30%); ST_Dump and the single ST_Transform to
+    4326 are FREE (<= 0.1 s), so blob identity and the reprojection ride
+    along for nothing; fetch is 0.2-0.5 s, unchanged from the fill serve.
+    Isolating the top-2 classes halves the cost at best, because the
+    dominant classes ARE most of the rows (Iowa corn+soy: 3.8 s of 6.8).
+    VERDICT: go, with a smaller budget. At the fill serve's full
+    ROW_BUDGET (420k) the union is 7-9 s, way over the 0.5-1.7 s serve
+    feel; at <= ~100k rows it is ~1-2 s, acceptable. So boundaries mode
+    wants its OWN budget (~100k, i.e. the level floor lands one rung
+    coarser than the fill at the same view), not a shared one. The
+    hexagon 30x prior does not transfer: axis-aligned squares union far
+    cheaper than hex boundaries.
+    POSTSCRIPT: the smaller budget was built, flown, and REMOVED the same
+    day at Stephen's call: the visible level drop on toggle reads wrong
+    (outlines should trace the same pixels the fill drew), so boundaries
+    shares ROW_BUDGET and the wide-view union cost is accepted.
     (b) `boundaries` flag through `ctl` -> serve branch: dissolve query,
     `get_line_color` from the class color column, transparent fill,
     line_width_units "pixels" (repo lesson: metres is the default and floors
@@ -192,8 +313,8 @@ silently (no status line, nothing).
   - Estimate: ~1-2 h of iteration after a sane benchmark; if the union is
     too slow, route 2 reopens the second-layer/patch question first.
   - Pairs with the pickable legend: isolate a class, outline its regions.
-- **The 10m group**: only `30m` is read today; 10 m (2024-2025) could serve
-  the deepest zoom rungs for those years, or the 10m-vs-30m comparison.
+- **The 10m-vs-30m 2024/2025 comparison** (the group itself is served now,
+  see the 10 m toggle section above).
 
 County stats (duckdb spatial x Overture counties), cropland->developed
 conversion, 18-year persistence map. A

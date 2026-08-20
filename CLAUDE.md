@@ -445,12 +445,30 @@ Things to know:
   marimo is PINNED ==0.23.16 in the rc project. uv installs by HARDLINK from
   its cache, so editing a venv file in place edits the cached wheel and a
   reinstall re-links the edit.
+- **BOUNDARIES MODE: built, verified, and REMOVED the same day (2026-08-20)**
+  at Stephen's call ("the boundaries don't really add anything"; the pixels
+  are already polygons, stroking them adds nothing, and the dissolve outlines
+  pyramid blocks at coarse levels while merging adjacent same-crop fields at
+  native). Full record, measured numbers and the way back (as region DATA,
+  not paint) in `docs/cdl-crops-notes.md`; the go/no-go benchmark
+  (`bench_cdl_segment.py`) stays: ST_Union_Agg on pixel squares is row-bound,
+  ~1-2 s at 100k rows, 7-9 s at 420k, ST_Dump/transform free, the hexagon
+  30x prior does not transfer. Also proven and still true: lonboard's
+  `stroked` flip works both ways under marimo (screenshot-verified), unlike
+  `filled`.
+- **10 m TOGGLE (2026-08-20, playwright-verified)**: the `10m` group is a
+  full mirror of `30m` (native + 2x..512x majority pyramid, 2024-2025 only,
+  same extent/attrs), so it is ONE PARAMETRIZATION: a "10 m" checkbox
+  (`res10` in ctl) sets `_hires` -> (base 10 m, LEVELS10 ladder incl. 512,
+  `cdl10_` tables, registered on mcon only, whole-plane at k >= 128), and
+  every serve/count/legend/analyze query reads `{_T}{k}`. Years < 2024 FALL
+  BACK to 30 m with `· 10 m needs 2024+` in the status, never silently
+  changing the year; `_hires` (not the checkbox) keys memo/held/served.
+  Same camera serves ~a rung-and-a-half finer, native 10 m at street-level
+  zooms. Driven: 10 m fill 246k drawn 2.0 s, fallback note verified.
 - Unbuilt, agreed as later: county stats (duckdb spatial against the Overture
   counties reader), the 10m-vs-30m 2024/2025 comparison, cropland->developed
-  conversion, an 18-year persistence map, SEGMENTING the pixels with DuckDB
-  (dissolve same-class regions into boundary outlines, the NLCD move;
-  Stephen queued it 2026-08-20), and the 10m group (unused; could serve the
-  deepest rungs for 2024/2025). A /dataviz pass on the altair
+  conversion, and an 18-year persistence map. A /dataviz pass on the altair
   chart's series colors was started 2026-08-20 and DROPPED at Stephen's
   direction (the NASS colors fail the validator: Spring Wheat vs Fallow
   ΔE 3.9; a validated crop-evocative 8-hue order exists in the session log
