@@ -13,7 +13,7 @@
 #     "anywidget>=0.9",
 #     "lonboard>=0.16.0",
 #     "arro3-core",
-#     "pillow",
+#     "pillow==12.3.0",
 # ]
 # ///
 """USDA Cropland Data Layer with Fields of the World, as DuckDB SQL in marimo.
@@ -1465,21 +1465,29 @@ def _(
                         vs, HOLD["pending"] = HOLD["pending"], None
                         continue
                 painted = False
-                for url, bounds, _legend, _line in _stages(vs):
-                    if HOLD.get("pending") is not None:
-                        HOLD["served"] = None
-                        break
-                    try:
-                        hud.widget.legend = json.dumps(_legend)
-                    except Exception:
-                        pass
-                    with pixels.hold_sync():
-                        pixels.image = url
-                        pixels.bounds = bounds
-                    HOLD["last_line"] = _line
-                    _say(_line)
-                    painted = True
-                    await asyncio.sleep(0)   # let the swap go out before stage 2
+                # the generator holds con_lock across its stages: ALWAYS close
+                # it (a `break` on a camera move left the lock held forever and
+                # every later serve blocked: "camera…" and nothing; Stephen,
+                # 2026-08-20 night)
+                _gen = _stages(vs)
+                try:
+                    for url, bounds, _legend, _line in _gen:
+                        if HOLD.get("pending") is not None:
+                            HOLD["served"] = None
+                            break
+                        try:
+                            hud.widget.legend = json.dumps(_legend)
+                        except Exception:
+                            pass
+                        with pixels.hold_sync():
+                            pixels.image = url
+                            pixels.bounds = bounds
+                        HOLD["last_line"] = _line
+                        _say(_line)
+                        painted = True
+                        await asyncio.sleep(0)   # let the swap go out before stage 2
+                finally:
+                    _gen.close()
                 if not painted and HOLD.get("pending") is None:
                     _say((HOLD.get("last_line") or "") + " · held")
                 vs, force = HOLD.get("pending"), False
