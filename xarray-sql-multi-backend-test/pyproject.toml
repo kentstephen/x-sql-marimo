@@ -9,6 +9,7 @@ requires-python = ">=3.13"
 # xql.register(con, ...) works on a duckdb connection as well as a DataFusion
 # SessionContext. The rc pins datafusion==54.0.0 exactly.
 dependencies = [
+    "altair>=6.2.2",
     "anywidget>=0.9",
     "arro3-core",
     "async-geotiff>=0.4",
@@ -18,7 +19,7 @@ dependencies = [
     "h3ronpy>=0.22.0",
     "icechunk",
     "lonboard[geotiff]>=0.16.0",
-    "marimo>=0.23.16",
+    "marimo==0.23.16",
     "matplotlib==3.11.1",
     "numpy==2.5.1",
     "obstore>=0.9.2",

@@ -294,6 +294,157 @@ marimo edit xsql-hrrr-heat-domes.py`, or `--sandbox`), with three additions:
 
 The original `xsql-hrrr-heat-hex.py` is unchanged and stays on 0.3.x.
 
+`xsql-cdl-crops.py` (2026-08-20, FLOWN ONCE, reworked same day, camera/HUD verified headless in a driven Chrome) is the USDA Cropland
+Data Layer as a DUCKDB-ONLY, SQL-cells-first notebook on the 0.4.0rc1 backend (run it
+from the rc venv like heat domes: `uv run --project xarray-sql-multi-backend-test
+marimo edit xsql-cdl-crops.py`, or `--sandbox`). Data: chill/usda-cropland-data-layer
+on source.coop, one icechunk repo, `crop_type (year, y, x) uint8`, 2008-2025 at 30 m
+(105,432 x 160,171, EPSG:5070) plus a 10m group (2024-2025, unused so far), with a
+block-MAJORITY multiscale pyramid (`30m/2x` .. `30m/256x`) and the official class
+names/colors embedded in the attrs. Full record in `docs/cdl-crops-notes.md`.
+Things to know:
+
+- **No H3, no DataFusion, and that is deliberate** (Stephen, 2026-08-20: "we dont
+  necessarily need to use h3"): the cube is categorical on a fixed Albers grid, so
+  there is no mean-fold; every analytic is COUNT/GROUP BY/self-join, and
+  `xql.register(con, f"cdl_{{k}}", ds, chunks=...)` puts each pyramid level on the
+  notebook's own DuckDB connection where marimo SQL cells (`mo.sql(..., engine=con)`)
+  query it as a table. The gold-star fold rule is about the mean-fold notebooks and
+  does not bind here.
+- **The pyramid replaces the whole zoom problem**: time depth is 1 (chunks
+  (1, 512, 512), shards (1, 8192, 8192)), so unlike HRRR a window never pays a deep
+  chunk. Measured from home: one-year CONUS histogram at 64x 0.4 s; the FULL 18-year
+  CONUS scan at 64x 1.3 s; corn/soy rotation self-join CONUS 0.6 s; native 30 m
+  20x20 km window x 3 years 0.9 s (pushdown against the 304 GB array); and every
+  rung of the map ladder (k=4/2/1 windows sized to a viewport) serves in 0.6 s.
+- **The map serve is one SQL query and one public lonboard call**: pixel
+  squares via `ST_MakeEnvelope` in 5070, `ST_Transform` to 4326, and the fill
+  color typed IN SQL as `[r, g, b]::UTINYINT[3]` (arrow FixedSizeList, so
+  `get_fill_color` is the table's own column). `PolygonLayer.from_duckdb` does
+  all conversion in its `__init__`; the serve keeps only its table, rechunked
+  to ONE CHUNK (multi-chunk swaps striped whole bands), and assigns it onto
+  the ONE persistent layer (built in the map cell with the opening CONUS view)
+  under `hold_sync`. No private lonboard imports (an earlier iteration used
+  four; removed at Stephen's push). Level pick is a floor rule (finest k with
+  pixel >= PX_PER screen px); the row budget uses the box's cell count as the
+  UPPER BOUND so deep zooms never pay a count query, and a real `count(*)`
+  only when the box could exceed it; a HELD-VIEW check (camera inside the
+  served box, same level/year/filter, MARGIN 0.35) skips serves entirely.
+  Serves memoised; map/wiring split per the repo rule; VIEW_W/H still the
+  guess. Any rung serves in 0.5-1.7 s including native 30 m.
+- **NEVER a second deck layer here**: under marimo every lonboard 0.16 layer
+  gets id `undefined` (its JS reads `model_id`, which marimo's bridge lacks).
+  Two STATIC layers survive it, but two layers where one UPDATES die: deck's
+  differ cannot tell the colliding ids apart and the tile layer's children
+  fail init on every toggle route (visible trait is unwatched, a removed
+  layer never remounts, opacity and construction-mounting fail the same way).
+  A 3-line bundle patch fixes it and was REVERTED at Stephen's direction;
+  place labels come from the BASEMAP instead (CartoStyle.Positron WITH
+  labels, under the pixels). Deforest's dark_only_labels overlay is equally
+  dead today (verified headless; unnoticed on a dark basemap). Full saga in
+  `docs/cdl-crops-notes.md`. Console errors are NOT evidence a layer is dead
+  and their absence is not evidence it is alive; screenshots are the ground
+  truth (both misreadings happened, same day).
+- **The wiring has NO THREADS AND NO TIMERS** (third rework the same day): a
+  threading.Timer serve painted under `marimo run` + playwright but not under
+  Stephen's `marimo edit` (camera reached the kernel; the timer-thread paint
+  was lost). Deforest's machinery is copied: async settle-debounce (SETTLE
+  0.35 s) on the kernel's loop, busy/pending coalescing, `run_in_executor` for
+  the blocking DuckDB work, `_spawn` with the run_coroutine_threadsafe
+  fallback, every trait assignment on the loop thread.
+- **The serve path runs on its OWN DuckDB connection (`mcon`)** with its own
+  registrations and classes copy: marimo SQL cells hold streaming Arrow
+  results open on `con`, and a serve count query interleaving on the same
+  connection raises "Can't 'FetchRaw' from ArrowQueryResult" (seen as the
+  first-load serve error). `con_lock` serializes serve vs analyze on mcon.
+- **SQL cells return native duckdb relations** (`App(sql_output="native")`);
+  polars was added and then REMOVED at Stephen's question (2026-08-20): the
+  dataframes only feed display and one altair chart, pyarrow is already a
+  dependency and zero-copy from duckdb, so the chart consumes
+  `rel.arrow().read_all()` and no dataframe library ships.
+- **Controls, status and analysis are ONE anywidget UNDER the map**, in the
+  deforest Controls/Status idiom (12px ui-sans-serif flex row, transparent
+  bordered button, color:inherit, 12.5px ui-monospace status line). Two layouts
+  were built and rejected first (2026-08-20): marimo-native slider/switch above
+  the map (drew "2,019" with a comma; a native range input fixes that), then a
+  dark floating panel ON the map (Stephen: "buttons and analysis go on the
+  white space below where the map is, like the other notebooks"). The status
+  line reports every serve (`{k}x · {m} px · {cells} · {ms} · year`) and any
+  exception from the observer path (comm-handler exceptions are silent; the
+  first flight's "no refold on zoom" gave no signal at all). Proven trait
+  types: `ctl` Unicode browser -> kernel (JSON with `act`: "set" | "analyze";
+  wiring reads `hud.widget.ctl`, marimo re-running the wiring IS the
+  year/toggle refold), `status`/`panel` Unicode kernel -> browser. "analyze
+  what's in view" (the deforest button) fills the analysis line with the
+  top-10 classes in the camera box (chip, name, M acres, share) at the serve's
+  level WITHOUT re-serving the map, plus an 18-YEAR TIMELAPSE of the box as an
+  inline SVG (top 6, class colors, direct labels; one GROUP BY year query,
+  0.8 s at CONUS/256x, its ms shown), with a `× clear`. A PHOTON SEARCH FIELD
+  (flood's client moved into the strip): Enter geocodes camera-biased on a
+  thread, the first hit flies via `deck.fly_to` (assigning `view_state`
+  kernel-side is IGNORED), the extent picks the zoom, and the refold follows;
+  measured: "fresno county california" -> native 30 m fields in ~3 s. In
+  browser fullscreen the strip re-parents into the fullscreen element (via
+  `shadowRoot.fullscreenElement` descent; `document.fullscreenElement`
+  reports the shadow HOST) as a docked bottom bar with its own white
+  backdrop. Commits on `change` + 250 ms debounce, never `input`. Year has
+  ◀ ▶ step arrows; crops-only STARTS OFF; lonboard's draw-box toolbar is
+  hidden by deforest's aria-label walk.
+- **The camera round trip is VERIFIED headless via playwright** (marimo `run`
+  --headless + chromium driving wheel/drag on the canvas, reading the HUD status
+  through the shadow DOM): load serves 128x · 72k cells · 0.7 s; wheel-zoom fires
+  "camera…" then 16x · 405k cells · 1.6 s; a HUD year commit refolds in 0.5 s.
+  Two harness gotchas: the canvas sits below the fold in a 950px viewport, so
+  scrollIntoView BEFORE mouse.wheel or the events hit nothing (the first zoom
+  test passed vacuously), and the playwright pip version must match the cached
+  chromium revision or `playwright install chromium-headless-shell` fetches one.
+- **Registered block layout differs by level**: whole-plane per year for k>=32
+  (scanned whole anyway), 2048^2 for k<=16 so x/y predicates prune fragments. A
+  2048 block is ~4.2M expanded rows; do not register fine levels whole-plane.
+- **DuckDB cursors DO NOT see `xql.register`'s registrations** (per-connection
+  replacement views), so everything runs on the ONE connection serialized by
+  `con_lock`; the debounce timer thread serves through it.
+- **Analytics cells run at 64x (`ANALYSIS_K`) and are block-majority APPROXIMATE**:
+  dominant classes overcount (corn reads ~119M acres against ~90M planted).
+  Trends/transitions at a fixed level are honest; absolute acreage wants native
+  over a window. Rotation matrix is a duckdb `PIVOT` over a `(y, x)` self-join,
+  two year dropdowns; area time series is one 18-year scan + altair lines.
+- **Palette**: official NASS colors kept in `classes.hex_official`, but Cotton
+  #FF2525 beside Soybeans #256F00 is a protan-fail pair, so the DEFAULT `hex`
+  remaps red-dominant classes (r>=170, g<=100, b<=110) onto a blue/purple/cyan
+  cycle. `0` = Background is also the fill value; `81` Clouds/No Data; both always
+  dropped. Crops-only switch additionally drops the landcover classes (matched by
+  name: Developed*, forest, water, wetlands, grassland, etc.).
+- **lonboard 0.16 basemap API**: `Map(basemap=MaplibreBasemap(style=CartoStyle...))` (CartoStyle.Positron WITH labels since 2026-08-20 evening, Stephen's call: basemap labels replace the impossible overlay);
+  `basemap_style=` is deprecated and `CartoBasemap` enum values are rejected by the
+  `basemap` trait; `height=`, not `_height=`. The from_duckdb "No CRS" UserWarning
+  is benign (coords already 4326).
+- **The fold box is a DENSIFIED boundary transform, clamped to the array's
+  Albers bbox**, never a 4-corner min/max: an EPSG:5070 parallel bows with
+  its LOWEST y at the central meridian (-96, over Texas), so corner-only
+  min clipped south TX / the Gulf coast / Florida in a smooth arc at
+  CONUS-wide zooms (Stephen: "doesnt the whole map load on open"; zooming
+  into LA/TX "fixed" it because the corners came close). 9 samples per edge,
+  then clamp, because corners at wide zoom land outside the projection's
+  validity. Status wording is "pixels · drawn", not "cells": no H3 here.
+- **2026-08-20 latest round (all playwright-verified)**: HOME fits ALL of
+  CONUS (zoom 3.6); "crops only" starts DESELECTED (the map opens as full
+  land cover, 256x ~137k px). The timelapse SVG builder is NESTED inside
+  _analyze_html: a cell-level underscore def referenced from a sibling
+  closure hits marimo's mangled name (NameError `_cell_*`, the conus-counties
+  lesson again). `uv add` bumped marimo 0.23.16 -> 0.24.0 as a side effect
+  (0.24 disposes task-created widget models: black map, healthy kernel);
+  marimo is PINNED ==0.23.16 in the rc project. uv installs by HARDLINK from
+  its cache, so editing a venv file in place edits the cached wheel and a
+  reinstall re-links the edit.
+- Unbuilt, agreed as later: county stats (duckdb spatial against the Overture
+  counties reader), the 10m-vs-30m 2024/2025 comparison, cropland->developed
+  conversion, an 18-year persistence map. A /dataviz pass on the altair
+  chart's series colors was started 2026-08-20 and DROPPED at Stephen's
+  direction (the NASS colors fail the validator: Spring Wheat vs Fallow
+  ΔE 3.9; a validated crop-evocative 8-hue order exists in the session log
+  if ever wanted).
+
 `xsql-mapterhorn-explorer.py` (EXPERIMENTAL, open defects below) draws Mapterhorn terrain
 worldwide as extruded H3 columns: the DEM half of the parked
 `archive/xsql-duckdb-terrain-h3.py` standing alone, on the canopy notebook's chassis
