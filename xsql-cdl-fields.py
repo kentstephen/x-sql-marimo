@@ -235,6 +235,11 @@ def _():
     # zoom-ins are cache hits (the raster read is area-proportional, ~1 s per
     # 0.04 deg² at 40 m from home)
     FTW_TILE_ZMAX = 13            # the per-state PMTiles' top zoom (outlines)
+    SWAP_HIDE_S = 0.15            # the bitmap judder: deck applies new `bounds`
+    # at once but loads a new `image` URL asynchronously, so the OLD picture is
+    # drawn stretched into the NEW box until the PNG decodes. Hiding the layer
+    # for this long around the swap trades that stretch for a brief blank.
+    # 0 turns it off (a guess until Stephen judges it on his screen).
     MARGIN = 0.35                 # fold box slack beyond the viewport
     HTTPFS_CACHE_DIR = "x-sql-marimo/duckdb-httpfs-cache"   # under the OS tmp dir:
     # DuckDB's cache_httpfs community extension writes every byte range it
@@ -280,6 +285,7 @@ def _():
         PREFIX,
         PX_PER,
         ROW_BUDGET,
+        SWAP_HIDE_S,
         VIEW_H,
         VIEW_W,
         YEAR0,
@@ -1261,6 +1267,7 @@ def _(
     NONCROP_CODES,
     PX_PER,
     ROW_BUDGET,
+    SWAP_HIDE_S,
     VIEW_W,
     YEAR0,
     FTW_FETCH_DEG2,
@@ -1652,9 +1659,18 @@ def _(
                             hud.widget.legend = json.dumps(_legend)
                         except Exception:
                             pass
+                        if SWAP_HIDE_S > 0:
+                            # hide across the swap (see SWAP_HIDE_S): the old
+                            # picture would otherwise sit stretched in the new
+                            # box until the new PNG decodes
+                            pixels.opacity = 0.0
+                            await asyncio.sleep(0)
                         with pixels.hold_sync():
                             pixels.image = url
                             pixels.bounds = bounds
+                        if SWAP_HIDE_S > 0:
+                            await asyncio.sleep(SWAP_HIDE_S)
+                            pixels.opacity = 1.0
                         HOLD["last_line"] = _line
                         _say(_line)
                         painted = True
