@@ -1591,7 +1591,10 @@ def _(
                 legend = [
                     {"code": code, "name": nm, "hex": hx,
                      "pct": round(100 * _cnt.get(code, 0) / _tot, 1),
-                     "note": f"{_cnt.get(code, 0) * _pxa / 1e3:,.1f}k ac"}
+                     # with fields ON the clip IS the P(field) grid, so the
+                     # orange class cannot appear: say so next to it
+                     "note": ("turn fields off to see" if fields and code == 2
+                              else f"{_cnt.get(code, 0) * _pxa / 1e3:,.1f}k ac")}
                     for code, (nm, hx, _c3) in DIS.items()
                 ]
                 HOLD["dis_split"] = {code: 100 * _cnt.get(code, 0) / _tot for code in DIS}
