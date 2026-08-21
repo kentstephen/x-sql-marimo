@@ -634,6 +634,18 @@ duckdb as a backend"). Full recon and numbers in `docs/ftw-cdl-notes.md`.
   only missing chunks. Driven: hits 0.5 s, a one-chunk miss ~2 s, fields on
   cold 4.6 s. Polygon benchmark on the same pipeline (scratch
   `_poly_bench.py`): 22-40 MB per frame at the Delta zoom; unfinished.
+- **END OF 2026-08-20: UNDECIDED, three states.** `main` = the bitmap serve
+  (flown; judder fixed by `SWAP_HIDE_S`). Branch `fields-tiles` = a working
+  RasterLayer tile serve (batched SQL per tile burst, whole view per batch,
+  cached, layer remove-then-add on state change) that is NOT mergeable: the
+  lonboard tile mesh is lit by deck's default lighting (~0.69x darker,
+  `opacity` ignored), fix is a bundle patch or a bespoke deck widget.
+  `6b816ac` = the polygon serve, the SQL-shaped version (payload 12-40 MB a
+  move at the Delta zoom). Stephen's read: the crops notebook is the clean
+  DuckDB demo; this one compromises DuckDB to chase the map, and the SQL
+  cells under the map duplicate the map's pipeline. Details and the
+  "register -> SQL joins -> map as output" reshape in `docs/ftw-cdl-notes.md`.
+  Do not pick a state for him.
 - **TODO, Stephen's (not now): picking.** Click a pixel or field to see who says
   what ("who says who's growing what"). He expects it to need the lonboard
   bundle patch (two-layer ids) and does not want that; the HRRR counties film's

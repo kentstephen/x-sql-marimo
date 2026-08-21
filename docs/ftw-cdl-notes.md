@@ -336,3 +336,40 @@ by a PolygonLayer table): at the Delta HOME zoom 12 the 420k-row budget picks
 thread hung the serve (hex WKB in SQL instead); not finished, killed because
 it competed with Stephen's flight. The bitmap's payload is 0.1-0.5 MB at the
 same views.
+
+## End of 2026-08-20: three states, undecided
+
+Stephen, late: "it looks great, but I don't understand why we had to sacrifice
+all the SQL"; the crops notebook is the clean DuckDB demo (fast, simple), this
+one compromises DuckDB to chase the map; "I don't want the way it is now, and I
+don't want to go back to the way it was before." Nothing decided. The states:
+
+1. **Polygon serve** (`6b816ac`): one SQL query -> `from_duckdb` -> PolygonLayer,
+   the FTW clip a `JOIN lk USING (y, x)`, outlines as `UNION ALL` rows. The
+   SQL-shaped version. Cost: payload, 12-40 MB per move at the Delta zoom
+   (measured today on the new data path: fields frame 22 MB, 3.3 s kernel).
+   Levers in SQL if revisited: a coarser rung per zoom, run-length merging of
+   same-class pixels along rows (rectangles, not squares).
+2. **Bitmap serve** (`main`, `7410439`): one PNG per view; the FTW clip and
+   disagreement decided in numpy per output pixel; mask chunk cache;
+   `SWAP_HIDE_S` for the judder (deck loads `image` async, applies `bounds` at
+   once). Flown: judder gone at 0.15; pans 0.5 s warm / ~2 s on a chunk miss.
+   The SQL for clip/disagreement CAN come back in front of this renderer at
+   ~0.3-1 s per fresh view (the ST_Transform pass); numpy was an
+   over-optimisation, not a requirement.
+3. **Tile serve** (branch `fields-tiles`): lonboard RasterLayer, deck asks
+   z/x/y, ONE query per batch (per-tile SQL has ~0.2 s fixed overhead on the
+   xql table, measured: 24 tiles 5.7 s one by one vs 0.19 s as one query),
+   whole view per batch (deck caps in-flight requests at 6), tiles cached,
+   remove-then-add the layer on a state change. Everything works EXCEPT the
+   colours: lonboard renders each tile through a mesh sub-layer whose
+   fragment shader calls `lighting_getLightColor`, ~0.69x on every channel,
+   `opacity` ignored; the TMS-less path (`getTileData` returns null without
+   tileMatrices) is dead code. Fix = a one-line bundle patch (material off),
+   or a bespoke deck.gl anywidget. The deforest notebook's raster is darkened
+   the same way (unnoticed under a 0.7 ramp).
+
+The SQL cells under the map redo the joins on the last box; with the map's
+own pipeline that is two pipelines for one idea. The shape that would read
+as a DuckDB notebook: register -> the joins as SQL cells -> the map as an
+output of those tables. Not built.
