@@ -267,8 +267,8 @@ def _():
         FTW_BOX_DEG2,
         FTW_BUCKET,
         FTW_FETCH_DEG2,
-        FTW_PAD,
         FTW_LEVELS,
+        FTW_PAD,
         FTW_RES,
         FTW_TILE_ZMAX,
         FTW_VEC,
@@ -277,9 +277,9 @@ def _():
         FTW_ZARR,
         HOLD,
         HOME,
+        HTTPFS_CACHE_DIR,
         LEVELS,
         LEVELS10,
-        HTTPFS_CACHE_DIR,
         MARGIN,
         OVERSAMPLE,
         PREFIX,
@@ -495,6 +495,7 @@ def _(
 
 @app.cell
 def _(
+    ACRES_PER_KM2,
     FTW_BUCKET,
     FTW_RES,
     FTW_VEC,
@@ -540,25 +541,31 @@ def _(
         th = n * (lon - lon0)
         return rho * np.sin(th), rho0 - rho * np.cos(th)
 
-    def render_view(px_x, px_y, rgb, x0, y0, x1, y1, pix_m, W, S, E, N, rings=None,
-                    line=(40, 40, 40, 210), scale=OVERSAMPLE):
-        """ONE PNG of the view: the drawn pixels (Albers centres + colours) are
-        dropped into a dense grid over the Albers box, every output pixel of
-        the lon/lat view box is forward-transformed into that grid (nearest),
-        then the FTW rings (already lon/lat) are drawn on top. Returns a data
-        URL and the bounds. Transparent where nothing is drawn."""
+    def render_view(px_x, px_y, codes, lut, x0, y0, x1, y1, pix_m, W, S, E, N,
+                    rings=None, ftw=None, clip=False, dis=False, noncrop=None,
+                    dis_lut=None, sel=None, line=(40, 40, 40, 210), scale=OVERSAMPLE):
+        """ONE PNG of the view. The drawn pixels (Albers centres + class codes)
+        go into a dense grid over the Albers box; every output pixel of the
+        lon/lat view box is forward-transformed into that grid (nearest) and
+        takes its code. The FTW side is decided HERE, per output pixel, from
+        its own lon/lat: `ftw` = (mask, ix0, iy0, res), a dense boolean of the
+        P(field) >= 0.5 grid over a box that contains the view; `clip` drops
+        pixels outside a field cell; `dis` repaints by CDL crop/non-crop x
+        FTW field (classes 1/2/3, `dis_lut`; non-crop and no field is not
+        drawn). No SQL lookups, no per-pixel transforms in DuckDB (2026-08-20,
+        late: the old ST_Transform-and-join passes were the intermittent
+        2-4 s on a pan). `sel` (set of codes) filters the paint AFTER the
+        counts. Returns (data URL, bounds, bytes, counts by code-or-class over
+        the drawn output pixels, drawn count, acres per output pixel)."""
         w = int(VIEW_W * (1 + MARGIN) * scale)
         h = int(VIEW_H * (1 + MARGIN) * scale)
-        # dense Albers grid of the level's pixels
         gw = int(round((x1 - x0) / pix_m)) + 1
         gh = int(round((y1 - y0) / pix_m)) + 1
-        grid = np.zeros((gh, gw, 4), dtype=np.uint8)
+        grid = np.zeros((gh, gw), dtype=np.uint8)     # 0 = nothing drawn
         if len(px_x):
             ix = np.clip(((px_x - x0) / pix_m).astype(np.int64), 0, gw - 1)
             iy = np.clip(((y1 - px_y) / pix_m).astype(np.int64), 0, gh - 1)
-            grid[iy, ix, :3] = rgb
-            grid[iy, ix, 3] = 255
-        # output lon/lat lattice -> Albers -> grid index
+            grid[iy, ix] = codes
         lons = W + (np.arange(w) + 0.5) * (E - W) / w
         lats = N - (np.arange(h) + 0.5) * (N - S) / h
         LON, LAT = np.meshgrid(lons, lats)
@@ -566,8 +573,37 @@ def _(
         jx = ((X - x0) / pix_m).astype(np.int64)
         jy = ((y1 - Y) / pix_m).astype(np.int64)
         ok = (jx >= 0) & (jx < gw) & (jy >= 0) & (jy < gh)
+        code = np.zeros((h, w), dtype=np.uint8)
+        code[ok] = grid[jy[ok], jx[ok]]
+        if ftw is not None:
+            mask, fx0, fy0, res = ftw
+            fx = np.floor((LON + 180.0) / res).astype(np.int64) - fx0
+            fy = np.floor((FTW_Y0 - LAT) / res).astype(np.int64) - fy0
+            inb = (fx >= 0) & (fx < mask.shape[1]) & (fy >= 0) & (fy < mask.shape[0])
+            field = np.zeros((h, w), dtype=bool)
+            field[inb] = mask[fy[inb], fx[inb]]
+            if clip:
+                code[~field] = 0
+        if dis:
+            crop = (code > 0) & ~noncrop[code]
+            cls = np.zeros((h, w), dtype=np.uint8)
+            cls[crop & field] = 1
+            cls[crop & ~field] = 2
+            cls[(code > 0) & noncrop[code] & field] = 3
+            code = cls
+            pal = dis_lut
+        else:
+            pal = lut
+        drawn = code > 0
+        counts = np.bincount(code[drawn], minlength=256)
+        if sel:
+            keep = np.zeros(256, dtype=bool)
+            keep[list(sel)] = True
+            code = np.where(keep[code], code, 0)
+            drawn = code > 0
         out = np.zeros((h, w, 4), dtype=np.uint8)
-        out[ok] = grid[jy[ok], jx[ok]]
+        out[..., :3] = pal[code]
+        out[..., 3] = np.where(drawn, 255, 0)
         img = Image.fromarray(out, "RGBA")
         if rings:
             d = ImageDraw.Draw(img)
@@ -581,7 +617,11 @@ def _(
         buf = io.BytesIO()
         img.save(buf, format="PNG", optimize=False, compress_level=4)
         url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
-        return url, [W, S, E, N], len(buf.getvalue())
+        # ground area of one output pixel, acres (for the disagreement legend)
+        lat_mid = math.radians((N + S) / 2)
+        px_km2 = ((E - W) / w * 111.32 * math.cos(lat_mid)) * ((N - S) / h * 110.574)
+        return (url, [W, S, E, N], len(buf.getvalue()), counts, int(drawn.sum()),
+                px_km2 * ACRES_PER_KM2)
 
     def bbox4326(vs):
         span = 360.0 / (512 * 2 ** vs["zoom"])
@@ -643,8 +683,14 @@ def _(
             res, f,
         )
 
-    return (albers_xy, bbox4326, ftw_files, ftw_grid_sql, ftw_states_in,
-            render_view, to5070)
+    return (
+        bbox4326,
+        ftw_files,
+        ftw_grid_sql,
+        ftw_states_in,
+        render_view,
+        to5070,
+    )
 
 
 @app.cell
@@ -1221,16 +1267,20 @@ def _(
     HOLD.pop("k", None)
     _rows = mcon.sql(
         f"""
-        SELECT t.x, t.y, c.r, c.g, c.b
-        FROM cdl10_4 t JOIN classes c ON c.code = t.crop_type
+        SELECT t.x, t.y, t.crop_type
+        FROM cdl10_4 t
         WHERE t.year = {YEAR0} AND t.crop_type NOT IN (0, 81)
           AND t.x BETWEEN {_x0} AND {_x1} AND t.y BETWEEN {_y0} AND {_y1}
         """
     ).fetchnumpy()
-    _rgb = np.stack([_rows["r"], _rows["g"], _rows["b"]], axis=1).astype(np.uint8)
-    _url, _bounds, _nbytes = render_view(
+    _LUT = np.zeros((256, 3), dtype=np.uint8)
+    for _code, _r, _g, _b in mcon.sql("SELECT code, r, g, b FROM classes").fetchall():
+        _LUT[_code] = (_r, _g, _b)
+    HOLD["lut"] = _LUT
+    _url, _bounds, _nbytes, _cnt, _nd, _pxa = render_view(
         np.asarray(_rows["x"], dtype=np.float64), np.asarray(_rows["y"], dtype=np.float64),
-        _rgb, _x0, _y0, _x1, _y1, 40.0, _W, _S, _E, _N,
+        np.asarray(_rows["crop_type"], dtype=np.uint8), _LUT,
+        _x0, _y0, _x1, _y1, 40.0, _W, _S, _E, _N,
     )
     pixels = BitmapLayer(image=_url, bounds=_bounds, opacity=1.0)
 
@@ -1258,6 +1308,10 @@ def _(
     DIS,
     FIELDS0,
     FTW_BOX_DEG2,
+    FTW_FETCH_DEG2,
+    FTW_PAD,
+    FTW_RES,
+    FTW_TILE_ZMAX,
     FTW_Y0,
     FTW_YEARS,
     HOLD: dict,
@@ -1270,9 +1324,6 @@ def _(
     SWAP_HIDE_S,
     VIEW_W,
     YEAR0,
-    FTW_FETCH_DEG2,
-    FTW_PAD,
-    FTW_TILE_ZMAX,
     asyncio,
     bbox4326,
     con_lock,
@@ -1285,8 +1336,11 @@ def _(
     math,
     mcon,
     np,
+    os,
     pixels,
     render_view,
+    tempfile,
+    threading,
     time,
     to5070,
     urllib,
@@ -1479,26 +1533,130 @@ def _(
     for _code, (_nm, _hx, _c3) in DIS.items():
         _DIS_LUT[_code] = _c3
 
-    def _paint(k, x0, y0, x1, y1, W, S, E, N, where, dis, rings=None):
-        """One PNG from `cur` (x, y, crop_type, cls): colours by class LUT or
-        by disagreement class; FTW outlines (tile polylines) drawn on top."""
-        rows = mcon.sql(
-            f"SELECT x, y, {'cls' if dis else 'crop_type'} AS c FROM cur t WHERE TRUE{where}"
-        ).fetchnumpy()
-        codes = np.asarray(rows["c"])
-        rgb = (_DIS_LUT if dis else _LUT)[codes]
-        url, bounds, nbytes = render_view(
+    _NONCROP = np.zeros(256, dtype=bool)
+    _NONCROP[list(NONCROP_CODES)] = True
+    _META = HOLD.get("cls_meta")
+    if _META is None:
+        _META = {int(c): (n, h) for c, n, h in
+                 mcon.sql("SELECT code, name, hex FROM classes").fetchall()}
+        HOLD["cls_meta"] = _META
+
+    _CH = 512   # the FTW pyramid's inner chunk (px): the unit of the mask cache
+    _MASK_DIR = os.path.join(tempfile.gettempdir(), "x-sql-marimo", "ftw-mask")
+
+    def _chunk_key(f, cx, cy):
+        return (_fyear, f, cx, cy)
+
+    def _chunk_path(f, cx, cy):
+        return os.path.join(_MASK_DIR, f"{f}x", str(_fyear), f"{cx}_{cy}.npy")
+
+    def _ftw_mask(px_m, W, S, E, N):
+        """Dense boolean of the P(field) >= 0.5 grid over the view box,
+        assembled from CHUNK-ALIGNED pieces (the Zarr's own 512-px inner
+        chunks, ~20 km at 40 m) cached in memory and on disk (packbits, 32 KB
+        each), so a pan reads only the chunks it has not seen, in ONE query
+        over their bounding box. Returns (mask, ix0, iy0, res, factor)."""
+        f = 4 if px_m < 120 else 16
+        res = FTW_RES * f
+        ix0 = int(math.floor((W + 180.0) / res))
+        ix1 = int(math.floor((E + 180.0) / res))
+        iy0 = int(math.floor((FTW_Y0 - N) / res))
+        iy1 = int(math.floor((FTW_Y0 - S) / res))
+        cx0, cx1, cy0, cy1 = ix0 // _CH, ix1 // _CH, iy0 // _CH, iy1 // _CH
+        cache = HOLD.setdefault("fchunks", {})
+        missing = []
+        for cx in range(cx0, cx1 + 1):
+            for cy in range(cy0, cy1 + 1):
+                if _chunk_key(f, cx, cy) in cache:
+                    continue
+                fp = _chunk_path(f, cx, cy)
+                if os.path.exists(fp):
+                    cache[_chunk_key(f, cx, cy)] = np.unpackbits(
+                        np.load(fp)).reshape(_CH, _CH).astype(bool)
+                else:
+                    missing.append((cx, cy))
+        if missing:
+            mx0, mx1 = min(c[0] for c in missing), max(c[0] for c in missing)
+            my0, my1 = min(c[1] for c in missing), max(c[1] for c in missing)
+            lon0, lon1 = mx0 * _CH * res - 180.0, (mx1 + 1) * _CH * res - 180.0
+            lat1, lat0 = FTW_Y0 - my0 * _CH * res, FTW_Y0 - (my1 + 1) * _CH * res
+            g = mcon.sql(
+                f"""SELECT floor((x + 180) / {res})::BIGINT AS ix,
+                           floor(({FTW_Y0} - y) / {res})::BIGINT AS iy
+                    FROM ftw_{f}
+                    WHERE time = TIMESTAMP '{_fyear}-01-01' AND band = 'field'
+                      AND variables >= 0.5
+                      AND x BETWEEN {lon0} AND {lon1} AND y BETWEEN {lat0} AND {lat1}"""
+            ).fetchnumpy()
+            big = np.zeros(((my1 - my0 + 1) * _CH, (mx1 - mx0 + 1) * _CH), dtype=bool)
+            if len(g["ix"]):
+                gx = np.asarray(g["ix"], dtype=np.int64) - mx0 * _CH
+                gy = np.asarray(g["iy"], dtype=np.int64) - my0 * _CH
+                okm = (gx >= 0) & (gx < big.shape[1]) & (gy >= 0) & (gy < big.shape[0])
+                big[gy[okm], gx[okm]] = True
+            for cx in range(mx0, mx1 + 1):
+                for cy in range(my0, my1 + 1):
+                    piece = big[(cy - my0) * _CH:(cy - my0 + 1) * _CH,
+                                (cx - mx0) * _CH:(cx - mx0 + 1) * _CH].copy()
+                    cache[_chunk_key(f, cx, cy)] = piece
+                    fp = _chunk_path(f, cx, cy)
+                    try:
+                        os.makedirs(os.path.dirname(fp), exist_ok=True)
+                        tmp = f"{fp}.{threading.get_ident()}.tmp"
+                        np.save(tmp, np.packbits(piece))
+                        os.replace(tmp + ".npy" if not tmp.endswith(".npy") else tmp, fp)
+                    except Exception:
+                        pass
+            if len(cache) > 600:
+                for _k in list(cache)[:100]:
+                    cache.pop(_k, None)
+        mask = np.zeros(((cy1 - cy0 + 1) * _CH, (cx1 - cx0 + 1) * _CH), dtype=bool)
+        for cx in range(cx0, cx1 + 1):
+            for cy in range(cy0, cy1 + 1):
+                mask[(cy - cy0) * _CH:(cy - cy0 + 1) * _CH,
+                     (cx - cx0) * _CH:(cx - cx0 + 1) * _CH] = cache[_chunk_key(f, cx, cy)]
+        return mask, cx0 * _CH, cy0 * _CH, res, f
+
+    def _paint(k, x0, y0, x1, y1, W, S, E, N, sel, fields, dis, rings=None, ftw=None):
+        """One PNG from `cur` (x, y, crop_type): the FTW clip / disagreement
+        decided per output pixel in render_view from the dense grid mask.
+        Returns (url, bounds, legend, drawn count, bytes)."""
+        rows = mcon.sql("SELECT x, y, crop_type FROM cur").fetchnumpy()
+        url, bounds, nbytes, counts, ndrawn, pxa = render_view(
             np.asarray(rows["x"], dtype=np.float64), np.asarray(rows["y"], dtype=np.float64),
-            rgb, x0, y0, x1, y1, float(_B * k), W, S, E, N, rings=rings,
+            np.asarray(rows["crop_type"], dtype=np.uint8), _LUT,
+            x0, y0, x1, y1, float(_B * k), W, S, E, N, rings=rings,
+            ftw=(ftw[:4] if ftw is not None else None), clip=fields, dis=dis,
+            noncrop=_NONCROP, dis_lut=_DIS_LUT, sel=(set(sel) if sel else None),
         )
-        return url, bounds, len(codes), nbytes
+        tot = int(counts.sum()) or 1
+        if not dis:
+            order = np.argsort(-counts)
+            legend = [{"code": int(c), "name": _META[int(c)][0], "hex": _META[int(c)][1],
+                       "pct": round(100 * counts[c] / tot, 1)}
+                      for c in order[:14] if counts[c] > 0 and int(c) in _META]
+        else:
+            legend = [
+                {"code": code, "name": nm, "hex": hx,
+                 "pct": round(100 * counts[code] / tot, 1),
+                 # with fields ON the clip IS the P(field) grid, so the
+                 # orange class cannot appear: say so next to it
+                 "note": ("turn fields off to see" if fields and code == 2
+                          else f"{counts[code] * pxa / 1e3:,.1f}k ac")}
+                for code, (nm, hx, _c3) in DIS.items()
+            ]
+            HOLD["dis_split"] = {code: 100 * counts[code] / tot for code in DIS}
+        return url, bounds, legend, ndrawn, nbytes
 
     def _ftw_warm(W, S, E, N, k):
-        """True when the P(field) grid a FTW frame needs is already cached."""
+        """True when every mask chunk a FTW frame needs is already in memory."""
         f = 4 if _B * k < 120 else 16
-        gc = HOLD.get("gcache", {})
-        return any((_fy, _f) == (_fyear, f) and _w <= W and _s <= S and _e >= E and _n >= N
-                   for (_fy, _f, _w, _s, _e, _n) in gc)
+        res = FTW_RES * f
+        cache = HOLD.get("fchunks", {})
+        cx0, cx1 = int(math.floor((W + 180.0) / res)) // _CH, int(math.floor((E + 180.0) / res)) // _CH
+        cy0, cy1 = int(math.floor((FTW_Y0 - N) / res)) // _CH, int(math.floor((FTW_Y0 - S) / res)) // _CH
+        return all(_chunk_key(f, cx, cy) in cache
+                   for cx in range(cx0, cx1 + 1) for cy in range(cy0, cy1 + 1))
 
     def _stages(vs):
         """Blocking generator: one or two (url, bounds, legend, line) frames
@@ -1554,7 +1712,7 @@ def _(
                          "pct": round(100 * r[3] / _tot, 1)} for r in _lg[:14]]
 
             def _line(npx, nbytes, stage_note):
-                return (f"{k}x · {_B * k} m pixels · {npx:,} px · {nbytes / 1e3:,.0f} KB png"
+                return (f"{k}x · {_B * k} m pixels · {npx:,} px drawn · {nbytes / 1e3:,.0f} KB png"
                         f" · year {_year}{stage_note} · {int((time.time() - _t0) * 1000)} ms")
 
             # a cold FTW miss keeps the previous picture up and says so; the
@@ -1562,55 +1720,18 @@ def _(
             # then snapped to the clipped one read as wrong: Stephen)
             if (fields or dis) and not _ftw_warm(W, S, E, N, k):
                 _say((HOLD.get("last_line") or "") + " · fetching FTW…")
-            _join = ""
-            if fields:
-                _lkt = _ftw_lookup(W, S, E, N, k)
-                _join = f"JOIN {_lkt} l USING (y, x)"
-            if not dis:
-                mcon.sql(f"CREATE OR REPLACE TABLE cur AS {_crop_sql(_join)}")
-                legend = _crop_legend()
-            else:
-                _gt, _res, _f, _gbox = _ftw_grid(_B * k, W, S, E, N)
-                mcon.sql(
-                    f"""
-                    CREATE OR REPLACE TABLE cur AS
-                    WITH g AS (SELECT ix, iy FROM {_gt}),
-                    p AS (
-                        SELECT t.x, t.y, t.crop_type, c.noncrop,
-                               ST_Transform(ST_Point(t.x, t.y), 'EPSG:5070', 'EPSG:4326',
-                                            always_xy := true) AS pt
-                        FROM {_T}{k} t {_join} JOIN classes c ON c.code = t.crop_type
-                        WHERE t.year = {_year} AND t.crop_type NOT IN {drop} AND {_box}
-                    )
-                    SELECT p.x, p.y, p.crop_type,
-                           (CASE WHEN NOT p.noncrop AND g.ix IS NOT NULL THEN 1
-                                 WHEN NOT p.noncrop THEN 2
-                                 WHEN g.ix IS NOT NULL THEN 3 END)::UTINYINT AS cls
-                    FROM p LEFT JOIN g
-                      ON floor((ST_X(p.pt) + 180) / {_res})::BIGINT = g.ix
-                     AND floor(({FTW_Y0} - ST_Y(p.pt)) / {_res})::BIGINT = g.iy
-                    """
-                )
-                mcon.sql("DELETE FROM cur WHERE cls IS NULL")
-                _cnt = dict(mcon.sql("SELECT cls, count(*) FROM cur GROUP BY 1").fetchall())
-                _tot = sum(_cnt.values()) or 1
-                _pxa = (_B * k / 1000) ** 2 * ACRES_PER_KM2
-                legend = [
-                    {"code": code, "name": nm, "hex": hx,
-                     "pct": round(100 * _cnt.get(code, 0) / _tot, 1),
-                     # with fields ON the clip IS the P(field) grid, so the
-                     # orange class cannot appear: say so next to it
-                     "note": ("turn fields off to see" if fields and code == 2
-                              else f"{_cnt.get(code, 0) * _pxa / 1e3:,.1f}k ac")}
-                    for code, (nm, hx, _c3) in DIS.items()
-                ]
-                HOLD["dis_split"] = {code: 100 * _cnt.get(code, 0) / _tot for code in DIS}
+            mcon.sql(f"CREATE OR REPLACE TABLE cur AS {_crop_sql('')}")
+            _ftw, _f = None, 0
+            if fields or dis:
+                _ftw = _ftw_mask(_B * k, W, S, E, N)
+                _f = _ftw[4]
             _rings, _nt, _tz = None, 0, 0
             if fields:
                 _tz = _tile_z(vs)
                 _rings, _nt, _nmiss = ftw_tile_rings(
                     ftw_states_in(mcon, W, S, E, N), _fyear, W, S, E, N, _tz)
-            url, bounds, npx, nbytes = _paint(k, x0, y0, x1, y1, W, S, E, N, _sel_px, dis, _rings)
+            url, bounds, legend, npx, nbytes = _paint(
+                k, x0, y0, x1, y1, W, S, E, N, _sel, fields, dis, _rings, _ftw)
             line = _line(npx, nbytes,
                          (f" · FTW {_fyear} fields · {_nt} tiles z{_tz}" if fields else "")
                          + (f" · disagreement vs P(field) at {10 * _f} m" if dis else ""))

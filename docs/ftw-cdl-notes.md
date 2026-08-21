@@ -293,3 +293,46 @@ Driven (playwright, headless Chrome, this Mac): fields on cold 5.8-7.1 s
 2.5-3.9 s when it misses (raster read + lookup, not the wire); disagreement +
 fields 0.7 s, pans 0.6-2.8 s. Worst case ~4 s against 10+ s before. Not yet
 flown by Stephen.
+
+## 2026-08-20, later: the FTW side decided per output pixel; chunk-cached mask
+
+Stephen flew the tile/raster build: judder gone with SWAP_HIDE_S 0.15 (back
+with 0), "intermittently non-responsive, sometimes fast, or sluggish". The
+driven numbers said the same: hits 0.6-1.1 s, misses 2.5-3.9 s, a miss every
+second or third pan. The miss was two SQL passes: the P(field) raster read for
+the PADDED box (up to 0.4 deg², ~10x the view, 2-3.5 s) and ST_Transform of
+every CDL centre in that box to bin it (1-2 s, millions of points at 20 m);
+disagreement paid the transform on every serve.
+
+Rework (in the notebook):
+- `render_view` takes CLASS CODES (not RGB) plus a dense boolean of the
+  P(field) grid and decides the clip and the disagreement class PER OUTPUT
+  PIXEL from the lon/lat it already computes for the warp. No lk tables, no
+  ST_Transform passes, no disagreement SQL on the serve; `cur` is the plain
+  CDL pixel fetch. Counts for the legend come from the drawn output pixels
+  (acres from the output pixel's ground area). The clip edge is the 40 m FTW
+  cell, not whole CDL pixels by centre. `_ftw_lookup` (the SQL join) stays
+  for analyze / timelapse, built on click.
+- The mask is cached BY THE ZARR'S INNER CHUNK (512 px, ~20 km at 40 m):
+  `_ftw_mask` reads only the missing chunks of the view in one query over
+  their bounding box, keeps them in memory (cap 600) and on disk as packbits
+  (`$TMPDIR/x-sql-marimo/ftw-mask/<f>x/<year>/<cx>_<cy>.npy`, 32 KB each),
+  and assembles the view's mask from them. Restarts are free.
+- `SWAP_HIDE_S` (0.15): opacity 0 across the image/bounds swap, 1 after.
+  deck loads a new `image` URL asynchronously but applies `bounds` at once,
+  so the old picture sat stretched in the new box: the judder. Lonboard's
+  image trait is URL-only, so this is the only lever short of the bundle
+  patch or a bespoke deck widget.
+
+Driven (playwright, headless Chrome, this Mac): fields on cold 4.6 s (9
+chunks + lookup-free); pans 0.51-0.56 s on a hit, ~2.0 s on a one-chunk miss
+(pan4 only; pan2/3/5 that missed before are hits now); disagreement 1.4 s
+first, pans 0.4-1.7 s. 9 chunks / 324 KB on disk after the run.
+
+Polygon benchmark (scratch copy `_poly_bench.py`, same pipeline, PNG replaced
+by a PolygonLayer table): at the Delta HOME zoom 12 the 420k-row budget picks
+4x = 412k squares = 40 MB per frame; fields frame 168k squares + outlines =
+22 MB at 3.3 s kernel. `mcon.register` of a pyarrow table from the worker
+thread hung the serve (hex WKB in SQL instead); not finished, killed because
+it competed with Stephen's flight. The bitmap's payload is 0.1-0.5 MB at the
+same views.

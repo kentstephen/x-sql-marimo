@@ -622,6 +622,18 @@ duckdb as a backend"). Full recon and numbers in `docs/ftw-cdl-notes.md`.
   cannot appear (same grid as the clip). Layer still the bitmap for this
   round; polygons from `6b816ac` are the agreed revert if it does not feel
   right on his screen. Not yet flown by him.
+- **2026-08-20 LATER: FTW decided PER OUTPUT PIXEL, mask cached by Zarr
+  chunk.** Flown: judder gone with `SWAP_HIDE_S` 0.15 (opacity 0 across the
+  image/bounds swap; deck loads `image` async, applies `bounds` at once),
+  but intermittently sluggish = the grid miss (padded raster read + an
+  ST_Transform pass, 2-4 s). Now `render_view` takes class codes + a dense
+  P(field) boolean and decides clip / disagreement per output pixel from the
+  lon/lat it already has (no lk tables or transform passes on the serve;
+  `_ftw_lookup` stays for analyze); `_ftw_mask` caches the grid by the
+  Zarr's 512-px inner chunk in memory + packbits on disk under tmp, reading
+  only missing chunks. Driven: hits 0.5 s, a one-chunk miss ~2 s, fields on
+  cold 4.6 s. Polygon benchmark on the same pipeline (scratch
+  `_poly_bench.py`): 22-40 MB per frame at the Delta zoom; unfinished.
 - **TODO, Stephen's (not now): picking.** Click a pixel or field to see who says
   what ("who says who's growing what"). He expects it to need the lonboard
   bundle patch (two-layer ids) and does not want that; the HRRR counties film's
