@@ -634,6 +634,14 @@ duckdb as a backend"). Full recon and numbers in `docs/ftw-cdl-notes.md`.
   only missing chunks. Driven: hits 0.5 s, a one-chunk miss ~2 s, fields on
   cold 4.6 s. Polygon benchmark on the same pipeline (scratch
   `_poly_bench.py`): 22-40 MB per frame at the Delta zoom; unfinished.
+- **MOVED OUT (2026-08-20, night): `~/dev/projects/cdl-ftw-zarr-marimo/cdl-ftw.py`.**
+  Stephen: "this belongs in a different repo." The tile build from branch
+  `fields-tiles` (4156933: map = xarray + numpy, DuckDB only for the parquet
+  joins, RasterLayer tiles) lives there with its own pyproject, README,
+  CLAUDE.md, memory, the FTW notes copy, and `tools/patch_lonboard_raster_unlit.py`
+  (the lighting fix, applied in that venv). `xsql-cdl-fields.py` here stays as
+  the bitmap record on `main` and is not maintained; `xsql-cdl-crops.py` stays
+  here as the DuckDB demo.
 - **END OF 2026-08-20: UNDECIDED, three states.** `main` = the bitmap serve
   (flown; judder fixed by `SWAP_HIDE_S`). Branch `fields-tiles` = a working
   RasterLayer tile serve (batched SQL per tile burst, whole view per batch,
