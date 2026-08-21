@@ -241,3 +241,55 @@ Also undecided: polygons back (6b816ac) vs bitmap with ROW_BUDGET 420k, capped
 fetch threads, no prefetch. The bitmap serve is not validated interactively;
 the driven harness measured kernel and paint times and did not capture the
 interactive feel (likely CPU saturation). See CLAUDE.md.
+
+## 2026-08-20, late: no parquet on the serve path (raster clip + PMTiles outlines)
+
+Stephen: polygons vs bitmap had become a yes/no fight; what he wanted was to
+find the thing that actually stalls and take it out. Measured that night from
+home, same Salinas box then a 20 km pan, then back:
+
+| | parquet (cache_httpfs on) | raster 4x (zarr via xql) | PMTiles z13 | PMTiles z12 |
+|---|---|---|---|---|
+| cold | 2.4 s, 3.8 MB | 1.1 s | 1.3 s, 0.4 MB, 36 tiles | 0.8 s, 0.5 MB, 12 tiles |
+| pan east | 1.6 s | 1.5 s | 0.6 s | 0.6 s |
+| back | 0.0 s (disk) | 1.1 s | 0.7 s | 0.7 s |
+
+The link was fast that night (the 10 s parquet stalls are slow-link nights);
+by BYTES the order is PMTiles < raster < parquet, and bytes are what a slow
+link charges. Decision (Stephen): PMTiles for the outlines, the probability
+raster for the clip, parquet only for the SQL cells. The layer stays the
+bitmap for this round, polygons from 6b816ac are the revert if it does not
+feel right on his screen.
+
+Built:
+- `cache_httpfs` (DuckDB community extension) loaded on every connection,
+  `HTTPFS_CACHE_DIR` under the OS tmp dir: every byte range fetched over
+  httpfs is kept on disk, so any row group read once is local afterwards,
+  across connections and restarts. Measured (CA file, Fresno + two pans): 2.3
+  / 1.4 / 1.6 s cold, 0.3 / 0.0 / 0.0 s in a fresh process; 19 MB on disk.
+  Kept for the SQL cells; the map no longer reads the parquet at all.
+- The clip is the P(field) >= 0.5 grid (ftw_4 / ftw_16, the same read
+  disagreement makes), read for the padded box and cached; `lk_n(y, x)` is
+  the CDL centres that bin into a field cell, built once per (table, level,
+  grid box); serve / analyze / timelapse keep their `JOIN lk USING (y, x)`.
+- The outlines are the per-state PMTiles (`US_<ST>.pmtiles`, tippecanoe
+  z0-13, layers "2024"/"2025"): new cell, the counties film's PMTiles v3 +
+  MVT decode by copy, sync obstore in a 16-thread pool, tile zoom =
+  floor(camera zoom) capped 13 (~15-40 tiles per view), raw tiles cached on
+  disk (`$TMPDIR/x-sql-marimo/ftw-tiles/<ST>/z/x/y.mvt`, empty file = absent),
+  decoded polylines in memory. Segments along a tile's clip line (both ends
+  outside the tile on the same side) are dropped, so no tile seams; and
+  render_view no longer closes polylines (it did, for the parquet rings, and
+  a tile-cut piece closed itself with a diagonal across the field).
+- Gone: fcon, the fetch pool, the padded parquet fetch, the prefetch, the
+  ST_Contains lookup, fields_sql / lookup_sql / rings_from_geojson.
+- Semantic change: with fields ON the clip and disagreement's "FTW field"
+  are the same grid, so the orange class (CDL crop, no FTW field) only shows
+  with fields OFF; the old polygon clip let orange flecks through where the
+  polygon and the grid disagreed.
+
+Driven (playwright, headless Chrome, this Mac): fields on cold 5.8-7.1 s
+(grid + lookup + 15 tiles z12); pans: 0.6-1.1 s when the grid cache hits,
+2.5-3.9 s when it misses (raster read + lookup, not the wire); disagreement +
+fields 0.7 s, pans 0.6-2.8 s. Worst case ~4 s against 10+ s before. Not yet
+flown by Stephen.

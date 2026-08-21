@@ -51,22 +51,27 @@ WHICH DATA, FROM WHERE, WHAT TYPE (every leg is DuckDB):
   years in the file, CRS84)
     s3://us-west-2.opendata.source.coop/tge-labs/ftw-global-data/predictions/vectors/
       alpha/results-by-admin-conf/admin:country_code=US/US_<ST>.parquet
-    -> read_parquet() through httpfs + spatial; the `bbox` struct prunes row groups.
+    -> read_parquet() through httpfs + spatial (+ cache_httpfs: fetched byte ranges
+       kept on disk under the OS tmp dir); the `bbox` struct prunes row groups.
+       Used by the SQL cells under the map ONLY; the map never reads it.
   FTW softmax probabilities 2024 + 2025, 10 m, EPSG:4326, 14 multiscale levels
     s3://us-west-2.opendata.source.coop/tge-labs/ftw-global-data/predictions/zarr/
       alpha/global.zarr (+ /4x .. /8192x)
     plain Zarr v3 (not icechunk), float32 variables(time, band, y, x), bands
     non_field_background / field / field_boundaries -> xql.register(con, "ftw_<k>", ds)
     on the same backend, blocks = the INNER chunk (512) so x/y predicates prune.
-  Not used: FTW per-state PMTiles (draw-only, decimated, no id) and the 500 m
-  confidence COGs (the `confidence` column is NULL for the entire US: the US is
-  not one of the 24 labelled countries).
+  FTW per-state PMTiles (tippecanoe z0-13, layers "2024" / "2025", no id)
+    same directory, US_<ST>.pmtiles -> ranged GETs (obstore), hand-rolled
+    PMTiles v3 + MVT decode (the HRRR counties film's, by copy): the FIELD
+    OUTLINES on the map, ~40 tiles per view, raw tiles cached on disk.
+  Not used: the 500 m confidence COGs (the `confidence` column is NULL for the
+  entire US: the US is not one of the 24 labelled countries).
 
-The FTW join is one point-in-polygon pass per (box, year, level): the CDL pixel
-centres of the serve level into the field polygons (ST_Contains, DuckDB's
-spatial join; 0.1 s for 2k fields x 660k pixels) into a (y, x) -> field lookup,
-reused by every serve and every year of the mask. Disagreement bins the CDL
-centres into the 40 m (or 160 m) FTW grid by index arithmetic.
+On the map, "inside a field" is the probability grid: a CDL pixel whose centre
+falls in a 40 m (or 160 m) FTW cell with P(field) >= 0.5, by index arithmetic
+(the same binning disagreement uses), built once per (level, box) into a
+(y, x) lookup reused by every serve. The polygons themselves are the SQL
+cells' business (ST_Contains joins, per-field purity, the 2x2).
 
 Under the map: "analyze what's in view" (the crops notebook's panel: top crops
 and the 18-year timelapse of the box, under the mask when it is on), then SQL
@@ -94,9 +99,13 @@ app = marimo.App(width="full", sql_output="native")
 def _():
     import asyncio
     import base64
+    import gzip
     import io
     import json
     import math
+    import os
+    import struct
+    import tempfile
     import threading
     import time
     from concurrent.futures import ThreadPoolExecutor
@@ -106,6 +115,7 @@ def _():
 
     import anywidget
     import duckdb
+    import obstore
     import icechunk
     import xarray as xr
     import zarr
@@ -133,12 +143,17 @@ def _():
         asyncio,
         base64,
         duckdb,
+        gzip,
         icechunk,
         io,
         json,
         math,
         mo,
         np,
+        obstore,
+        os,
+        struct,
+        tempfile,
         threading,
         time,
         traitlets,
@@ -167,8 +182,9 @@ def _(mo):
     | data | type on disk | how DuckDB reads it |
     |---|---|---|
     | CDL `crop_type(year, y, x)`, 30 m, EPSG:5070, 2008-2025, + majority pyramid | icechunk Zarr v3, uint8 | `xql.register` (xarray-sql DuckDB backend): tables `cdl_1` (native) .. `cdl_256` |
-    | FTW field polygons, one GeoParquet per state, both years in the file | fiboa GeoParquet, CRS84 | `read_parquet(...)` over httpfs, `bbox` struct prunes row groups |
-    | FTW softmax P(non-field / field / boundary), 10 m, EPSG:4326, 14 levels | plain Zarr v3, float32 | `xql.register`: tables `ftw_4` (40 m), `ftw_16` (160 m) |
+    | FTW softmax P(non-field / field / boundary), 10 m, EPSG:4326, 14 levels | plain Zarr v3, float32 | `xql.register`: tables `ftw_4` (40 m), `ftw_16` (160 m); the map's clip and disagreement |
+    | FTW field outlines, one PMTiles per state | tippecanoe MVT, z0-13 | not DuckDB: ranged GETs + MVT decode, drawn on the map |
+    | FTW field polygons, one GeoParquet per state, both years in the file | fiboa GeoParquet, CRS84 | `read_parquet(...)` over httpfs (+ `cache_httpfs` on disk), `bbox` struct prunes row groups; the SQL cells below |
 
     FTW's `confidence` column is NULL for the whole US (not one of the 24 labelled
     countries), so nothing here uses it. Field shapes change over time: disagreement
@@ -213,13 +229,19 @@ def _():
     OVERSAMPLE = 1.0              # picture px per screen px (1.5 looked crisper but
     # pushed ~4M output pixels through the Albers transform + PNG encode per
     # serve, seconds on a laptop; 1.0 is the screen's own resolution)
-    FTW_BOX_DEG2 = 0.35           # FTW modes only when the (padded) box is under this
-    FTW_PAD = 1.6                 # the FTW fetch covers PAD x the serve box each side
-    FTW_FETCH_DEG2 = 0.4          # ... capped at this area. Measured: the state file
-    # has ~48 row groups of ~13 MB, spatially sorted, so a wider box touches more
-    # of them and the read is NOT flat (2.5x pad: 13 s open, 18 s on a miss);
-    # a modest pad makes small pans and zoom-ins hits without that bill
+    FTW_BOX_DEG2 = 0.35           # FTW modes only when the box is under this
+    FTW_PAD = 1.6                 # the P(field) grid is read for PAD x the serve box
+    FTW_FETCH_DEG2 = 0.4          # ... capped at this area, so small pans and
+    # zoom-ins are cache hits (the raster read is area-proportional, ~1 s per
+    # 0.04 deg² at 40 m from home)
+    FTW_TILE_ZMAX = 13            # the per-state PMTiles' top zoom (outlines)
     MARGIN = 0.35                 # fold box slack beyond the viewport
+    HTTPFS_CACHE_DIR = "x-sql-marimo/duckdb-httpfs-cache"   # under the OS tmp dir:
+    # DuckDB's cache_httpfs community extension writes every byte range it
+    # fetches over httpfs (the FTW parquet row groups, ~13 MB each) to disk, so
+    # a place touched once is read locally afterwards, on any connection and
+    # across restarts. Measured (CA file, Fresno then two pans): 2.3 / 1.4 /
+    # 1.6 s cold, 0.3 / 0.0 / 0.0 s in a fresh process. None disables.
     VIEW_W, VIEW_H = 1400, 700    # the usual guess; no ruler
     HOME = {"longitude": -121.45, "latitude": 37.95, "zoom": 12.0}  # the Delta west of Stockton
 
@@ -243,6 +265,7 @@ def _():
         FTW_PAD,
         FTW_LEVELS,
         FTW_RES,
+        FTW_TILE_ZMAX,
         FTW_VEC,
         FTW_Y0,
         FTW_YEARS,
@@ -251,6 +274,7 @@ def _():
         HOME,
         LEVELS,
         LEVELS10,
+        HTTPFS_CACHE_DIR,
         MARGIN,
         OVERSAMPLE,
         PREFIX,
@@ -269,12 +293,15 @@ def _(
     FTW_BUCKET,
     FTW_LEVELS,
     FTW_ZARR,
+    HTTPFS_CACHE_DIR,
     LEVELS,
     LEVELS10,
     PREFIX,
     S3Store,
     duckdb,
     icechunk,
+    os,
+    tempfile,
     threading,
     xql,
     xr,
@@ -298,6 +325,13 @@ def _(
             "INSTALL spatial; LOAD spatial; INSTALL httpfs; LOAD httpfs;"
             " SET s3_region='us-west-2'; SET s3_url_style='path';"
         )
+        if HTTPFS_CACHE_DIR:
+            _d = os.path.join(tempfile.gettempdir(), HTTPFS_CACHE_DIR)
+            os.makedirs(_d, exist_ok=True)
+            c.sql(
+                "INSTALL cache_httpfs FROM community; LOAD cache_httpfs;"
+                f" SET cache_httpfs_cache_directory='{_d}';"
+            )
         return c
 
     con = _connect()
@@ -449,13 +483,8 @@ def _(
     mcon.sql(_STATES_DDL)
     mcon.executemany("INSERT INTO ftw_states VALUES (?,?,?,?,?)", _STATES)
 
-    # a THIRD connection for the FTW parquet fetch on a thread (httpfs +
-    # spatial only, no registrations): it runs concurrently with the CDL
-    # centre scan on mcon and hands the polygons back as Arrow (WKB)
-    fcon = _connect()
-
     NONCROP_CODES = sorted(r[0] for r in _rows if r[7])
-    return NONCROP_CODES, con, con_lock, fcon, mcon
+    return NONCROP_CODES, con, con_lock, mcon
 
 
 @app.cell
@@ -540,26 +569,13 @@ def _(
             for ring in rings:
                 pts = [((lon - W) * sx, (N - lat) * sy) for lon, lat in ring]
                 if len(pts) >= 2:
-                    d.line(pts + [pts[0]], fill=line, width=1)
+                    # polylines as given: closed rings arrive closed, and a
+                    # tile-cut piece must NOT be closed (that drew a diagonal)
+                    d.line(pts, fill=line, width=1)
         buf = io.BytesIO()
         img.save(buf, format="PNG", optimize=False, compress_level=4)
         url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
         return url, [W, S, E, N], len(buf.getvalue())
-
-    def rings_from_geojson(rows, json_loads):
-        """Every ring (outer and holes) of polygons / multipolygons from
-        ST_AsGeoJSON rows, as lists of (lon, lat)."""
-        rings = []
-        for (gj,) in rows:
-            if not gj:
-                continue
-            g = json_loads(gj)
-            if g.get("type") == "Polygon":
-                rings.extend(g["coordinates"])
-            elif g.get("type") == "MultiPolygon":
-                for poly in g["coordinates"]:
-                    rings.extend(poly)
-        return [[(c[0], c[1]) for c in r] for r in rings if len(r) >= 3]
 
     def bbox4326(vs):
         span = 360.0 / (512 * 2 ** vs["zoom"])
@@ -591,47 +607,18 @@ def _(
         return (max(min(xs), _X0), max(min(ys), _Y0),
                 min(max(xs), _X1), min(max(ys), _Y1))
 
-    def ftw_files(c, W, S, E, N):
-        """The state parquet files whose extent meets the box."""
-        sts = c.sql(
+    def ftw_states_in(c, W, S, E, N):
+        """State codes whose FTW extent meets the box."""
+        return [r[0] for r in c.sql(
             f"""SELECT st FROM ftw_states
                 WHERE xmax > {W} AND xmin < {E} AND ymax > {S} AND ymin < {N}
                 ORDER BY st"""
-        ).fetchall()
-        return [f"s3://{FTW_BUCKET}/{FTW_VEC}US_{r[0]}.parquet" for r in sts]
+        ).fetchall()]
 
-    def fields_sql(files, W, S, E, N, ftw_year):
-        """Fields of the box for one FTW year, with the bbox-struct predicate
-        (row groups are spatially sorted, so it prunes). The file's geometry
-        type is GEOMETRY('OGC:CRS84'); lonboard's from_duckdb only recognises
-        plain GEOMETRY, hence the cast."""
-        fl = ", ".join(f"'{f}'" for f in files)
-        return f"""
-            SELECT id, "metrics:area" AS area_m2, geometry::GEOMETRY AS geometry
-            FROM read_parquet([{fl}])
-            WHERE bbox.xmin > {W} AND bbox.xmax < {E}
-              AND bbox.ymin > {S} AND bbox.ymax < {N}
-              AND date_part('year', "determination:datetime" AT TIME ZONE 'UTC')
-                  = {ftw_year}
-        """
-
-    def lookup_sql(tbl, x0, y0, x1, y1, fields_tbl):
-        """(y, x) -> field id for every CDL pixel centre of table `tbl` (a
-        cdl_<k> / cdl10_<k> level) inside a field: ONE point-in-polygon pass
-        (ST_Contains, DuckDB's spatial join), reused by every serve afterwards
-        as a plain hash join."""
-        return f"""
-            WITH p AS (
-                SELECT DISTINCT y, x,
-                       ST_Transform(ST_Point(x, y), 'EPSG:5070', 'EPSG:4326',
-                                    always_xy := true) AS pt
-                FROM {tbl}
-                WHERE year = 2025
-                  AND x BETWEEN {x0} AND {x1} AND y BETWEEN {y0} AND {y1}
-            )
-            SELECT f.id, p.y, p.x
-            FROM {fields_tbl} f JOIN p ON ST_Contains(f.geometry, p.pt)
-        """
+    def ftw_files(c, W, S, E, N):
+        """The state parquet files whose extent meets the box (SQL cells)."""
+        return [f"s3://{FTW_BUCKET}/{FTW_VEC}US_{st}.parquet"
+                for st in ftw_states_in(c, W, S, E, N)]
 
     def ftw_grid_sql(px_m, year, W, S, E, N):
         """The FTW cells that are field (P(field) >= 0.5) in the 4326 box, as
@@ -650,8 +637,282 @@ def _(
             res, f,
         )
 
-    return (albers_xy, bbox4326, fields_sql, ftw_files, ftw_grid_sql, lookup_sql,
-            render_view, rings_from_geojson, to5070)
+    return (albers_xy, bbox4326, ftw_files, ftw_grid_sql, ftw_states_in,
+            render_view, to5070)
+
+
+@app.cell
+def _(
+    FTW_BUCKET,
+    FTW_VEC,
+    S3Store,
+    ThreadPoolExecutor,
+    gzip,
+    math,
+    np,
+    obstore,
+    os,
+    struct,
+    tempfile,
+    threading,
+):
+    # ---- FTW field OUTLINES from the per-state PMTiles (tippecanoe, z0-13,
+    # layers "2024" / "2025", no id: draw-only, which is all an outline needs).
+    # The map no longer touches the parquet: the clip is the P(field) grid,
+    # the outlines are tiles, and the first visit to any place is bounded
+    # (~30-40 tiles, ~0.4 MB, measured 0.6-1.3 s from home) instead of a
+    # 13-40 MB row-group read. Raw tiles are cached on disk under the OS tmp
+    # dir, decoded polylines in memory. The PMTiles v3 client and the MVT
+    # decode are the HRRR counties film's, by copy (repo rule), sync obstore
+    # in a thread pool because the serve runs in a worker thread.
+    _pm = S3Store(bucket=FTW_BUCKET, region="us-west-2", skip_signature=True)
+    _TILE_DIR = os.path.join(tempfile.gettempdir(), "x-sql-marimo", "ftw-tiles")
+    _arch, _arch_lock = {}, threading.Lock()
+    _mem, _mem_lock = {}, threading.Lock()
+    _tpool = ThreadPoolExecutor(max_workers=16)
+
+    def _rng(path, a, b):
+        """Inclusive byte range [a, b]; obstore's end is exclusive."""
+        return bytes(memoryview(obstore.get_range(_pm, path, start=a, end=b + 1)))
+
+    def _varint(buf, i):
+        r = sh = 0
+        while True:
+            c = buf[i]
+            i += 1
+            r |= (c & 0x7F) << sh
+            if not c & 0x80:
+                return r, i
+            sh += 7
+
+    def _parse_dir(buf):
+        n, i = _varint(buf, 0)
+        ids, last = [0] * n, 0
+        for k in range(n):
+            v, i = _varint(buf, i)
+            last += v
+            ids[k] = last
+        runs = [0] * n
+        for k in range(n):
+            runs[k], i = _varint(buf, i)
+        lens = [0] * n
+        for k in range(n):
+            lens[k], i = _varint(buf, i)
+        offs = [0] * n
+        for k in range(n):
+            v, i = _varint(buf, i)
+            offs[k] = (offs[k - 1] + lens[k - 1]) if v == 0 and k > 0 else v - 1
+        return list(zip(ids, offs, lens, runs))
+
+    def _tile_id(z, x, y):
+        acc = sum((1 << t) * (1 << t) for t in range(z))
+        n = 1 << z
+        d, sq = 0, n >> 1
+        while sq > 0:
+            rx = 1 if x & sq else 0
+            ry = 1 if y & sq else 0
+            d += sq * sq * ((3 * rx) ^ ry)
+            if ry == 0:
+                if rx == 1:
+                    x, y = sq - 1 - x, sq - 1 - y
+                x, y = y, x
+            sq >>= 1
+        return acc + d
+
+    def _find(entries, tid):
+        lo, hi = 0, len(entries) - 1
+        while lo <= hi:
+            m = (lo + hi) // 2
+            if tid < entries[m][0]:
+                hi = m - 1
+            elif tid > entries[m][0]:
+                lo = m + 1
+            else:
+                return entries[m]
+        if hi >= 0 and (entries[hi][3] == 0 or tid - entries[hi][0] < entries[hi][3]):
+            return entries[hi]
+        return None
+
+    def _open(st):
+        """Header + root directory of one state archive, once."""
+        with _arch_lock:
+            a = _arch.get(st)
+            if a is None:
+                path = f"{FTW_VEC}US_{st}.pmtiles"
+                hdr = _rng(path, 0, 126)
+                assert hdr[:7] == b"PMTiles" and hdr[7] == 3, "not a PMTiles v3 archive"
+                rd_off, rd_len, _, _, ld_off, _, td_off, _ = struct.unpack("<8Q", hdr[8:72])
+                root = _parse_dir(gzip.decompress(_rng(path, rd_off, rd_off + rd_len - 1)))
+                a = _arch[st] = {"path": path, "root": root, "ld": ld_off, "td": td_off,
+                                 "leaf": {}, "maxz": hdr[101]}
+            return a
+
+    def _blob(st, z, x, y):
+        """Raw tile bytes (gzip as shipped) or None when absent; disk-cached."""
+        fp = os.path.join(_TILE_DIR, st, str(z), str(x), f"{y}.mvt")
+        if os.path.exists(fp):
+            with open(fp, "rb") as f:
+                b = f.read()
+            return b or None
+        a = _open(st)
+        tid, ents = _tile_id(z, x, y), a["root"]
+        blob = b""
+        for _ in range(4):
+            e = _find(ents, tid)
+            if e is None:
+                break
+            if e[3] == 0:
+                lk = (e[1], e[2])
+                with _arch_lock:
+                    if lk not in a["leaf"]:
+                        a["leaf"][lk] = _parse_dir(gzip.decompress(
+                            _rng(a["path"], a["ld"] + e[1], a["ld"] + e[1] + e[2] - 1)))
+                ents = a["leaf"][lk]
+                continue
+            blob = _rng(a["path"], a["td"] + e[1], a["td"] + e[1] + e[2] - 1)
+            break
+        os.makedirs(os.path.dirname(fp), exist_ok=True)
+        tmp = f"{fp}.{threading.get_ident()}.tmp"
+        with open(tmp, "wb") as f:
+            f.write(blob)
+        os.replace(tmp, fp)
+        return blob or None
+
+    def _fields(buf):
+        i, n = 0, len(buf)
+        while i < n:
+            key, i = _varint(buf, i)
+            f, w = key >> 3, key & 0x7
+            if w == 0:
+                v, i = _varint(buf, i)
+            elif w == 2:
+                ln, i = _varint(buf, i)
+                v = buf[i:i + ln]
+                i += ln
+            elif w == 5:
+                v = buf[i:i + 4]
+                i += 4
+            elif w == 1:
+                v = buf[i:i + 8]
+                i += 8
+            else:
+                raise ValueError(f"wire type {w}")
+            yield f, w, v
+
+    def _rings(geom):
+        rings, ring = [], None
+        x = y = 0
+        i, n = 0, len(geom)
+        while i < n:
+            cmd, i = _varint(geom, i)
+            op, count = cmd & 0x7, cmd >> 3
+            if op == 1:
+                for _ in range(count):
+                    dx, i = _varint(geom, i)
+                    dy, i = _varint(geom, i)
+                    x += (dx >> 1) ^ -(dx & 1)
+                    y += (dy >> 1) ^ -(dy & 1)
+                    ring = [(x, y)]
+                    rings.append(ring)
+            elif op == 2:
+                for _ in range(count):
+                    dx, i = _varint(geom, i)
+                    dy, i = _varint(geom, i)
+                    x += (dx >> 1) ^ -(dx & 1)
+                    y += (dy >> 1) ^ -(dy & 1)
+                    ring.append((x, y))
+            elif op == 7:
+                ring.append(ring[0])
+            else:
+                raise ValueError(f"geometry op {op}")
+        return rings
+
+    def _decode(blob, year, z, x, y):
+        """One tile -> polylines (lon/lat float arrays) of the year's layer.
+        Features are tile-clipped upstream, so a segment running along the
+        clip line (both ends outside the tile on the same side) is dropped:
+        that is what keeps the tile grid from showing as seams."""
+        if blob[:2] == b"\x1f\x8b":
+            blob = gzip.decompress(blob)
+        want = str(year)
+        out = []
+        n = 1 << z
+        for f, _w, v in _fields(blob):
+            if f != 3:
+                continue
+            name, extent, feats = None, 4096, []
+            for lf, _lw, lv in _fields(v):
+                if lf == 1:
+                    name = lv.decode("utf-8")
+                elif lf == 2:
+                    feats.append(lv)
+                elif lf == 5:
+                    extent = lv
+            if name != want:
+                continue
+            for fv in feats:
+                gtype, geom = 0, b""
+                for ff, _fw, fvv in _fields(fv):
+                    if ff == 3:
+                        gtype = fvv
+                    elif ff == 4:
+                        geom = fvv
+                if gtype != 3:
+                    continue
+                for ring in _rings(geom):
+                    if len(ring) < 2:
+                        continue
+                    a = np.asarray(ring, dtype=np.float64)
+                    ax, ay = a[:-1], a[1:]
+                    keep = ~(((ax[:, 0] < 0) & (ay[:, 0] < 0)) | ((ax[:, 0] > extent) & (ay[:, 0] > extent))
+                             | ((ax[:, 1] < 0) & (ay[:, 1] < 0)) | ((ax[:, 1] > extent) & (ay[:, 1] > extent)))
+                    # runs of kept segments -> polylines
+                    idx = np.flatnonzero(keep)
+                    if not len(idx):
+                        continue
+                    cuts = np.flatnonzero(np.diff(idx) > 1) + 1
+                    for run in np.split(idx, cuts):
+                        pts = a[run[0]:run[-1] + 2]
+                        lon = (x + pts[:, 0] / extent) / n * 360.0 - 180.0
+                        lat = np.degrees(np.arctan(np.sinh(np.pi * (1.0 - 2.0 * (y + pts[:, 1] / extent) / n))))
+                        out.append(np.column_stack([lon, lat]))
+        return out
+
+    def _tile(st, z, x, y, year):
+        key = (st, z, x, y, year)
+        with _mem_lock:
+            v = _mem.get(key)
+        if v is not None:
+            return v, False
+        b = _blob(st, z, x, y)
+        v = _decode(b, year, z, x, y) if b else []
+        with _mem_lock:
+            _mem[key] = v
+            if len(_mem) > 4000:
+                for _k in list(_mem)[:500]:
+                    _mem.pop(_k, None)
+        return v, True
+
+    def ftw_tile_rings(states, year, W, S, E, N, z):
+        """The year's field outlines over the box from the states' archives at
+        tile zoom z: (list of lon/lat polylines, tiles, tiles not in memory)."""
+        n = 1 << z
+
+        def tx(lon):
+            return min(n - 1, max(0, int((lon + 180) / 360 * n)))
+
+        def ty(lat):
+            lat = max(-85.05, min(85.05, lat))
+            return min(n - 1, max(0, int((1 - math.log(math.tan(math.radians(lat))
+                                                     + 1 / math.cos(math.radians(lat))) / math.pi) / 2 * n)))
+
+        jobs = [(st, z, x, y, year) for st in states
+                for x in range(tx(W), tx(E) + 1) for y in range(ty(N), ty(S) + 1)]
+        res = list(_tpool.map(lambda j: _tile(*j), jobs))
+        rings = [r for v, _ in res for r in v]
+        return rings, len(jobs), sum(1 for _, miss in res if miss)
+
+    return (ftw_tile_rings,)
 
 
 @app.cell
@@ -1004,24 +1265,21 @@ def _(
     YEAR0,
     FTW_FETCH_DEG2,
     FTW_PAD,
-    ThreadPoolExecutor,
+    FTW_TILE_ZMAX,
     asyncio,
     bbox4326,
     con_lock,
     deck,
-    fcon,
-    fields_sql,
-    ftw_files,
     ftw_grid_sql,
+    ftw_states_in,
+    ftw_tile_rings,
     hud,
     json,
-    lookup_sql,
     math,
     mcon,
     np,
     pixels,
     render_view,
-    rings_from_geojson,
     time,
     to5070,
     urllib,
@@ -1117,14 +1375,15 @@ def _(
             break
         return k, x0, y0, x1, y1, drop
 
-    # ---- the FTW tables. Two caches: (1) polygons fetched ONCE for a PADDED
-    # box (FTW_PAD x the serve box each side, capped at FTW_FETCH_DEG2; one
-    # parquet read costs ~3 s whatever the box, so fetching wide makes pans
-    # and zoom-ins cache hits), (2) the pixel -> field lookup per (table,
-    # level, serve box), built from the cached polygons. A cold miss fetches
-    # the parquet on fcon in a thread WHILE mcon scans the CDL centres. -----
-    _pool = HOLD.setdefault("pool", ThreadPoolExecutor(max_workers=2))
-
+    # ---- the FTW side, no parquet on the serve path (2026-08-20, late):
+    # the CLIP is the P(field) >= 0.5 grid of the probability Zarr (xql on
+    # ftw_4 / ftw_16), read for a PADDED box and cached per (year, level,
+    # box); the CDL-pixel "inside a field" lookup lk_n(y, x) is built once per
+    # (table, level, grid box) by binning the pixel centres into that grid
+    # (the same arithmetic disagreement uses); the OUTLINES are PMTiles (the
+    # ftw_tile_rings cell). Every first visit is bounded: one raster read of
+    # a few MB and ~40 small tiles, instead of 13-40 MB of parquet row
+    # groups (the ~10 s stalls). -----
     def _padded(W, S, E, N):
         cw, ch = (W + E) / 2, (S + N) / 2
         dw, dh = (E - W) / 2, (N - S) / 2
@@ -1133,141 +1392,15 @@ def _(
             f = max(1.0, (FTW_FETCH_DEG2 / (4 * dw * dh)) ** 0.5)
         return cw - dw * f, ch - dh * f, cw + dw * f, ch + dh * f
 
-    def _fetch_fields(files, fyear, W, S, E, N):
-        """Blocking parquet read on fcon -> Arrow (geometry as WKB)."""
-        _sql = fields_sql(files, W, S, E, N, fyear)
-        # read_all(): .arrow() alone is a LAZY reader and the read would happen
-        # on the caller's thread at CREATE TABLE time (no concurrency at all)
-        return fcon.sql(
-            f"SELECT id, area_m2, ST_AsWKB(geometry) AS wkb FROM ({_sql})"
-        ).arrow().read_all()
-
-    def _adopt_fetch(fut, fyear, pw, ps, pe, pn):
-        """A finished fetch future -> polygon table on mcon + cache entry.
-        Runs on the serve thread (mcon is single-threaded under con_lock)."""
-        arrow = fut.result()
-        n = HOLD.get("fb_n", 0)
-        HOLD["fb_n"] = n + 1
-        fbt = f"fb_{n}"
-        mcon.register(f"_arrow_{n}", arrow)
-        mcon.sql(
-            f"""CREATE OR REPLACE TABLE {fbt} AS
-                SELECT id, area_m2, ST_GeomFromWKB(wkb) AS geometry
-                FROM _arrow_{n}"""
-        )
-        mcon.unregister(f"_arrow_{n}")
-        cache = HOLD.setdefault("fcache", {})
-        cache[(fyear, round(pw, 3), round(ps, 3), round(pe, 3), round(pn, 3))] = fbt
-        if len(cache) > 6:
-            _old = next(iter(cache))
-            _ot = cache.pop(_old)
-            try:
-                mcon.sql(f"DROP TABLE IF EXISTS {_ot}")
-            except Exception:
-                pass
-        return fbt, (pw, ps, pe, pn)
-
-    def _fields_cache(W, S, E, N):
-        """(polygon table on mcon, its box) covering the box for _fyear: a
-        cached padded fetch that contains it, a finished background prefetch
-        that does, else a new padded fetch (blocking; the caller runs the
-        CDL centre scan on mcon while it is in flight). Also queues a WIDER
-        prefetch (2x the padded box) in the pool so the next miss finds the
-        row groups warm in fcon's httpfs cache and lands as a table."""
-        cache = HOLD.setdefault("fcache", {})
-        pf = HOLD.get("prefetch")
-        if pf is not None and (pf[0].done() or (
-                pf[1] == _fyear and pf[2] <= W and pf[3] <= S and pf[4] >= E and pf[5] >= N)):
-            # finished, or still in flight but covering this box: adopt it
-            # (waiting beats starting a second read of the same row groups)
-            HOLD["prefetch"] = None
-            try:
-                _adopt_fetch(*pf)
-            except Exception:
-                pass
-        for (_fy, _w, _s, _e, _n), _t in cache.items():
-            if _fy == _fyear and _w <= W and _s <= S and _e >= E and _n >= N:
-                return _t, (_w, _s, _e, _n), None
-        pw, ps, pe, pn = _padded(W, S, E, N)
-        _files = ftw_files(mcon, pw, ps, pe, pn)   # ftw_states lives on mcon
-        fut = _pool.submit(_fetch_fields, _files, _fyear, pw, ps, pe, pn)
-        return None, (pw, ps, pe, pn), fut
-
-    def _queue_prefetch(W, S, E, N):
-        """After a cold miss: fetch a ring twice as wide in the background."""
-        if HOLD.get("prefetch") is not None:
-            return
-        cw, ch = (W + E) / 2, (S + N) / 2
-        dw, dh = (E - W), (N - S)   # 2x each side of the padded box
-        pw, ps, pe, pn = cw - dw, ch - dh, cw + dw, ch + dh
-        cache = HOLD.setdefault("fcache", {})
-        if any(_fy == _fyear and _w <= pw and _s <= ps and _e >= pe and _n >= pn
-               for (_fy, _w, _s, _e, _n) in cache):
-            return
-        _files = ftw_files(mcon, pw, ps, pe, pn)
-        fut = _pool.submit(_fetch_fields, _files, _fyear, pw, ps, pe, pn)
-        HOLD["prefetch"] = (fut, _fyear, pw, ps, pe, pn)
-
-    def _ftw_tables_at(T, k, W, S, E, N):
-        """(fields table, lookup table) for table prefix T at level k. The
-        lookup is built ONCE over the cached polygon box (not the serve box),
-        so pans inside it are hits; keyed per (year, base, level, that box)."""
-        B = 10 if T == "cdl10_" else 30
-        lk = HOLD.setdefault("fb", {})
-        for (_fy, _bb, _k, _w, _s, _e, _n), _v in lk.items():
-            if (_fy, _bb, _k) == (_fyear, B, k) and _w <= W and _s <= S and _e >= E and _n >= N:
-                return _v
-        fbt, (pw, ps, pe, pn), fut = _fields_cache(W, S, E, N)
-        x0, y0, x1, y1 = to5070(mcon, pw, ps, pe, pn)
-        n = HOLD.get("lk_n", 0)
-        HOLD["lk_n"] = n + 1
-        # the CDL centres of the padded box, scanned while the parquet read
-        # (if any) is in flight on the other connection
-        pxt = f"px_{n}"
-        mcon.sql(
-            f"""CREATE OR REPLACE TABLE {pxt} AS
-                SELECT DISTINCT y, x,
-                       ST_Transform(ST_Point(x, y), 'EPSG:5070', 'EPSG:4326',
-                                    always_xy := true) AS pt
-                FROM {T}{k}
-                WHERE year = 2025
-                  AND x BETWEEN {x0} AND {x1} AND y BETWEEN {y0} AND {y1}"""
-        )
-        cold = fut is not None
-        if cold:
-            fbt, _ = _adopt_fetch(fut, _fyear, pw, ps, pe, pn)
-        lkt = f"lk_{n}"
-        mcon.sql(
-            f"""CREATE OR REPLACE TABLE {lkt} AS
-                SELECT f.id, p.y, p.x
-                FROM {fbt} f JOIN {pxt} p ON ST_Contains(f.geometry, p.pt)"""
-        )
-        mcon.sql(f"DROP TABLE IF EXISTS {pxt}")
-        key = (_fyear, B, k, round(pw, 3), round(ps, 3), round(pe, 3), round(pn, 3))
-        lk[key] = (fbt, lkt)
-        if len(lk) > 8:
-            _old = next(iter(lk))
-            _ot = lk.pop(_old)
-            try:
-                mcon.sql(f"DROP TABLE IF EXISTS {_ot[1]}")
-            except Exception:
-                pass
-        if cold:
-            _queue_prefetch(pw, ps, pe, pn)
-        return lk[key]
-
-    def _ftw_tables(W, S, E, N, k):
-        return _ftw_tables_at(_T, k, W, S, E, N)
-
     def _ftw_grid(px_m, W, S, E, N):
         """The FTW field cells (P >= 0.5) for a PADDED box, cached per (year,
-        level, box) as a table of grid indexes; the disagreement query joins
-        it. Returns (table, res, factor)."""
+        level, box) as a table of grid indexes. Returns (table, res, factor,
+        the box it covers)."""
         f = 4 if px_m < 120 else 16
         cache = HOLD.setdefault("gcache", {})
         for (_fy, _f, _w, _s, _e, _n), _t in cache.items():
             if (_fy, _f) == (_fyear, f) and _w <= W and _s <= S and _e >= E and _n >= N:
-                return _t, ftw_grid_sql(px_m, _fyear, W, S, E, N)[1], f
+                return _t, ftw_grid_sql(px_m, _fyear, W, S, E, N)[1], f, (_w, _s, _e, _n)
         pw, ps, pe, pn = _padded(W, S, E, N)
         _gsql, _res, _f = ftw_grid_sql(px_m, _fyear, pw, ps, pe, pn)
         n = HOLD.get("g_n", 0)
@@ -1282,7 +1415,52 @@ def _(
                 mcon.sql(f"DROP TABLE IF EXISTS {_ot}")
             except Exception:
                 pass
-        return gt, _res, _f
+        return gt, _res, _f, (pw, ps, pe, pn)
+
+    def _ftw_lookup_at(T, k, W, S, E, N):
+        """lk_n(y, x): the CDL pixel centres of table prefix T at level k that
+        fall in a FTW field cell, built ONCE over the grid's (padded) box so
+        pans inside it are hits; keyed per (year, base, level, that box)."""
+        B = 10 if T == "cdl10_" else 30
+        lk = HOLD.setdefault("fb", {})
+        for (_fy, _bb, _k, _w, _s, _e, _n), _v in lk.items():
+            if (_fy, _bb, _k) == (_fyear, B, k) and _w <= W and _s <= S and _e >= E and _n >= N:
+                return _v
+        gt, res, f, (pw, ps, pe, pn) = _ftw_grid(B * k, W, S, E, N)
+        x0, y0, x1, y1 = to5070(mcon, pw, ps, pe, pn)
+        n = HOLD.get("lk_n", 0)
+        HOLD["lk_n"] = n + 1
+        lkt = f"lk_{n}"
+        mcon.sql(
+            f"""CREATE OR REPLACE TABLE {lkt} AS
+                WITH p AS (
+                    SELECT DISTINCT y, x,
+                           ST_Transform(ST_Point(x, y), 'EPSG:5070', 'EPSG:4326',
+                                        always_xy := true) AS pt
+                    FROM {T}{k}
+                    WHERE year = 2025
+                      AND x BETWEEN {x0} AND {x1} AND y BETWEEN {y0} AND {y1})
+                SELECT p.y, p.x
+                FROM p JOIN {gt} g
+                  ON floor((ST_X(p.pt) + 180) / {res})::BIGINT = g.ix
+                 AND floor(({FTW_Y0} - ST_Y(p.pt)) / {res})::BIGINT = g.iy"""
+        )
+        key = (_fyear, B, k, round(pw, 3), round(ps, 3), round(pe, 3), round(pn, 3))
+        lk[key] = lkt
+        if len(lk) > 8:
+            _old = next(iter(lk))
+            _ot = lk.pop(_old)
+            try:
+                mcon.sql(f"DROP TABLE IF EXISTS {_ot}")
+            except Exception:
+                pass
+        return lkt
+
+    def _ftw_lookup(W, S, E, N, k):
+        return _ftw_lookup_at(_T, k, W, S, E, N)
+
+    def _tile_z(vs):
+        return int(min(FTW_TILE_ZMAX, max(8, math.floor(vs["zoom"]))))
 
     _LUT = HOLD.get("lut")
     if _LUT is None:
@@ -1294,48 +1472,26 @@ def _(
     for _code, (_nm, _hx, _c3) in DIS.items():
         _DIS_LUT[_code] = _c3
 
-    def _paint(k, x0, y0, x1, y1, W, S, E, N, where, dis, fbt):
+    def _paint(k, x0, y0, x1, y1, W, S, E, N, where, dis, rings=None):
         """One PNG from `cur` (x, y, crop_type, cls): colours by class LUT or
-        by disagreement class; FTW rings drawn when fbt is given."""
+        by disagreement class; FTW outlines (tile polylines) drawn on top."""
         rows = mcon.sql(
             f"SELECT x, y, {'cls' if dis else 'crop_type'} AS c FROM cur t WHERE TRUE{where}"
         ).fetchnumpy()
         codes = np.asarray(rows["c"])
         rgb = (_DIS_LUT if dis else _LUT)[codes]
-        rings = None
-        if fbt is not None:
-            _tol = _B * k / 2 / 111_000
-            rings = rings_from_geojson(mcon.sql(
-                f"""SELECT ST_AsGeoJSON(ST_SimplifyPreserveTopology(geometry, {_tol}))
-                    FROM {fbt}
-                    WHERE ST_XMin(geometry) < {E} AND ST_XMax(geometry) > {W}
-                      AND ST_YMin(geometry) < {N} AND ST_YMax(geometry) > {S}"""
-            ).fetchall(), json.loads)
         url, bounds, nbytes = render_view(
             np.asarray(rows["x"], dtype=np.float64), np.asarray(rows["y"], dtype=np.float64),
             rgb, x0, y0, x1, y1, float(_B * k), W, S, E, N, rings=rings,
         )
         return url, bounds, len(codes), nbytes
 
-    def _ftw_warm(W, S, E, N, k, dis):
-        """True when everything a FTW frame needs is already cached (no
-        parquet / grid fetch ahead), so stage 1 can be skipped."""
-        fc = HOLD.get("fcache", {})
-        poly = any(_fy == _fyear and _w <= W and _s <= S and _e >= E and _n >= N
-                   for (_fy, _w, _s, _e, _n) in fc)
-        pf = HOLD.get("prefetch")
-        if not poly and pf is not None and pf[0].done() and pf[1] == _fyear \
-                and pf[2] <= W and pf[3] <= S and pf[4] >= E and pf[5] >= N:
-            poly = True
-        if not poly and _fields:
-            return False
-        if dis:
-            f = 4 if _B * k < 120 else 16
-            gc = HOLD.get("gcache", {})
-            if not any((_fy, _f) == (_fyear, f) and _w <= W and _s <= S and _e >= E and _n >= N
-                       for (_fy, _f, _w, _s, _e, _n) in gc):
-                return False
-        return True
+    def _ftw_warm(W, S, E, N, k):
+        """True when the P(field) grid a FTW frame needs is already cached."""
+        f = 4 if _B * k < 120 else 16
+        gc = HOLD.get("gcache", {})
+        return any((_fy, _f) == (_fyear, f) and _w <= W and _s <= S and _e >= E and _n >= N
+                   for (_fy, _f, _w, _s, _e, _n) in gc)
 
     def _stages(vs):
         """Blocking generator: one or two (url, bounds, legend, line) frames
@@ -1397,18 +1553,17 @@ def _(
             # a cold FTW miss keeps the previous picture up and says so; the
             # frame lands when the fetch does (a first "everything" frame that
             # then snapped to the clipped one read as wrong: Stephen)
-            if (fields or dis) and not _ftw_warm(W, S, E, N, k, dis):
+            if (fields or dis) and not _ftw_warm(W, S, E, N, k):
                 _say((HOLD.get("last_line") or "") + " · fetching FTW…")
-            # ---- stage 2 (or the only stage): the real frame
-            _join, _fbt = "", None
+            _join = ""
             if fields:
-                _fbt, _lkt = _ftw_tables(W, S, E, N, k)
+                _lkt = _ftw_lookup(W, S, E, N, k)
                 _join = f"JOIN {_lkt} l USING (y, x)"
             if not dis:
                 mcon.sql(f"CREATE OR REPLACE TABLE cur AS {_crop_sql(_join)}")
                 legend = _crop_legend()
             else:
-                _gt, _res, _f = _ftw_grid(_B * k, W, S, E, N)
+                _gt, _res, _f, _gbox = _ftw_grid(_B * k, W, S, E, N)
                 mcon.sql(
                     f"""
                     CREATE OR REPLACE TABLE cur AS
@@ -1440,9 +1595,14 @@ def _(
                     for code, (nm, hx, _c3) in DIS.items()
                 ]
                 HOLD["dis_split"] = {code: 100 * _cnt.get(code, 0) / _tot for code in DIS}
-            url, bounds, npx, nbytes = _paint(k, x0, y0, x1, y1, W, S, E, N, _sel_px, dis, _fbt)
+            _rings, _nt, _tz = None, 0, 0
+            if fields:
+                _tz = _tile_z(vs)
+                _rings, _nt, _nmiss = ftw_tile_rings(
+                    ftw_states_in(mcon, W, S, E, N), _fyear, W, S, E, N, _tz)
+            url, bounds, npx, nbytes = _paint(k, x0, y0, x1, y1, W, S, E, N, _sel_px, dis, _rings)
             line = _line(npx, nbytes,
-                         (f" · FTW {_fyear} fields" if fields else "")
+                         (f" · FTW {_fyear} fields · {_nt} tiles z{_tz}" if fields else "")
                          + (f" · disagreement vs P(field) at {10 * _f} m" if dis else ""))
             memo[key] = (url, bounds, legend, line)
             if len(memo) > 24:
@@ -1604,7 +1764,7 @@ def _(
             fields = _fields and (E - W) * (N - S) <= FTW_BOX_DEG2
             _join = ""
             if fields:
-                _fbt, _lkt = _ftw_tables(W, S, E, N, k)
+                _lkt = _ftw_lookup(W, S, E, N, k)
                 _join = f"JOIN {_lkt} l USING (y, x)"
             _sel_px = _sel_sql.replace("crop_type", "t.crop_type") if not _dis else ""
             rows = mcon.sql(
@@ -1624,8 +1784,8 @@ def _(
             _k30 = max(1, min(256, 2 ** round(math.log2(max(_B * k / 30, 1)))))
             _join30 = ""
             if fields:
-                _fbt30, _lkt30 = _ftw_tables(W, S, E, N, _k30) if _B == 30 else \
-                    _ftw_tables_at("cdl_", _k30, W, S, E, N)
+                _lkt30 = _ftw_lookup(W, S, E, N, _k30) if _B == 30 else \
+                    _ftw_lookup_at("cdl_", _k30, W, S, E, N)
                 _join30 = f"JOIN {_lkt30} l USING (y, x)"
             _t_tl = time.time()
             _tl_codes = [r[3] for r in rows[:6]]
@@ -1647,12 +1807,15 @@ def _(
                     for code, (nm, _hx, _c3) in DIS.items()
                 )
             if fields:
-                _nf = mcon.sql(
-                    f"""SELECT count(*), sum(area_m2) / 4046.8564 FROM {_fbt} f
-                        WHERE ST_XMin(f.geometry) < {E} AND ST_XMax(f.geometry) > {W}
-                          AND ST_YMin(f.geometry) < {N} AND ST_YMax(f.geometry) > {S}"""
-                ).fetchone()
-                extra = (f"{_nf[0]:,} FTW {_fyear} fields · {(_nf[1] or 0) / 1e3:,.1f}k acres"
+                _gt, _res, _f, _gbox = _ftw_grid(_B * k, W, S, E, N)
+                _ncell = mcon.sql(
+                    f"""SELECT count(*) FROM {_gt}
+                        WHERE ix BETWEEN floor(({W} + 180) / {_res}) AND floor(({E} + 180) / {_res})
+                          AND iy BETWEEN floor(({FTW_Y0} - {N}) / {_res}) AND floor(({FTW_Y0} - {S}) / {_res})"""
+                ).fetchone()[0]
+                _cell_ac = (10 * _f / 1000) ** 2 * ACRES_PER_KM2
+                extra = (f"FTW {_fyear} field area in view {_ncell * _cell_ac / 1e3:,.1f}k acres"
+                         f" (P(field) ≥ 0.5 at {10 * _f} m)"
                          + (" · " + extra if extra else ""))
         mode = "fields" if fields else "off"
         total = sum(r[2] for r in rows) or 1

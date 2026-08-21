@@ -605,6 +605,23 @@ duckdb as a backend"). Full recon and numbers in `docs/ftw-cdl-notes.md`.
   change the serve again without a measurement from his screen (which of: the
   map drags on pan = browser; the status sits on "camera…" = kernel; the
   picture lands then the page stutters = CPU).
+- **2026-08-20 LATE: THE MAP NO LONGER READS THE PARQUET.** Stephen's call
+  after a three-way benchmark (table in `docs/ftw-cdl-notes.md`): the clip
+  is the P(field) >= 0.5 grid from the probability Zarr (the read
+  disagreement already makes; `lk_n(y, x)` = CDL centres binned into field
+  cells, once per (table, level, grid box)), the outlines are the per-state
+  PMTiles (new cell: counties film's PMTiles/MVT reader by copy, sync
+  obstore in a thread pool, tile zoom = floor(camera zoom) capped 13, raw
+  tiles on disk under tmp, seam segments dropped, polylines NOT closed by
+  render_view), and the parquet serves the SQL cells only, through
+  DuckDB's `cache_httpfs` community extension (`HTTPFS_CACHE_DIR`, byte
+  ranges kept on disk across connections and restarts). fcon, the fetch
+  pool, the prefetch and the ST_Contains lookup are gone. Driven: fields on
+  cold 6-7 s, pans 0.6-1.1 s on a grid-cache hit, 2.5-3.9 s on a miss
+  (raster + lookup, never the wire). With fields ON, disagreement's orange
+  cannot appear (same grid as the clip). Layer still the bitmap for this
+  round; polygons from `6b816ac` are the agreed revert if it does not feel
+  right on his screen. Not yet flown by him.
 - **TODO, Stephen's (not now): picking.** Click a pixel or field to see who says
   what ("who says who's growing what"). He expects it to need the lonboard
   bundle patch (two-layer ids) and does not want that; the HRRR counties film's
