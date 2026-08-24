@@ -907,6 +907,11 @@ def _(
         cov = np.where(np.isnan(agree), 1.0, COV_MIN + (1 - COV_MIN) * np.clip(agree, 0, 1))
         geo = _rings_table(cells, _scaled(coords, lens, cov), lens, box)
         geo_full = _rings_table(cells, coords, lens, box)
+        # highlight disagreement: coverage inverted too (the least-backed cells
+        # full-size and solid, the agreeing ones small and faint), else the two
+        # cues point opposite ways and the map reads as pale blobs with bold dots
+        cov_inv = np.where(np.isnan(agree), COV_MIN, COV_MIN + (1 - COV_MIN) * (1 - np.clip(agree, 0, 1)))
+        geo_inv = _rings_table(cells, _scaled(coords, lens, cov_inv), lens, box)
         lap("hex")
         rgb = np.array([CLASSES.get(int(c), ("?", (128, 128, 128)))[1] for c in cls], np.uint8)
         alpha_agree = np.where(
@@ -944,7 +949,7 @@ def _(
             if len(a_ok) else f"{n:,} cells · NLCD only"
         ) + " (" + " ".join(f"{k} {v:.1f}" for k, v in _lap.items()) + ")"
         return {
-            "cells": cells, "geo": geo, "geo_full": geo_full, "fill": fill,
+            "cells": cells, "geo": geo, "geo_full": geo_full, "geo_inv": geo_inv, "fill": fill,
             "cls": cls, "clu": clu, "agree": agree, "has_aef": has_aef, "score": score,
         }
 
@@ -1352,7 +1357,10 @@ def _(
         fr = HOLD["frame"]
         if fr is None or HOLD["paint"] == "raster":
             return
-        geo = fr["geo"] if HOLD["paint"] == "agreement" else fr["geo_full"]
+        if HOLD["paint"] == "agreement":
+            geo = fr["geo_inv"] if HOLD["inv"] else fr["geo"]
+        else:
+            geo = fr["geo_full"]
         with layer.hold_sync():
             if HOLD["geo_sent"] is not geo:
                 layer._rows_per_chunk = max(1, geo.num_rows)
