@@ -363,3 +363,8 @@ in a bespoke anywidget on the HRRR counties film's chassis.
   frame on hide and refolded on show ("it didn't come back"). COV_FLAT back to
   1.0 in both notebooks. Driven: hide / show / raster / NLCD H3 / hide /
   clusters, screenshots, zero console errors.
+- Pick outline: gold PathLayer from `cellToBoundary`, colour kept. Overfill
+  measured: mesh radius right (523 m vs 531 m avg edge, res 8; 1,384 vs 1,406
+  at res 7); at overfill 1.0 cells tile exactly at the centre with a hairline
+  at the far edge; 1.08 shows dark overlap seams. 1.02. The uniform gaps in
+  Stephen's screenshot were COV_FLAT 0.8 in a stale kernel.

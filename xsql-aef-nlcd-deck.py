@@ -1279,7 +1279,8 @@ def _(anywidget, asyncio, traitlets):
         import {MapboxOverlay} from "https://esm.sh/@deck.gl/mapbox@9.3.10?deps=@deck.gl/core@9.3.10";
         import {ColumnLayer, BitmapLayer} from "https://esm.sh/@deck.gl/layers@9.3.10?deps=@deck.gl/core@9.3.10";
         import {TileLayer, H3HexagonLayer} from "https://esm.sh/@deck.gl/geo-layers@9.3.10?deps=@deck.gl/core@9.3.10,@deck.gl/extensions@9.3.10,@deck.gl/layers@9.3.10,@deck.gl/mesh-layers@9.3.10";
-        import {latLngToCell, getResolution} from "https://esm.sh/h3-js@4.5.0";
+        import {latLngToCell, getResolution, cellToBoundary} from "https://esm.sh/h3-js@4.5.0";
+        import {PathLayer} from "https://esm.sh/@deck.gl/layers@9.3.10?deps=@deck.gl/core@9.3.10";
 
         const STYLES = {
           labels: "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
@@ -1370,11 +1371,15 @@ def _(anywidget, asyncio, traitlets):
             const c8 = raw.colors, v8 = raw.cov;
             colors = c8 && c8.byteLength === N * 4 ? new Uint8Array(c8) : null;
             cov = v8 && v8.byteLength === N * 4 ? new Float32Array(v8) : null;
-            // OVERFILL: deck's low-precision H3 mode draws every cell with the shape
-            // of the cell at the viewport centre, so cells away from it leave hairline
-            // gaps at coverage 1 (measured: thin diagonal slivers across a field of
-            // cultivated crops). A few percent of overlap hides them.
-            if (cov) { const f = cfg.overfill || 1.03; for (let i = 0; i < cov.length; i++) cov[i] *= f; }
+            // OVERFILL: deck's low-precision H3 mode draws every cell with the mesh of
+            // the cell at the viewport centre (measured right: 523 m radius at res 8
+            // against a 531 m average edge), so cells tile exactly at the centre and
+            // drift to a hairline gap towards the edges of a wide view. 2% overlap
+            // covers the drift without visible overlap seams at ALPHA_FLAT; more
+            // (1.08 was tried) shows dark seams where translucent cells overlap.
+            // (The uniform ~7% gaps Stephen saw were COV_FLAT 0.8 in a kernel that
+            // had not been reloaded after the revert to 1.0.)
+            if (cov) { const f = cfg.overfill || 1.02; for (let i = 0; i < cov.length; i++) cov[i] *= f; }
             dataObj = N && colors && cov ? {
               length: N,
               attributes: {
@@ -1439,6 +1444,19 @@ def _(anywidget, asyncio, traitlets):
               pickable: true,
               beforeId: cfg.labels_slot || "watername_ocean",
             }));
+            // the picked cell: its own colour stays, a gold outline from its boundary
+            if (cfg.hit && hexIndex.has(cfg.hit)) {
+              let ring = null;
+              try { ring = cellToBoundary(cfg.hit, true); } catch (e) { ring = null; }
+              if (ring) out.push(new PathLayer({
+                id: "picked",
+                data: [ring],
+                getPath: (d) => d,
+                getColor: [255, 200, 40, 255],
+                widthUnits: "pixels", getWidth: 3, widthMinPixels: 2,
+                beforeId: cfg.labels_slot || "watername_ocean",
+              }));
+            }
             return out;
           }
           function update() { if (overlay) overlay.setProps({layers: layers()}); }
@@ -1655,7 +1673,8 @@ def _(
         fr = HOLD["frame"]
         if fr is None:
             return
-        rgba = fr["fill"](HOLD["paint"], HOLD["sel"], HOLD["hit"], HOLD["inv"])
+        rgba = fr["fill"](HOLD["paint"], HOLD["sel"], None, HOLD["inv"])
+        _cfg(hit=format(HOLD["hit"], "x") if HOLD["hit"] else None)
         cov = fr["coverage"](HOLD["paint"], HOLD["inv"])
         with deck.hold_sync():
             if HOLD["sent"] is not fr:

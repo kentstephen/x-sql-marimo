@@ -906,8 +906,17 @@ frame-output changed. Runs from the root. Things to know:
   scratchpad). `highPrecision: false` always (`"auto"` falls back to the
   polygon path at res <= 5 or with a pentagon, and that path has no
   coverage). Low-precision mode draws every cell with the centre cell's
-  shape, so full-coverage cells leave hairline diagonal gaps; the widget
-  multiplies the coverage array by `config.overfill` (1.03).
+  mesh (measured RIGHT: 523 m radius at res 8 vs a 531 m average edge;
+  cells tile exactly at the viewport centre, a hairline opens towards the
+  edges of a wide view); the widget multiplies the coverage array by
+  `config.overfill` (1.02; 1.08 was tried and showed dark overlap seams at
+  ALPHA_FLAT 190). Stephen's screenshot of "strokes" around every cell was
+  COV_FLAT 0.8 in a kernel not reloaded after the revert to 1.0: constants
+  edits need a reload of the notebook.
+- **Pick = a GOLD OUTLINE** (`#ffc828`, 3 px PathLayer from h3-js
+  `cellToBoundary` of the hit, `config.hit`), the cell's own colour kept
+  (the white recolour is gone from `fill()`'s use). Stephen: "gold or
+  something noticeable instead of just white".
 - **COPY BYTES TRAITS THE MOMENT THEY CHANGE.** Reading a Bytes trait from a
   0 ms timer after its `change:` event found nothing (the event handler saw
   46,440 bytes; the deferred `loadCells` left N = 0; the same function run by
