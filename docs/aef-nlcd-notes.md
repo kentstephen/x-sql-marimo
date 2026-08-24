@@ -184,3 +184,17 @@ Open: the mosaic rungs (res 10-11) are not yet driven here (same code as the
 one-shot); VIEW_W/H is a guess (the ruler port); cluster colours shift per view
 (holding prototypes/clusters from a wider fold is the next knob); the SQL cells
 under the map run on the current frame behind a run button.
+
+### The south-up COGs (same day)
+
+The first deep zoom read agreement 86-98% below 0.5 at res 9-10 (worse than
+random: with labels uncorrelated to the vectors the best OTHER prototype beats
+the own one most of the time) while res 11 from the mosaic read 14%. The AEF
+COGs' transform is `| 10 0 418080 | 0 +10 5406720 |`: y pixel size POSITIVE,
+origin at the SOUTH edge, `bounds` reporting bottom > top. The window and the
+pixel centres now go through the affine transform. Re-driven: res 5 30% below
+0.5 (p50 0.99), res 6 18%, res 7 19%, res 8 17%, res 9 15%, res 10 18%, res
+11 14%. Also `MOSAIC_MIN_RES` 11 (res 10 from the 40 m overview; its padded box
+would be ~1.8 GB raw from the mosaic). Full rung table: open 21 s; res 6 3.3 s;
+res 7 8.6 s; res 8 12.3 s (107k cells); res 9 6.9 s; res 10 7.3 s; res 11
+6.6 s (mosaic, 202 MB, 118k cells).

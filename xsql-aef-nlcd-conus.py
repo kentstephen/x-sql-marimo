@@ -25,9 +25,9 @@ every time the map settles, the ground under it is folded to H3 at the resolutio
 the zoom deserves, NLCD from its own overview pyramid and AlphaEarth from whichever
 of its two source.coop copies can serve that rung:
 
-  res 10-11 (zoomed in)   tge-labs/aef-mosaic   the 10 m Zarr, native, one window
-  res 5-9   (zoomed out)  tge-labs/aef          the per-tile COGs' OVERVIEWS (mean
-                                                embeddings at 80..2560 m), many files
+  res 11    (zoomed in)   tge-labs/aef-mosaic   the 10 m Zarr, native, one window
+  res 5-10  (zoomed out)  tge-labs/aef          the per-tile COGs' OVERVIEWS (mean
+                                                embeddings at 40..2560 m), many files
 
 Both folds are the h3 UDF in DataFusion; NLCD's majority class and AlphaEarth's
 mean vector meet on the cell. Per view: class prototypes, the agreement (sigmoid
@@ -168,8 +168,11 @@ def _():
     # up (native 10 m); below that the COG overview index (0 = 20 m, 1 = 40 m,
     # 2 = 80 m, 3 = 160 m, 4 = 320 m, 5 = 640 m, 6 = 1280 m, 7 = 2560 m), picked
     # for ~15-50 overview pixels per cell.
-    MOSAIC_MIN_RES = 10
-    AEF_LEVEL_FOR_RES = {5: 7, 6: 6, 7: 4, 8: 3, 9: 2}
+    # res 10 stays on the COGs (40 m): its padded box is ~2,800 km2, ~1.8 GB raw
+    # from the mosaic (a minute from home); res 11 (~360 km2, ~230 MB) is the
+    # first rung the mosaic serves in ~10 s.
+    MOSAIC_MIN_RES = 11
+    AEF_LEVEL_FOR_RES = {5: 7, 6: 6, 7: 4, 8: 3, 9: 2, 10: 1}
     AEF_MAX_FILES = 2500  # more files than this and the view gets NLCD only
 
     # The fold box is the flat camera footprint, padded, from a GUESSED canvas size
@@ -590,29 +593,37 @@ async def _(
         return _open[rel]
 
     async def _read_cog(i, li, box):
-        """One file's overview window over the box: (int8 (64, h, w), lon, lat) or None."""
+        """One file's overview window over the box: (int8 (64, h, w), lon, lat) or None.
+
+        Rows and columns go through the file's AFFINE TRANSFORM, not its bounds:
+        these COGs are stored SOUTH-UP (transform e = +10, origin at the south
+        edge; `bounds` reports bottom > top), and a north-up assumption mirrors
+        every tile within its 82 km (measured 2026-08-24: agreement 86-98% below
+        0.5 on the COG rungs, worse than random, against 14% from the mosaic).
+        """
         g = await _get(_PATHS[i])
         ov = g.overviews[li]
         H, W = ov.shape
-        L, B, R, T = g.bounds
-        T, B = max(T, B), min(T, B)
-        px = (R - L) / W
+        t = g.transform
+        sx, sy = t.a * (g.width / W), t.e * (g.height / H)  # signed overview pixel sizes
         fwd, inv = _tf(_CRS[i])
         W_, S_, E_, N_ = box
         lons = np.concatenate([np.linspace(W_, E_, 5), np.full(5, E_), np.linspace(E_, W_, 5), np.full(5, W_)])
         lats = np.concatenate([np.full(5, N_), np.linspace(N_, S_, 5), np.full(5, S_), np.linspace(S_, N_, 5)])
         ux, uy = fwd.transform(lons, lats)
-        c0 = max(0, int((np.nanmin(ux) - L) / px))
-        c1 = min(W, int(math.ceil((np.nanmax(ux) - L) / px)))
-        r0 = max(0, int((T - np.nanmax(uy)) / px))
-        r1 = min(H, int(math.ceil((T - np.nanmin(uy)) / px)))
+        cc = (np.asarray(ux) - t.c) / sx
+        rr = (np.asarray(uy) - t.f) / sy
+        c0 = max(0, int(np.floor(np.nanmin(cc))))
+        c1 = min(W, int(np.ceil(np.nanmax(cc))))
+        r0 = max(0, int(np.floor(np.nanmin(rr))))
+        r1 = min(H, int(np.ceil(np.nanmax(rr))))
         if c1 <= c0 or r1 <= r0:
             return None
         async with _sem:
             ra = await ov.read(window=Window(col_off=c0, row_off=r0, width=c1 - c0, height=r1 - r0))
         a = np.asarray(np.ma.filled(ra.as_masked(), AEF_NODATA)).reshape(64, r1 - r0, c1 - c0)
-        xs = L + (np.arange(c0, c1) + 0.5) * px
-        ys = T - (np.arange(r0, r1) + 0.5) * px
+        xs = t.c + (np.arange(c0, c1) + 0.5) * sx
+        ys = t.f + (np.arange(r0, r1) + 0.5) * sy
         X, Y = np.meshgrid(xs, ys)
         lon, lat = inv.transform(X, Y)
         return a, lon, lat
