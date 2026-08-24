@@ -1,7 +1,7 @@
 # /// script
 # requires-python = ">=3.13"
 # dependencies = [
-#     "marimo==0.24.0",
+#     "marimo",
 #     "datafusion>=54.0.0",
 #     "xarray-sql[duckdb]==0.4.0rc1",
 #     "xarray",
@@ -119,6 +119,8 @@ def _():
 @app.cell(hide_code=True)
 def _(mo):
     mo.md("""
+    [![Open in molab](https://molab.marimo.io/molab-shield.svg)](https://molab.marimo.io/github/github.com/kentstephen/x-sql-marimo/blob/main/xsql-aef-nlcd-conus.py)
+
     # NLCD, backed or not by AlphaEarth, across CONUS
 
     Fly anywhere in the lower 48. When the map settles, the ground in view is folded
