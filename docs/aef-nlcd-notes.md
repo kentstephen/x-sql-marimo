@@ -293,11 +293,24 @@ everything for every paint; a `labels` toggle. What held and what did not:
   (60 m and finer) render a 1x1 transparent PNG. Level per zoom measured: z1 at
   5.x, z2 at 6.x, z3 at 7.x, z4 at 8.x, z5 at 9.x, so z5 lines up with
   HEX_ZOOM 9.
-- OPEN: `NLCD raster` selected at deep zoom after an H3 paint shows nothing (the
-  transparent tiles stay cached). A nudge of `max_zoom` did not refetch; a fresh
-  RasterLayer via `deck.layers` did not remount in the drive (deforest's route
-  works there for a constants edit; here the swap happens inside a ctl
-  handler). Workaround: zoom out past 9 and back in with the raster paint on.
-  Stephen: "you're done with this."
+- CLOSED (late 2026-08-24): `NLCD raster` at deep zoom after an H3 paint showed
+  nothing, and sometimes raster and hexes both showed. Both were one defect.
+  From lonboard 0.16's bundle: the raster layer's `layerProps` returns
+  `data: null` and `getTileData` is a class field, so deck's TileLayer never
+  hits `dataChanged` and never re-requests cached tiles on any trait change
+  (`max_zoom`, `extent`, `_tile_matrix_set` all go through `setOptions` and
+  `tile.layers = null`, sublayers rebuilt from the CACHED content). And every
+  lonboard layer's deck id under marimo is `undefined` (`model_id` missing), so
+  `deck.layers = [new_raster, layer]` matched the new raster to the old one by
+  id: deck transferred state, kept the tileset, kept its cache. Fix: remove the
+  raster (`deck.layers = [layer]`), `await asyncio.sleep(SWAP_GAP)` (0.4 s) so
+  the browser applies that pass, then add the fresh layer. Driven (toggles.py):
+  raster at zoom 11 after agreement, off, NLCD H3, clusters, zoom out under an
+  H3 paint (raster shows), off wide (basemap only), raster wide. No console
+  errors. The same two-pass swap is how any second tile layer (S2 imagery
+  under the hexes) would have to come and go: one raster layer at a time.
+- Paint buttons are toggles: the active one clicked again sends `paint: null`;
+  kernel parks the hexes and removes the raster (basemap only). NLCD H3 and
+  clusters H3 at COV_FLAT 0.8 / ALPHA_FLAT 190 (`geo_flat`).
 - Kernel-side tile cache `(x, y, z) -> Tile` (4,000 entries) so any raster
   layer rebuild does not refetch from S3.

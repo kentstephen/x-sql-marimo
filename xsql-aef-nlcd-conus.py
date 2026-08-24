@@ -33,8 +33,9 @@ of its two source.coop copies can serve that rung:
 Both folds are the h3 UDF in DataFusion; NLCD's majority class and AlphaEarth's
 mean vector meet on the cell. Per view: class prototypes, the agreement (sigmoid
 over the own-vs-runner-up cosine margin), spherical k-means clusters. The strip
-under the map has the three paints (agreement: alpha + coverage; NLCD: regular
-hexagons; AlphaEarth: the clusters), the pickable legend, a click that lights the
+under the map has the four paints as toggles, none required (NLCD raster; agreement:
+alpha + coverage; NLCD and AlphaEarth clusters: regular hexagons at coverage
+0.8), the pickable legend, a click that lights the
 hexagon and tells its story. Prototypes and clusters are PER VIEW: they say what
 is typical of a class HERE, and cluster colours are arbitrary per fold.
 
@@ -213,7 +214,14 @@ def _():
                    "#009E73", "#D55E00", "#999999", "#7B4EA3", "#6B3F1D"]
     ALPHA_MIN, ALPHA_MAX = 30, 235
     COV_MIN = 0.30
+    # NLCD H3 / AlphaEarth clusters H3: regular hexagons, slightly shrunken and a
+    # little below the agreement paint's top alpha (Stephen: coverage 0.8, lower opacity)
+    COV_FLAT = 0.80
+    ALPHA_FLAT = 190
     DIM_ALPHA = 22
+    # seconds between removing the raster layer and adding its replacement: deck
+    # must see the removal as its own pass (see _swap_raster in the wiring cell)
+    SWAP_GAP = 0.4
 
     NLCD_PREFIX = "kylebarron/usgs-landcover/annual-nlcd/c1/v1/cu/mosaic"
     NLCD_NODATA = 250
@@ -250,6 +258,7 @@ def _():
         AEF_RES,
         AEF_X0,
         AEF_Y0,
+        ALPHA_FLAT,
         ALPHA_MAX,
         ALPHA_MIN,
         BASE_RES,
@@ -257,6 +266,7 @@ def _():
         CELL_BUDGET,
         CLASSES,
         CLUSTER_HEX,
+        COV_FLAT,
         COV_MIN,
         DIM_ALPHA,
         HEX_ZOOM,
@@ -268,6 +278,7 @@ def _():
         MIN_RES,
         MOSAIC_MIN_RES,
         NLCD_LEVEL_FOR_RES,
+        SWAP_GAP,
         NLCD_NODATA,
         NLCD_PREFIX,
         PAD,
@@ -505,8 +516,8 @@ async def _(
     def make_nlcd_raster(under_hexes):
         """A FRESH RasterLayer (deck caches tiles per layer instance, and a tile
         rendered transparent stays transparent, so switching between the raster
-        paint and an H3 paint at deep zoom needs a new layer: inserted through
-        deck.layers, the deforest rule)."""
+        paint and an H3 paint at deep zoom needs a new layer: removed and re-added
+        through deck.layers in two passes, `_swap_raster` in the wiring cell)."""
         return RasterLayer(
             _tile_matrix_set=_tms,
             _crs=_g.crs,
@@ -813,10 +824,12 @@ async def _(
 
 @app.cell
 def _(
+    ALPHA_FLAT,
     ALPHA_MAX,
     ALPHA_MIN,
     CLASSES,
     CLUSTER_HEX,
+    COV_FLAT,
     COV_MIN,
     DIM_ALPHA,
     K_CLUSTERS,
@@ -964,7 +977,8 @@ def _(
         coords, lens = _parse_wkb(blobs)
         cov = np.where(np.isnan(agree), 1.0, COV_MIN + (1 - COV_MIN) * np.clip(agree, 0, 1))
         geo = _rings_table(cells, _scaled(coords, lens, cov), lens)
-        geo_full = _rings_table(cells, coords, lens)
+        # the flat paints (NLCD H3, clusters H3): every hexagon at COV_FLAT
+        geo_flat = _rings_table(cells, _scaled(coords, lens, np.full(n, COV_FLAT)), lens)
         # highlight disagreement: coverage inverted too (the least-backed cells
         # full-size and solid, the agreeing ones small and faint), else the two
         # cues point opposite ways and the map reads as pale blobs with bold dots
@@ -991,7 +1005,7 @@ def _(
             if paint == "agreement":
                 a = alpha_inv if inv else alpha_agree
             else:
-                a = np.full(len(cls), ALPHA_MAX, np.uint8)
+                a = np.full(len(cls), ALPHA_FLAT, np.uint8)
             if sel:
                 a = np.where(np.isin(key, list(sel)), a, DIM_ALPHA).astype(np.uint8)
             rgba = np.concatenate([c, a[:, None]], axis=1)
@@ -1006,7 +1020,7 @@ def _(
             if len(a_ok) else f"{n:,} cells · NLCD only"
         ) + " (" + " ".join(f"{k} {v:.1f}" for k, v in _lap.items()) + ")"
         return {
-            "cells": cells, "geo": geo, "geo_full": geo_full, "geo_inv": geo_inv, "fill": fill,
+            "cells": cells, "geo": geo, "geo_flat": geo_flat, "geo_inv": geo_inv, "fill": fill,
             "cls": cls, "clu": clu, "agree": agree, "has_aef": has_aef, "score": score,
         }
 
@@ -1090,7 +1104,8 @@ def _(anywidget, traitlets):
           const mkPaint = (key, text, title) => {
             const b = document.createElement("button");
             b.textContent = text; b.title = title; b.style.cssText = btnCss;
-            b.onclick = () => { paint = key; sel.clear(); stylePaint(); send("set"); renderLegend(); };
+            // a toggle: the active paint clicked again turns every paint off (null)
+            b.onclick = () => { paint = paint === key ? null : key; sel.clear(); stylePaint(); send("set"); renderLegend(); };
             return [key, b];
           };
           const paintBtns = [
@@ -1326,7 +1341,8 @@ def _(CartoStyle, HOME, LABELS_SLOT, Map, MaplibreBasemap, PolygonLayer, np, pa)
     )
     HOLD = {
         "placeholder": layer.table,  # what the hexagon layer holds below HEX_ZOOM
-        "raster": None,  # the RasterLayer the wiring last inserted
+        "raster": None,  # the RasterLayer the wiring last inserted (None: no paint)
+        "raster_mode": None,  # None / "raster" / "hex": what that layer renders
         "frame": None, "geo_sent": None, "box": None, "res": None, "vs": None,
         "busy": False, "pending": None, "task": None, "loop": None,
         "paint": "agreement", "sel": set(), "hit": None, "memo": {}, "h_cam": None, "h_ctl": None,
@@ -1353,6 +1369,7 @@ def _(
     HOLD,
     HOME,
     SETTLE,
+    SWAP_GAP,
     aef_fold,
     asyncio,
     build_frame,
@@ -1391,13 +1408,31 @@ def _(
         except Exception:
             pass
 
-    # The raster goes in through deck.layers FROM HERE (the deforest rule): a
-    # constants edit rebuilds it and rewires without destroying the Map.
-    if HOLD["raster"] is None or HOLD.get("raster_src") is not nlcd_raster:
-        # first wiring, or the NLCD cell re-ran: a fresh raster for the current paint
-        HOLD["raster"] = make_nlcd_raster(HOLD["paint"] != "raster")
-        HOLD["raster_src"] = nlcd_raster
+    def _raster_mode(paint):
+        """What the raster layer must be for a paint: absent (no paint), opaque at
+        every level (the raster paint), or transparent at the fine levels (an H3
+        paint, the hexagons over the basemap)."""
+        return paint if paint in (None, "raster") else "hex"
+
+    async def _swap_raster(paint):
+        """One raster layer PER MODE, swapped in two passes. deck caches tiles per
+        layer instance and never re-requests them on a trait change (lonboard's
+        raster JS passes `data: null`, and only a data change resets a TileLayer's
+        tileset), so a paint change needs a fresh layer. Under marimo every
+        lonboard layer's deck id is `undefined`, so replacing the raster in ONE
+        `deck.layers` assignment reads to deck as an update of the same layer and
+        the old tile cache (blank or opaque) stays: that was the open defect.
+        Remove first, let the browser apply the removal, then add."""
+        if HOLD["raster"] is not None:
+            deck.layers = [layer]
+            HOLD["raster"] = None
+            await asyncio.sleep(SWAP_GAP)
+        HOLD["raster_mode"] = _raster_mode(paint)
+        if paint is None:
+            return
+        HOLD["raster"] = make_nlcd_raster(paint != "raster")
         deck.layers = [HOLD["raster"], layer]
+
 
     def _hexes_off(msg):
         """Below HEX_ZOOM: the picture shows, the hexagon layer holds its placeholder."""
@@ -1434,12 +1469,12 @@ def _(
     def _paint():
         """Hand the current frame's hexagons + colours to the one layer."""
         fr = HOLD["frame"]
-        if fr is None or HOLD["paint"] == "raster":
+        if fr is None or HOLD["paint"] in (None, "raster"):
             return
         if HOLD["paint"] == "agreement":
             geo = fr["geo_inv"] if HOLD["inv"] else fr["geo"]
         else:
-            geo = fr["geo_full"]
+            geo = fr["geo_flat"]
         with layer.hold_sync():
             if HOLD["geo_sent"] is not geo:
                 layer._rows_per_chunk = max(1, geo.num_rows)
@@ -1453,6 +1488,9 @@ def _(
 
     async def _serve(vs, force=False):
         vsd = _vsd(vs)
+        if HOLD["paint"] is None:
+            _hexes_off(f"zoom {vsd['zoom']:.1f} · no paint (basemap only) · pick one in the strip")
+            return
         if HOLD["paint"] == "raster":
             _hexes_off(f"zoom {vsd['zoom']:.1f} · NLCD raster (its own tiles) · pick an H3 paint for the fold")
             return
@@ -1530,11 +1568,18 @@ def _(
             loop = HOLD.get("loop")
             return asyncio.run_coroutine_threadsafe(coro, loop) if loop else None
 
+    # The raster goes in through deck.layers FROM HERE (the deforest rule): a
+    # constants edit rebuilds it and rewires without destroying the Map.
+    if HOLD.get("raster_src") is not nlcd_raster:
+        # first wiring, or the NLCD cell re-ran: a fresh raster for the current paint
+        HOLD["raster_src"] = nlcd_raster
+        HOLD["task_raster"] = _spawn(_swap_raster(HOLD["paint"]))
+
     def _hexes_wanted(vs):
         """Whether the hexes will be on at this camera: decides, BEFORE deck's tile
         requests for the new zoom are served, whether the fine NLCD tiles render
         transparent (the fold lands seconds later; by then the tiles are cached)."""
-        return HOLD["paint"] != "raster" and _vsd(vs)["zoom"] >= HEX_ZOOM
+        return HOLD["paint"] not in (None, "raster") and _vsd(vs)["zoom"] >= HEX_ZOOM
 
     def _on_camera(change):
         vs = change["new"]
@@ -1628,23 +1673,25 @@ def _(
         except Exception:
             return
         _was = HOLD["paint"]
-        HOLD["paint"] = c.get("paint", "agreement")
+        HOLD["paint"] = c.get("paint", "agreement")  # None when every paint is off
         HOLD["sel"] = {int(x) for x in c.get("sel", [])}
         HOLD["inv"] = bool(c.get("inv", False))
         fr = HOLD["frame"]
-        if HOLD["paint"] != _was and (HOLD["paint"] == "raster" or _was == "raster"):
-            # into or out of the raster paint: park the hexes, or fold the current view
+        if _raster_mode(HOLD["paint"]) != HOLD.get("raster_mode", _raster_mode(_was)):
+            # the raster layer changes (none / opaque / under the hexes): swap it in
+            # two passes, then park the hexes or fold the current view
             vs = HOLD["vs"] if HOLD["vs"] is not None else dict(HOME)
             raster_state["hexes"] = _hexes_wanted(vs)
             raster_state["raster_paint"] = HOLD["paint"] == "raster"
-            # a fresh raster layer for this paint (deck's per-layer tile cache holds
-            # the other paint's renders); inserted through deck.layers
-            HOLD["raster"] = make_nlcd_raster(HOLD["paint"] != "raster")
-            deck.layers = [HOLD["raster"], layer]
-            if HOLD["busy"]:
-                HOLD["pending"] = vs
-            else:
-                HOLD["task"] = _spawn(_serve(vs, force=True))
+
+            async def _swap_then_serve():
+                await _swap_raster(HOLD["paint"])
+                if HOLD["busy"]:
+                    HOLD["pending"] = vs
+                else:
+                    await _serve(vs, force=True)
+
+            HOLD["task"] = _spawn(_swap_then_serve())
             return
         if c.get("act") == "dres":
             HOLD["dres"] = max(-2, min(2, int(c.get("dres", 0))))
@@ -1665,7 +1712,7 @@ def _(
             )
             return
         if c.get("act") == "analyze":
-            hud.widget.panel = _analyze_html(fr) if fr is not None else "<span style='opacity:.7'>no fold in view (zoom in past 9, or pick an H3 paint)</span>"
+            hud.widget.panel = _analyze_html(fr) if fr is not None else "<span style='opacity:.7'>no fold in view (zoom in past 9 with an H3 paint on)</span>"
             return
         if c.get("act") == "click" and fr is not None:
             try:

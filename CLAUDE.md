@@ -799,11 +799,26 @@ width, docks into fullscreen.
   level, because deck requests tiles BEFORE `view_state` syncs to the kernel,
   so any camera-set flag lost the race and opaque tiles were cached under the
   hexes (measured with a render log: deck draws level z ~ floor(zoom) - 4
-  here; z5 = 60 m starts at zoom 9 = HEX_ZOOM). **OPEN DEFECT:** picking
-  `NLCD raster` at deep zoom after an H3 paint shows only the basemap: deck
-  keeps the transparent tiles; a fresh RasterLayer swapped in via
-  `deck.layers` (the deforest route) did not remount in the drive. Zoom out
-  past 9 and back, or pick the raster paint before zooming in, and it shows. H3 cells on an icosahedron
+  here; z5 = 60 m starts at zoom 9 = HEX_ZOOM). **THE RASTER SWAP IS TWO
+  PASSES (2026-08-24, late; closed the "raster at deep zoom after an H3 paint
+  shows nothing" / "both show" defect).** Root cause, read from lonboard's
+  bundle: the raster JS layer passes `data: null` and a stable `getTileData`,
+  so NO trait change ever makes deck re-request tiles (a TileLayer resets its
+  tileset only on `dataChanged`), and under marimo every lonboard layer's
+  deck id is `undefined`, so replacing the raster in ONE `deck.layers`
+  assignment reads to deck as an update of the SAME layer and the old tile
+  cache (blank or opaque) survives. `_swap_raster` in the wiring cell does
+  `deck.layers = [layer]`, sleeps `SWAP_GAP` (0.4 s) so the browser applies
+  the removal as its own pass, then adds a fresh RasterLayer for the mode
+  (absent / opaque everywhere / blank at the fine levels). Driven: every
+  state paints (raster at zoom 11 after an H3 paint, H3 after raster, off
+  at both zooms, raster back at zoom 5). **Paints are toggles, none
+  required**: clicking the active paint sends `paint: null` (HOLD["paint"]
+  None: hexes parked, raster removed, basemap only, status "no paint").
+  **NLCD H3 and clusters H3 draw at `COV_FLAT` 0.8 coverage and
+  `ALPHA_FLAT` 190** (`geo_flat` in the frame; `geo_full` is gone), the
+  basemap showing between the hexagons; agreement keeps its own scaling.
+  H3 cells on an icosahedron
 edge have 8-10 vertices: the ring builder parses WKB by its own vertex count
 (the two white diagonals across CONUS on his screen were those cells
 dropped). Numbers and design in `docs/aef-nlcd-notes.md`.
