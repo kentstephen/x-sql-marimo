@@ -765,6 +765,40 @@ zoomable map); runs from the root. Full record in `docs/aef-nlcd-notes.md`.
   the same notebook (data side solved in `docs/imagery-and-terrain-notes.md`;
   render side never stabilized; a second deck layer under marimo is the risk).
 
+`xsql-aef-nlcd-conus.py` (2026-08-24, DRIVEN HEADLESS, NOT YET FLOWN BY STEPHEN)
+is the agreement notebook as a CAMERA-DRIVEN fold anywhere in CONUS: NLCD from
+its overview pyramid (the nlcd-zoom tile reader by copy) and AlphaEarth from
+whichever copy can serve the rung, joined per view, scored, clustered, drawn as
+scaled hexagon polygons with the same strip (three paints, legend, click).
+Numbers and design in `docs/aef-nlcd-notes.md`.
+
+- **Two AlphaEarth sources by rung.** res 10-11: the mosaic (native 10 m window).
+  res 5-9: the `tge-labs/aef` COGs' OVERVIEWS (`AEF_LEVEL_FOR_RES` picks 80 m at
+  res 9 up to 2560 m at res 5), one `async_geotiff` open per 82 km UTM tile
+  (cached), the overview window per tile computed through pyproj (declared in
+  the header; the Albers side stays closed-form), pixels from all tiles stacked
+  into ONE 1-D xarray Dataset (`i` dim, 64 int8 columns + lat/lon) and folded
+  by ONE DataFusion query with the h3 UDF (dequantize in SQL: `signum`, not
+  `sign`, which DataFusion lacks). The year's CONUS index slice is cached as
+  parquet under tmp (`CACHE_DIR`). `AEF_MAX_FILES` (2500) caps a view; over it,
+  NLCD only with "zoom in for AlphaEarth".
+- **Measured (driven Chrome, from home):** open at CONUS zoom 4 = res 5, NLCD L5
+  16.4 Mpx 2.0 s + AEF 1,993 files at 2560 m 20.6 s + frame 0.2 s = 21 s,
+  31.5k cells; zoom to res 6: 293 files at 1280 m, 4.6 s; res 7 over Colorado:
+  84 files at 320 m, 9.7 s (58k cells). A zoom inside the served box is held.
+  Folded frames memoised (12), COG handles cached for the session.
+- **Camera loop = deforest's** (settle 0.35 s, coalescing, `_spawn`, every trait
+  assignment on the loop; the frame build in an executor). The map cell is
+  placeholder + literal HOME and never re-runs; the wiring cell observes
+  `deck.view_state` and `hud.widget.ctl` with traitlets observers (un-observed
+  via `HOLD["h_cam"]` / `HOLD["h_ctl"]` on re-run) and does NOT rely on marimo
+  re-running on ctl. Same lonboard lessons as the one-shot: arro3 Table on
+  assignment, `_rows_per_chunk` reset per swap.
+- **Ladder:** BASE_RES 7 at ZOOM0 6.2, PER_RES 1.4, res 5-11, then coarsened
+  until the padded box fits `CELL_BUDGET` 150k hexagons (polygons: the budget is
+  vertices). VIEW_W/H is still the 1400x720 guess (the HFP ruler is not ported).
+  Prototypes and k-means are PER VIEW: cluster colours change between folds.
+
 `xsql-mapterhorn-explorer.py` (EXPERIMENTAL, open defects below) draws Mapterhorn terrain
 worldwide as extruded H3 columns: the DEM half of the parked
 `archive/xsql-duckdb-terrain-h3.py` standing alone, on the canopy notebook's chassis

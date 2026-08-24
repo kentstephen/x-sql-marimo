@@ -644,7 +644,9 @@ def _(ALPHA_MAX, ALPHA_MIN, CLASSES, CLUSTER_HEX, DIM_ALPHA, cells, np, pa):
     _pal = np.array([tuple(int(h[i:i + 2], 16) for i in (1, 3, 5)) for h in CLUSTER_HEX], np.uint8)
     _rgb_clu = _pal[_clu % len(_pal)]
 
-    def fill_colors(paint, sel):
+    _cellid = cells["cell"].to_numpy()
+
+    def fill_colors(paint, sel, hit=None):
         """RGBA per cell. paint: 'agreement' (NLCD rgb, alpha by agreement),
         'nlcd' (NLCD rgb, flat), 'clusters' (the k-means palette, flat). sel (a
         set of legend codes; class codes < 100, cluster codes 100 + k; empty = all)
@@ -657,6 +659,9 @@ def _(ALPHA_MAX, ALPHA_MIN, CLASSES, CLUSTER_HEX, DIM_ALPHA, cells, np, pa):
         if sel:
             a = np.where(np.isin(key, list(sel)), a, DIM_ALPHA).astype(np.uint8)
         rgba = np.concatenate([rgb, a[:, None]], axis=1)
+        if hit is not None:
+            # the clicked hexagon lights up: white, full alpha (no stroke pass)
+            rgba[_cellid == hit] = (255, 255, 255, 255)
         return pa.FixedSizeListArray.from_arrays(pa.array(rgba.ravel()), 4)
 
     return (fill_colors,)
@@ -964,6 +969,11 @@ def _(
     _paint = _c.get("paint", "agreement")
     _sel = {int(x) for x in _c.get("sel", [])}
     _geo = geo if _paint == "agreement" else geo_full  # scaled hexagons, or the regular ones
+    _hit = HOLD.get("hit")
+    if _c.get("act") != "click":
+        pass
+    else:
+        _hit = None  # resolved below; the paint follows
     with layer.hold_sync():
         if HOLD["geo"] is not _geo:
             # The trait takes an arro3 Table on assignment (the constructor converts
@@ -975,7 +985,7 @@ def _(
             layer._rows_per_chunk = max(1, _geo.num_rows)
             layer.table = ArrowTable.from_arrow(_geo)
             HOLD["geo"] = _geo
-        layer.get_fill_color = fill_colors(_paint, _sel)
+        layer.get_fill_color = fill_colors(_paint, _sel, _hit)
 
     _cls = cells["cls"].to_numpy()
     _ag = cells["agree"].to_numpy(zero_copy_only=False)
@@ -1039,7 +1049,10 @@ def _(
             ).fetchone()
             if _r is None:
                 _story = f"<span style='opacity:.7'>({_lat:.4f}, {_lon:.4f}): no cell here</span>"
+                HOLD["hit"] = None
             else:
+                HOLD["hit"] = _cell if HOLD.get("hit") != _cell else None  # click again clears
+                layer.get_fill_color = fill_colors(_paint, _sel, HOLD["hit"])
                 _nm, _ag, _alt, _pur, _hom, _ck = _r
                 _story = (
                     f"<b>{_nm}</b> at {_lat:.4f}, {_lon:.4f}: cluster {_ck}, agreement "

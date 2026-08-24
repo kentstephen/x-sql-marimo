@@ -151,3 +151,36 @@ view and a 4-notch zoom both paint, no console errors.
   7 = evergreen/shrub mix; 8 = water. The seeding needs `1 - cos` clipped at
   zero (float32 cosines pass 1). Driven: paint switch, chips, click story with
   the cluster id.
+
+## `xsql-aef-nlcd-conus.py` (2026-08-24): the camera-driven version
+
+Stephen: "go ahead and build conus". Design decisions taken without asking (he
+said no questions needed): two AEF sources by rung (mosaic res 10-11, COG
+overviews res 5-9), a file budget above which the view is NLCD only, prototypes
+and clusters per view, pyproj for the UTM tiles.
+
+The COG path: index parquet (year slice cached under tmp, 1,993 CONUS files for
+2024), per-tile open (cached; 64 concurrent), per-tile overview window from the
+box transformed into the tile's UTM, pixel centres back to lat/lon with pyproj,
+all tiles' pixels stacked into ONE 1-D Dataset (int8 x 64 + lat/lon) and folded
+by ONE DataFusion query (dequantize in SQL with `signum`; DataFusion has no
+`sign`). Overview per res: 9 -> 80 m, 8 -> 160 m, 7 -> 320 m, 6 -> 1280 m,
+5 -> 2560 m.
+
+Driven (headless Chrome, from home):
+
+| view | res | NLCD | AEF | total |
+|---|---|---|---|---|
+| CONUS, zoom 4 (open) | 5 | L5 16.4 Mpx, 2.0 s | 1,993 files @ 2560 m, 2.0 Mpx, 20.6 s | 21 s, 31.5k cells |
+| +3 notches | 5 | held | held | 0 |
+| +6 | 6 | L4 10.5 Mpx 1.4 s | 293 files @ 1280 m, 4.3 s | 4.6 s, 35.7k cells |
+| +9 (Colorado) | 7 | L4 (cached tiles) 0.2 s | 84 files @ 320 m, 4.5 Mpx, 8.8 s | 9.7 s, 58k cells |
+
+Agreement at CONUS p50 0.81 (44% below 0.5); over Colorado at res 7 p50 0.35,
+56% below 0.5: at 320 m herbaceous, shrub and the forests are one continuum to
+the embedding and NLCD's cuts through it are the faded ground.
+
+Open: the mosaic rungs (res 10-11) are not yet driven here (same code as the
+one-shot); VIEW_W/H is a guess (the ruler port); cluster colours shift per view
+(holding prototypes/clusters from a wider fold is the next knob); the SQL cells
+under the map run on the current frame behind a run button.
