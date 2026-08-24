@@ -133,3 +133,12 @@ view and a 4-notch zoom both paint, no console errors.
   anywhere (kernel or console).
 - Basemap DarkMatter with labels (Stephen: faint colours read better on dark).
 - marimo 0.24.0 across the repo; the crops black-map defect did not reproduce.
+- Third pass: paint buttons `agreement` / `NLCD` (regular hexagons: `geo_full`
+  swapped in, same row count, `_rows_per_chunk` reset each swap); deck picking
+  replaced by the strip's geometric click (worked once on his screen, then
+  never; `pickable=False`); Positron again. Driven: chip isolate, "× all", NLCD
+  paint, and a map click resolving to "Evergreen forest at 38.8361, -121.0647:
+  agreement 0.98, NLCD purity 1.00, homogeneity 0.979".
+- Stephen's next idea (open): a THIRD tier, the embedding on its own. Options
+  laid out: nearest-prototype class in NLCD's palette; k-means clusters with
+  a categorical palette and NLCD-composition legend; PCA-1 / similarity ramp.

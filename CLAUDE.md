@@ -727,9 +727,17 @@ zoomable map); runs from the root. Full record in `docs/aef-nlcd-notes.md`.
   browser -> kernel, `status`/`legend`/`panel` kernel -> browser, the ONE strip
   element re-parented into the fullscreen element and back (so the strip under
   the map and the fullscreen bar are the same element with the same state),
-  killOld of stale strips, bbox-toolbar hiding. Here: a "fade by agreement"
-  checkbox and a pickable legend (click isolates, multi-select, "× all"); the
-  panel shows the isolated classes' numbers. No marimo-native controls.
+  killOld of stale strips, bbox-toolbar hiding. Here: paint buttons
+  (`agreement` = fade + coverage; `NLCD` = regular hexagons, flat colours, a
+  second full-size hexagon table swapped in), a pickable legend (click
+  isolates, multi-select, "× all"); the panel shows a clicked cell's story and
+  the isolated classes' numbers. No marimo-native controls. **Picking is the
+  strip's click, not deck's**: `pickable=True` showed the feature panel ONCE
+  and never again on Stephen's screen (the counties film and crops saw the
+  same), so the skeleton's capture-phase canvas click sends pixel + rect,
+  the kernel unprojects against `deck.view_state` (Web Mercator, pitch 0),
+  `coordinates_to_cells` at RES, one DuckDB lookup. Basemap back to Positron
+  (DarkMatter tried for an hour at his ask, then "back to positron").
 - **THE MAP CELL DEPENDS ON IMPORTS ONLY** (Stephen: the recurring "change a
   param and the map does not render" lonboard problem). It builds the
   PolygonLayer on a 1-row placeholder with a literal opening camera; the wiring

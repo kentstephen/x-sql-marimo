@@ -37,10 +37,11 @@ The map is NLCD in NLCD's own colours. Agreement is drawn as ALPHA and as CELL
 COVERAGE (each hexagon scaled about its centre): agreeing ground is solid and full,
 disagreeing ground is faint and small, so the basemap shows through where the two
 datasets tell different stories. Not extruded. The strip under the map (the
-cdl-ftw-zarr-marimo HudControls skeleton) has a fade checkbox and a pickable legend
-(click a class to isolate it); clicking a hexagon opens lonboard's feature panel
-with the class, its agreement and the class it looks more like. Basemap DarkMatter
-(Stephen: low-opacity colours read better on dark).
+cdl-ftw-zarr-marimo HudControls skeleton) has paint buttons (agreement / regular
+NLCD hexagons) and a pickable legend
+(click a class to isolate it); clicking the map puts that hexagon's story in the
+strip's panel (class, agreement, the class it looks more like, purity, homogeneity),
+by unprojecting the click kernel-side, not deck picking. Basemap Positron.
 
 The score is CONSISTENCY, not correctness: the labels are NLCD's own, so a class
 mislabelled the same way everywhere looks perfectly typical. Prototypes are local to
@@ -589,8 +590,9 @@ def _(COV_MIN, cells, cells_to_wkb_polygons, np, pa):
         fields = [geom, *(pa.field(k, v.type) for k, v in props.items())]
         return pa.Table.from_arrays(arrays, schema=pa.schema(fields))
 
-    geo = hex_table(hex_xy)
-    return (geo,)
+    geo = hex_table(hex_xy)  # scaled by agreement
+    geo_full = hex_table(_xy)  # regular hexagons, for the NLCD paint
+    return geo, geo_full
 
 
 @app.cell
@@ -621,11 +623,14 @@ def _(anywidget, traitlets):
         """Controls + legend + status UNDER the map: the strip from
         ~/dev/projects/cdl-ftw-zarr-marimo (cdl-ftw.py / aef-similarity.py /
         aef-agreement.py keep one skeleton in sync; this is that skeleton trimmed
-        to this notebook). One row: a fade checkbox, the pickable legend (click a
+        to this notebook). One row: the paint buttons (agreement / NLCD), the pickable legend (click a
         class to isolate it, multi-select toggles, "× all" resets); a panel line
         (the isolated classes' numbers); a status line (the reads and the score).
         Proven trait types only: `ctl` Unicode JSON browser -> kernel, `status` /
-        `legend` / `panel` Unicode kernel -> browser. The ONE strip element is
+        `legend` / `panel` Unicode kernel -> browser; the map CLICK goes through
+        `ctl` too (canvas pixel + rect, unprojected kernel-side against the synced
+        camera, resolved to the H3 cell: deck's own picking under marimo worked
+        once and never again). The ONE strip element is
         re-parented into the fullscreen element as a bottom bar and back, so the
         strip under the map and the strip in fullscreen are the same element with
         the same state. Hides lonboard's bbox toolbar."""
@@ -652,8 +657,35 @@ def _(anywidget, traitlets):
             if (title) l.title = title;
             return [l, i];
           };
-          const [labF, fade] = mk("fade by agreement", true,
-            "alpha follows agreement; off = plain NLCD (coverage stays)");
+          // paint: agreement (alpha + coverage by agreement) or NLCD (regular
+          // hexagons, flat colours)
+          const btnCss =
+            "font:12px ui-sans-serif,system-ui,sans-serif;cursor:pointer;" +
+            "padding:.1rem .45rem;border-radius:4px;border:1px solid " +
+            "rgba(127,127,127,.45);background:transparent;color:inherit";
+          let paint = "agreement";
+          const paintBox = document.createElement("span");
+          paintBox.style.cssText = "display:inline-flex;gap:.3rem;align-items:center";
+          const pl = document.createElement("span");
+          pl.textContent = "paint";
+          const mkPaint = (key, text, title) => {
+            const b = document.createElement("button");
+            b.textContent = text; b.title = title; b.style.cssText = btnCss;
+            b.onclick = () => { paint = key; stylePaint(); send("set"); };
+            return [key, b];
+          };
+          const paintBtns = [
+            mkPaint("agreement", "agreement", "alpha and hexagon size follow agreement"),
+            mkPaint("nlcd", "NLCD", "regular hexagons, NLCD's colours, no fade"),
+          ];
+          const stylePaint = () => {
+            paintBtns.forEach(([k, b]) => {
+              b.style.borderColor = k === paint ? "#2b6cb0" : "rgba(127,127,127,.45)";
+              b.style.fontWeight = k === paint ? "600" : "400";
+            });
+          };
+          stylePaint();
+          paintBox.append(pl, ...paintBtns.map(([, b]) => b));
           // the legend: classes in the box, pickable (click isolates, × all resets)
           const sel = new Set();
           const legendBox = document.createElement("div");
@@ -663,13 +695,9 @@ def _(anywidget, traitlets):
           let seq = 0, deb = null;
           const send = (act, extra) => {
             model.set("ctl", JSON.stringify(Object.assign({
-              act: act, fade: fade.checked, sel: Array.from(sel),
+              act: act, paint: paint, sel: Array.from(sel),
               n: ++seq }, extra || {})));
             model.save_changes();
-          };
-          const commit = () => {
-            clearTimeout(deb);
-            deb = setTimeout(() => send("set"), 250);
           };
           const renderLegend = () => {
             let items = [];
@@ -712,7 +740,7 @@ def _(anywidget, traitlets):
           };
           model.on("change:legend", renderLegend);
           renderLegend();
-          box.append(labF, legendBox);
+          box.append(paintBox, legendBox);
           const panel = document.createElement("div");
           panel.style.cssText =
             "font:13px ui-sans-serif,system-ui,sans-serif;padding:.15rem 0";
@@ -761,7 +789,26 @@ def _(anywidget, traitlets):
             }
           };
           document.addEventListener("fullscreenchange", onFs);
-          fade.addEventListener("change", commit);
+          // THE CLICK (the skeleton's): a capture-phase listener on the document
+          // finds the map canvas in the event's composedPath (shadow roots
+          // included), guards against drags, sends the canvas pixel + rect; the
+          // kernel unprojects it and looks the cell up. Not deck picking.
+          let downAt = null;
+          const onDown = (e) => { downAt = [e.clientX, e.clientY]; };
+          const onClick = (e) => {
+            if (wrap.dataset.dead || !el.isConnected) return;
+            const path = e.composedPath ? e.composedPath() : [e.target];
+            const cv = path.find((n) => n && n.tagName === "CANVAS");
+            if (!cv) return;
+            if (downAt && Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]) > 5) return;
+            const r = cv.getBoundingClientRect();
+            if (!r.width || !r.height) return;
+            send("click", {
+              px: e.clientX - r.left, py: e.clientY - r.top,
+              w: r.width, h: r.height });
+          };
+          document.addEventListener("pointerdown", onDown, true);
+          document.addEventListener("click", onClick, true);
           const paintS = () => { status.textContent = model.get("status") || ""; };
           model.on("change:status", paintS);
           paintS();
@@ -785,6 +832,8 @@ def _(anywidget, traitlets):
           const bboxTimer = setInterval(() => hideBbox(document), 1000);
           return () => {
             document.removeEventListener("fullscreenchange", onFs);
+            document.removeEventListener("pointerdown", onDown, true);
+            document.removeEventListener("click", onClick, true);
             clearInterval(bboxTimer);
             wrap.remove();
           };
@@ -815,17 +864,17 @@ def _(CartoStyle, Map, MaplibreBasemap, PolygonLayer, np, pa):
         get_fill_color=pa.FixedSizeListArray.from_arrays(pa.array([0, 0, 0, 0], pa.uint8()), 4),
         filled=True,
         stroked=False,
-        pickable=True,
+        pickable=False,  # deck's GPU picking under marimo worked once and never again; the strip's click does it
     )
     deck = Map(
         layers=[layer],
-        basemap=MaplibreBasemap(style=CartoStyle.DarkMatter),
+        basemap=MaplibreBasemap(style=CartoStyle.Positron),
         view_state=_home,
         height=720,
     )
     HOLD = {"geo": None}  # which hexagon table the layer currently holds
     deck  # the cell's LAST statement: what marimo displays
-    return HOLD, layer
+    return HOLD, deck, layer
 
 
 @app.cell
@@ -840,14 +889,19 @@ def _(
     ArrowTable,
     CLASSES,
     HOLD,
+    RES,
     aef_stats,
     cells,
     con,
+    coordinates_to_cells,
+    deck,
     fill_colors,
     geo,
+    geo_full,
     hud,
     json,
     layer,
+    math,
     nlcd_stats,
     np,
     score_stats,
@@ -860,19 +914,21 @@ def _(
         _c = json.loads(hud.widget.ctl or "{}")
     except Exception:
         _c = {}
-    _fade = bool(_c.get("fade", True))
+    _paint = _c.get("paint", "agreement")
+    _fade = _paint == "agreement"
     _sel = {int(x) for x in _c.get("sel", [])}
+    _geo = geo if _fade else geo_full  # scaled hexagons, or the regular ones
     with layer.hold_sync():
-        if HOLD["geo"] is not geo:
+        if HOLD["geo"] is not _geo:
             # The trait takes an arro3 Table on assignment (the constructor converts
             # pyarrow itself; assignment does not). And the constructor fixed
             # `_rows_per_chunk` from the 1-row placeholder: table AND every accessor
             # serialize in chunks of that size, so without resetting it a 39k-row
             # table crosses as 39k one-row chunks and draws nothing. One chunk
             # (the crops notebook's lesson: multi-chunk swaps striped whole bands).
-            layer._rows_per_chunk = max(1, geo.num_rows)
-            layer.table = ArrowTable.from_arrow(geo)
-            HOLD["geo"] = geo
+            layer._rows_per_chunk = max(1, _geo.num_rows)
+            layer.table = ArrowTable.from_arrow(_geo)
+            HOLD["geo"] = _geo
         layer.get_fill_color = fill_colors(_fade, _sel)
 
     _cls = cells["cls"].to_numpy()
@@ -896,6 +952,39 @@ def _(
     hud.widget.legend = json.dumps(_legend)
     hud.widget.status = "\n".join([nlcd_stats, aef_stats, score_stats])
 
+    def _unproject(vs, px, py, w, h):
+        """Web Mercator, pitch/bearing 0: canvas pixel -> lon/lat (the other repo's)."""
+        world = 512 * 2 ** vs["zoom"]
+        lon = vs["longitude"] + (px - w / 2) * 360.0 / world
+        lat0 = math.radians(vs["latitude"])
+        uy = (1 - math.log(math.tan(lat0) + 1 / math.cos(lat0)) / math.pi) / 2
+        uy = uy + (py - h / 2) / world
+        lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * uy))))
+        return lon, lat
+
+    _story = ""
+    if _c.get("act") == "click":
+        try:
+            _v = deck.view_state
+            _vs = {"longitude": float(_v.longitude), "latitude": float(_v.latitude), "zoom": float(_v.zoom)}
+            _lon, _lat = _unproject(_vs, float(_c["px"]), float(_c["py"]), float(_c["w"]), float(_c["h"]))
+            _cell = int(coordinates_to_cells(np.array([_lat]), np.array([_lon]), RES)[0].as_py())
+            _r = con.execute(
+                "SELECT name, agree, alt_name, purity, homogeneity FROM cells WHERE cell = ?", [_cell]
+            ).fetchone()
+            if _r is None:
+                _story = f"<span style='opacity:.7'>({_lat:.4f}, {_lon:.4f}): no cell here</span>"
+            else:
+                _nm, _ag, _alt, _pur, _hom = _r
+                _story = (
+                    f"<b>{_nm}</b> at {_lat:.4f}, {_lon:.4f}: agreement "
+                    + ("unscored" if _ag is None or np.isnan(_ag) else f"{_ag:.2f}")
+                    + (f", looks more like <i>{_alt}</i>" if _alt and _alt != "none" and _ag is not None and not np.isnan(_ag) and _ag < 0.5 else "")
+                    + f", NLCD purity {_pur:.2f}, homogeneity {_hom:.3f}"
+                )
+        except Exception as _e:
+            _story = f"<span style='opacity:.7'>click: {_e}</span>"
+
     if _sel:
         _rows = con.execute(
             """
@@ -906,13 +995,14 @@ def _(
             """,
             [list(_sel)],
         ).fetchall()
-        hud.widget.panel = " · ".join(
+        _selline = " · ".join(
             f"<b>{nm}</b>: {cnt:,} cells, agreement p50 {p50:.2f}, {pct:.0f}% below 0.5"
             + (f", usually looks like <i>{alt}</i>" if alt else "")
             for nm, cnt, p50, pct, alt in _rows
         )
     else:
-        hud.widget.panel = ""
+        _selline = ""
+    hud.widget.panel = "<br>".join(x for x in (_story, _selline) if x)
     return
 
 
