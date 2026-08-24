@@ -99,7 +99,7 @@ replacement scan cannot see them). Design notes in docs/hrrr-heat-hex-notes.md.
 
 import marimo
 
-__generated_with = "0.23.16"
+__generated_with = "0.24.0"
 app = marimo.App(width="full")
 
 

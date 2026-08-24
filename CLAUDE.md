@@ -685,6 +685,75 @@ duckdb as a backend"). Full recon and numbers in `docs/ftw-cdl-notes.md`.
   0.1 s. DuckDB `CASE` cannot return a `UTINYINT[N]`: colours go through a
   VALUES join.
 
+`xsql-aef-nlcd-agreement.py` (2026-08-24, HEADLESS + PLAYWRIGHT-PASSED, NOT YET
+FLOWN BY STEPHEN) is Annual NLCD 2024 coloured as it is, with each hexagon's ALPHA
+and COVERAGE (the hexagon scaled about its centre) set by how well the AlphaEarth
+Foundations embedding backs NLCD's word there. One box (Folsom Lake / Auburn
+foothills), one year, no camera fold (the conus-counties one-shot chassis with a
+zoomable map); runs from the root. Full record in `docs/aef-nlcd-notes.md`.
+
+- **AlphaEarth is on source.coop twice**: `tge-labs/aef-mosaic` (Zarr v3, one
+  sharded int8 array `(time 9, band 64, y, x)`, EPSG:4326 ~10 m, 2017-2025, NO
+  PYRAMID, inner chunk 256², shard 4096²) and `tge-labs/aef` (COGs per UTM zone
+  WITH mean-renormalised overviews). The mosaic is read via obstore's S3Store ->
+  `zarr.storage.ObjectStore` (no s3fs). Dequantize `(x/127.5)**2 * sign(x)`; the
+  vectors come back unit length, so the per-cell mean is a centroid and its norm is
+  a free homogeneity score. NLCD's mirror ends at 2024: there is no NLCD 2025.
+- **Both folds are the h3 UDF in DataFusion** (repo rule): NLCD majority class per
+  cell from 2-D lat/lon data variables (closed-form inverse Albers, no pyproj);
+  AlphaEarth as 64 variables `e00..e63` with 64 `avg()` columns. Measured: NLCD
+  read 0.7-2.3 s + fold 0.0 s; AEF 2,783² x 64 read 13-19 s (496 MB raw, the wire)
+  + fold 0.4 s; 39k cells at res 10; scores 0.1 s.
+- **The score is consistency, not correctness**: per class (>= 30 cells) the
+  prototype is the mean vector; agreement = sigmoid of (own cosine minus best other
+  cosine) / TAU 0.02. Prototypes in one box sit 0.90-0.96 apart and 37% of cells
+  flip to an adjacent NLCD word (developed open space and deciduous forest ~50%,
+  water/pasture/developed high ~10%). A full softmax was dropped (dilutes by class
+  count).
+- **Per-cell coverage needs polygons**: deck's H3HexagonLayer has one `coverage`
+  per layer, so the hexagons are a geoarrow.polygon column built from h3ronpy WKB
+  (fixed 125-byte hexagon layout, one frombuffer, vertices scaled about the centre)
+  on a PolygonLayer, `pickable=True` (Stephen: "we can't just rely on the
+  legend"): the feature panel shows class name, agreement, "looks more like",
+  NLCD purity, homogeneity. NLCD's own colormap kept (Stephen: "color the way it
+  is") on CartoStyle.DarkMatter WITH labels (his call: faint colours read better
+  on dark). SQL cells under the map: per-class table, the confusion PIVOT
+  (below-0.5 cells x runner-up class), closest prototype pairs, the 25
+  least-backed cells. DuckDB here is ONLY the marimo SQL engine for those tables
+  and the cell join; no polyfill, no dissolve, no h3 extension.
+- **The strip under the map is the cdl-ftw-zarr-marimo `HudControls` skeleton**
+  (cdl-ftw.py / aef-similarity.py / aef-agreement.py keep one skeleton in sync
+  over there; Stephen: "follow that pattern"): one anywidget, `ctl` Unicode JSON
+  browser -> kernel, `status`/`legend`/`panel` kernel -> browser, the ONE strip
+  element re-parented into the fullscreen element and back (so the strip under
+  the map and the fullscreen bar are the same element with the same state),
+  killOld of stale strips, bbox-toolbar hiding. Here: a "fade by agreement"
+  checkbox and a pickable legend (click isolates, multi-select, "× all"); the
+  panel shows the isolated classes' numbers. No marimo-native controls.
+- **THE MAP CELL DEPENDS ON IMPORTS ONLY** (Stephen: the recurring "change a
+  param and the map does not render" lonboard problem). It builds the
+  PolygonLayer on a 1-row placeholder with a literal opening camera; the wiring
+  cell assigns `layer.table` + `get_fill_color` under `hold_sync` and re-runs on
+  every constant edit and strip commit. Two lonboard facts that cost a round:
+  (1) the `table` trait accepts pyarrow in the CONSTRUCTOR but only an arro3
+  `Table` on ASSIGNMENT (`arro3.core.Table.from_arrow`); (2) the constructor
+  fixes `layer._rows_per_chunk` from its first table and every later table AND
+  accessor serializes in chunks of that size, so a placeholder-built layer sent
+  the 39k-row swap as 39k one-row chunks and drew NOTHING, silently: set
+  `layer._rows_per_chunk = geo.num_rows` before the swap (one chunk).
+- **marimo is 0.24.0 everywhere since 2026-08-24** (Stephen: "upd all the marimo
+  notebooks not in archive to the latest version"): both pyprojects, both venvs,
+  every root notebook's `__generated_with`. The 0.23.16 pin existed because 0.24.0
+  black-mapped cdl-crops on a refold; re-verified on 0.24.0 in a driven Chrome:
+  crops opens (256x, 136,833 drawn) AND refolds on wheel zoom (128x, 317,765
+  drawn); every other root notebook exports headless with 0 error lines
+  (heat-domes from the rc venv). The defect did not reproduce.
+- **TODO (Stephen)**: variable zoom for CONUS (the mosaic has no pyramid; the COG
+  mirror's overviews are the wide-view route; numbers in the notes) and Earth
+  Genome Sentinel-2 mosaics under the hexagons to inspect a faint patch from
+  the same notebook (data side solved in `docs/imagery-and-terrain-notes.md`;
+  render side never stabilized; a second deck layer under marimo is the risk).
+
 `xsql-mapterhorn-explorer.py` (EXPERIMENTAL, open defects below) draws Mapterhorn terrain
 worldwide as extruded H3 columns: the DEM half of the parked
 `archive/xsql-duckdb-terrain-h3.py` standing alone, on the canopy notebook's chassis
