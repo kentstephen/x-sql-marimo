@@ -253,3 +253,23 @@ example link ("we should incorporate his tooling when we can").
 - The live coarse AEF rungs (res 5-7 from the 2560-320 m overviews) still exist
   in `aef_fold` but are unreachable below HEX_ZOOM; the res − button can reach
   res 7 from a zoom-9 view.
+
+### Paints, analyze, strip sizing (2026-08-24, night)
+
+Stephen's asks after flying the tiles build: clearer button names; a raster-only
+paint; "hex" -> "H3" for space; "reverse" -> a clearer name; the strip fit to
+the view; and the crops notebook's "analyze what's in view" (no time series).
+
+- Paints: `NLCD raster` (tiles only, at ANY zoom: the fold is skipped while it
+  is selected and runs when an H3 paint is picked), `NLCD H3`, `agreement H3`,
+  `AlphaEarth clusters H3`; `highlight disagreement` checkbox (the inverted
+  alpha). Strip at 13px, roomier buttons, full width under the map and in the
+  fullscreen dock.
+- `analyze what's in view` / `× clear`: the panel gets the view's summary as
+  two small tables: per NLCD class (share of cells, km2 from the res's cell
+  area, agreement p50, share below 0.5, usual alternative) and per cluster
+  (share, NLCD make-up). Driven at an Iowa res-8 view: crops 84% of cells,
+  agreement 1.00, 9% below 0.5, usually pasture; developed-low 55% below 0.5.
+- Seen in the clusters paint over pure cornland: four clusters that are each
+  100% "cultivated crops": the embedding splits the one NLCD word into kinds
+  of cropland (rotation, most likely). The third tier doing its job.

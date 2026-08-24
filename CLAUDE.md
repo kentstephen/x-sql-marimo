@@ -778,9 +778,12 @@ fold proved unusable (open 21 s at home, 95 s on molab where every piece,
 CPU included, is 4-5x slower: "show something cheap like the raster, then
 when you zoom in the agreement hexes"). The raster's `opacity` is IGNORED at
 runtime (crops lesson), so a WHITE SHEET polygon (the fold box, row 0 of the
-same polygon layer) hides the tiles under the hexagons. Strip: three paints,
-a `reverse` checkbox (agreement alpha inverted: the least-backed cells solid,
-Stephen's experiment), `res − / +`, legend, click. H3 cells on an icosahedron
+same polygon layer) hides the tiles under the hexagons. Strip: four paints
+(`NLCD raster` = tiles only at any zoom, fold skipped; `NLCD H3`; `agreement
+H3`; `AlphaEarth clusters H3`), a `highlight disagreement` checkbox (agreement
+alpha inverted: the least-backed cells solid), `res − / +`, `analyze what's in
+view` / `× clear` (the crops button: per-class and per-cluster tables in the
+panel), legend, click; 13px, full width, docks into fullscreen. H3 cells on an icosahedron
 edge have 8-10 vertices: the ring builder parses WKB by its own vertex count
 (the two white diagonals across CONUS on his screen were those cells
 dropped). Numbers and design in `docs/aef-nlcd-notes.md`.

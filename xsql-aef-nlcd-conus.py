@@ -1121,7 +1121,19 @@ def _(anywidget, traitlets):
           };
           model.on("change:legend", renderLegend);
           renderLegend();
-          box.append(paintBox, resBox, legendBox);
+          // analyze what's in view (the crops notebook's button): the kernel fills
+          // the panel with the view's summary; × clear empties it
+          const anBox = document.createElement("span");
+          anBox.style.cssText = "display:inline-flex;gap:.3rem;align-items:center";
+          const anB = document.createElement("button");
+          anB.textContent = "analyze what's in view"; anB.style.cssText = btnCss;
+          anB.title = "per NLCD class in view: share, area, agreement; and the clusters' make-up";
+          anB.onclick = () => send("analyze");
+          const clB = document.createElement("button");
+          clB.textContent = "× clear"; clB.style.cssText = btnCss;
+          clB.onclick = () => send("clear");
+          anBox.append(anB, clB);
+          box.append(paintBox, resBox, anBox, legendBox);
           const panel = document.createElement("div");
           panel.style.cssText = "font:13.5px ui-sans-serif,system-ui,sans-serif;padding:.25rem 0";
           const status = document.createElement("div");
@@ -1258,6 +1270,8 @@ def _(HudControls, mo):
 @app.cell
 def _(
     ArrowTable,
+    CLASSES,
+    CLUSTER_HEX,
     HEX_ZOOM,
     HOLD,
     HOME,
@@ -1444,6 +1458,65 @@ def _(
     deck.observe(_on_camera, names="view_state")
     HOLD["h_cam"] = _on_camera
 
+    _CELL_KM2 = {5: 252.9, 6: 36.13, 7: 5.161, 8: 0.7373, 9: 0.1053, 10: 0.01505, 11: 0.00215}
+
+    def _analyze_html(fr):
+        """The view's summary as HTML for the strip's panel: every NLCD class (share
+        of cells, km2, agreement p50, share below 0.5, usual alternative) and, with
+        the embedding in, each cluster's NLCD make-up."""
+        cls, clu, agree = fr["cls"], fr["clu"], fr["agree"]
+        n = max(1, len(cls))
+        km2 = _CELL_KM2.get(HOLD["res"], 0.0)
+        a_ok = agree[~np.isnan(agree)]
+        head = (
+            f"<b>res {HOLD['res']}</b> · {n:,} cells · {n * km2:,.0f} km² · "
+            + (f"agreement p50 {np.median(a_ok):.2f}, {(a_ok < 0.5).mean() * 100:.0f}% below 0.5" if len(a_ok) else "NLCD only")
+        )
+        td = "padding:.1rem .6rem .1rem 0;white-space:nowrap"
+        rows = []
+        codes, counts = np.unique(cls, return_counts=True)
+        con.register("cur_cells", fr["cells"])
+        alts = dict(con.execute(
+            "SELECT name, mode(alt_name) FILTER (WHERE agree < 0.5) FROM cur_cells GROUP BY name"
+        ).fetchall())
+        for code, cnt in sorted(zip(codes, counts), key=lambda t: -t[1]):
+            if int(code) not in CLASSES:
+                continue
+            nm, rgb = CLASSES[int(code)]
+            a = agree[cls == code]
+            a = a[~np.isnan(a)]
+            chip = f"<span style='display:inline-block;width:10px;height:10px;border-radius:2px;background:rgb{rgb};margin-right:.35rem;vertical-align:-1px'></span>"
+            rows.append(
+                f"<tr><td style='{td}'>{chip}{nm}</td><td style='{td};text-align:right'>{100 * cnt / n:.1f}%</td>"
+                f"<td style='{td};text-align:right'>{cnt * km2:,.0f} km²</td>"
+                + (f"<td style='{td};text-align:right'>{np.median(a):.2f}</td><td style='{td};text-align:right'>{(a < 0.5).mean() * 100:.0f}%</td>"
+                   f"<td style='{td};opacity:.75'>{alts.get(nm) or ''}</td>" if len(a) else f"<td style='{td}' colspan=3><span style='opacity:.6'>unscored</span></td>")
+                + "</tr>"
+            )
+        th = "padding:.1rem .6rem .1rem 0;text-align:left;opacity:.6;font-weight:500"
+        table = (
+            f"<table style='border-collapse:collapse;font-size:13px;margin:.2rem 0'><tr><th style='{th}'>NLCD class</th><th style='{th}'>of cells</th>"
+            f"<th style='{th}'>area</th><th style='{th}'>agreement p50</th><th style='{th}'>below 0.5</th><th style='{th}'>usually looks like</th></tr>"
+            + "".join(rows) + "</table>"
+        )
+        clus = ""
+        if fr["has_aef"] and len(clu):
+            items = []
+            for k in range(int(clu.max()) + 1):
+                m = clu == k
+                if not m.any():
+                    continue
+                cc, cn = np.unique(cls[m], return_counts=True)
+                top = sorted(zip(cn, cc), reverse=True)[:3]
+                mix = ", ".join(f"{100 * nn / m.sum():.0f}% {CLASSES.get(int(c), ('?',))[0]}" for nn, c in top)
+                chip = f"<span style='display:inline-block;width:10px;height:10px;border-radius:2px;background:{CLUSTER_HEX[k % len(CLUSTER_HEX)]};margin-right:.35rem;vertical-align:-1px'></span>"
+                items.append(f"<tr><td style='{td}'>{chip}cluster {k}</td><td style='{td};text-align:right'>{100 * m.sum() / n:.1f}%</td><td style='{td};opacity:.75'>{mix}</td></tr>")
+            clus = (
+                f"<table style='border-collapse:collapse;font-size:13px;margin:.2rem 0'><tr><th style='{th}'>AlphaEarth cluster</th><th style='{th}'>of cells</th><th style='{th}'>made of (NLCD)</th></tr>"
+                + "".join(items) + "</table>"
+            )
+        return head + table + clus
+
     def _unproject(vs, px, py, w, h):
         world = 512 * 2 ** vs["zoom"]
         lon = vs["longitude"] + (px - w / 2) * 360.0 / world
@@ -1479,6 +1552,12 @@ def _(
                 HOLD["pending"] = vs
             else:
                 HOLD["task"] = _spawn(_serve(vs, force=True))
+            return
+        if c.get("act") == "clear":
+            hud.widget.panel = ""
+            return
+        if c.get("act") == "analyze":
+            hud.widget.panel = _analyze_html(fr) if fr is not None else "<span style='opacity:.7'>no fold in view (zoom in past 9, or pick an H3 paint)</span>"
             return
         if c.get("act") == "click" and fr is not None:
             try:
