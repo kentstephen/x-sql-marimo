@@ -142,3 +142,12 @@ view and a 4-notch zoom both paint, no console errors.
 - Stephen's next idea (open): a THIRD tier, the embedding on its own. Options
   laid out: nearest-prototype class in NLCD's palette; k-means clusters with
   a categorical palette and NLCD-composition legend; PCA-1 / similarity ramp.
+- Fourth pass: the third paint, `AlphaEarth` = spherical k-means (K_CLUSTERS 10,
+  k-means++ seed, numpy, ~0.2 s) over the cell vectors, Okabe-Ito+2 palette,
+  legend chips = clusters with their NLCD make-up. In the foothills box the
+  clusters read as: 0 = low/medium developed; 1-3 = open-space developed mixed
+  with herbaceous (the developed-open-space confusion, seen from the other
+  side); 4 = evergreen (+deciduous); 5 = herbaceous; 6 = shrub/deciduous mix;
+  7 = evergreen/shrub mix; 8 = water. The seeding needs `1 - cos` clipped at
+  zero (float32 cosines pass 1). Driven: paint switch, chips, click story with
+  the cluster id.

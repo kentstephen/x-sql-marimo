@@ -729,7 +729,10 @@ zoomable map); runs from the root. Full record in `docs/aef-nlcd-notes.md`.
   the map and the fullscreen bar are the same element with the same state),
   killOld of stale strips, bbox-toolbar hiding. Here: paint buttons
   (`agreement` = fade + coverage; `NLCD` = regular hexagons, flat colours, a
-  second full-size hexagon table swapped in), a pickable legend (click
+  second full-size hexagon table swapped in; `AlphaEarth` = the embedding on
+  its own, spherical k-means `K_CLUSTERS` 10 in numpy on an Okabe-Ito palette,
+  legend chips = clusters with their NLCD make-up, Stephen's "third tier"), a
+  pickable legend (click
   isolates, multi-select, "× all"); the panel shows a clicked cell's story and
   the isolated classes' numbers. No marimo-native controls. **Picking is the
   strip's click, not deck's**: `pickable=True` showed the feature panel ONCE

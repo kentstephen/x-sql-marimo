@@ -37,8 +37,9 @@ The map is NLCD in NLCD's own colours. Agreement is drawn as ALPHA and as CELL
 COVERAGE (each hexagon scaled about its centre): agreeing ground is solid and full,
 disagreeing ground is faint and small, so the basemap shows through where the two
 datasets tell different stories. Not extruded. The strip under the map (the
-cdl-ftw-zarr-marimo HudControls skeleton) has paint buttons (agreement / regular
-NLCD hexagons) and a pickable legend
+cdl-ftw-zarr-marimo HudControls skeleton) has three paints (agreement; regular NLCD
+hexagons; AlphaEarth = k-means clusters of the cell vectors, the embedding on its
+own, legend chips saying what each cluster is made of in NLCD terms) and a pickable legend
 (click a class to isolate it); clicking the map puts that hexagon's story in the
 strip's panel (class, agreement, the class it looks more like, purity, homogeneity),
 by unprojecting the click kernel-side, not deck picking. Basemap Positron.
@@ -172,6 +173,13 @@ def _():
     TAU = 0.02
     # A class needs this many cells before its mean is a prototype.
     MIN_CLASS_CELLS = 30
+    # The third paint: the embedding on its own. Spherical k-means over the cell
+    # vectors (cosine), K clusters, no labels; the legend says what each cluster
+    # is made of in NLCD terms. Cluster ids are arbitrary per run. The palette is
+    # Okabe-Ito plus two (no red-green pair; protan-safe).
+    K_CLUSTERS = 10
+    CLUSTER_HEX = ["#0072B2", "#E69F00", "#56B4E9", "#F0E442", "#CC79A7",
+                   "#009E73", "#D55E00", "#999999", "#7B4EA3", "#6B3F1D"]
 
     # The agreement -> paint mapping. Alpha and coverage both run from their floor at
     # agreement 0 to full at agreement 1.
@@ -216,7 +224,9 @@ def _():
         BOX,
         CLASSES,
         COV_MIN,
+        CLUSTER_HEX,
         DIM_ALPHA,
+        K_CLUSTERS,
         MIN_CLASS_CELLS,
         NLCD_NODATA,
         NLCD_PREFIX,
@@ -449,6 +459,7 @@ def _(
 @app.cell
 def _(
     CLASSES,
+    K_CLUSTERS,
     MIN_CLASS_CELLS,
     TAU,
     aef_cells,
@@ -497,10 +508,34 @@ def _(
     agree = np.where(_has, 1.0 / (1.0 + np.exp(-_margin / TAU)), np.nan)
     alt_p = 1.0 - agree
 
+    # Spherical k-means (cosine; the vectors are unit length, so the mean
+    # renormalised is the centroid direction). k-means++ seeding, fixed seed,
+    # 25 Lloyd steps or convergence. ~1 s for 40k x 64.
+    _rng = np.random.default_rng(0)
+    _C = _V[_rng.integers(len(_V))][None, :]
+    for _ in range(1, K_CLUSTERS):
+        _d = np.clip(1 - (_V @ _C.T).max(1), 1e-12, None)  # float32 cosines can pass 1
+        _C = np.vstack([_C, _V[_rng.choice(len(_V), p=_d / _d.sum())]])
+    clu = np.zeros(len(_V), np.int64)
+    for _ in range(25):
+        _new = (_V @ _C.T).argmax(1)
+        if (_new == clu).all():
+            break
+        clu = _new
+        for _k in range(K_CLUSTERS):
+            if (clu == _k).any():
+                _C[_k] = _V[clu == _k].mean(0)
+        _C /= np.linalg.norm(_C, axis=1)[:, None]
+    clu = (_V @ _C.T).argmax(1)
+    # renumber by size so cluster 0 is the biggest
+    _order = np.argsort(-np.bincount(clu, minlength=K_CLUSTERS))
+    clu = np.argsort(_order)[clu]
+
     cells = pa.table(
         {
             "cell": _j["cell"],
             "cls": pa.array(cls.astype(np.uint8)),
+            "cluster": pa.array(clu.astype(np.int16)),
             "name": pa.array([CLASSES.get(int(c), ("?",))[0] for c in cls]),
             "npx": _j["npx"],
             "purity": _j["purity"],
@@ -596,7 +631,7 @@ def _(COV_MIN, cells, cells_to_wkb_polygons, np, pa):
 
 
 @app.cell
-def _(ALPHA_MAX, ALPHA_MIN, CLASSES, DIM_ALPHA, cells, np, pa):
+def _(ALPHA_MAX, ALPHA_MIN, CLASSES, CLUSTER_HEX, DIM_ALPHA, cells, np, pa):
     # ---- the fill colours: NLCD's rgb, agreement as alpha --------------------------
     _cls = cells["cls"].to_numpy()
     _rgb = np.array([CLASSES.get(int(c), ("?", (128, 128, 128)))[1] for c in _cls], np.uint8)
@@ -605,13 +640,23 @@ def _(ALPHA_MAX, ALPHA_MIN, CLASSES, DIM_ALPHA, cells, np, pa):
         np.isnan(_agree), ALPHA_MAX, ALPHA_MIN + (ALPHA_MAX - ALPHA_MIN) * np.clip(_agree, 0, 1)
     ).astype(np.uint8)
 
-    def fill_colors(fade, sel):
-        """RGBA per cell: fade=True runs alpha by agreement, False is flat NLCD;
-        sel (a set of class codes, empty = all) dims every other class to DIM_ALPHA."""
-        a = _alpha_agree if fade else np.full(len(_cls), ALPHA_MAX, np.uint8)
+    _clu = cells["cluster"].to_numpy()
+    _pal = np.array([tuple(int(h[i:i + 2], 16) for i in (1, 3, 5)) for h in CLUSTER_HEX], np.uint8)
+    _rgb_clu = _pal[_clu % len(_pal)]
+
+    def fill_colors(paint, sel):
+        """RGBA per cell. paint: 'agreement' (NLCD rgb, alpha by agreement),
+        'nlcd' (NLCD rgb, flat), 'clusters' (the k-means palette, flat). sel (a
+        set of legend codes; class codes < 100, cluster codes 100 + k; empty = all)
+        dims everything else to DIM_ALPHA."""
+        if paint == "clusters":
+            rgb, key = _rgb_clu, 100 + _clu
+        else:
+            rgb, key = _rgb, _cls
+        a = _alpha_agree if paint == "agreement" else np.full(len(_cls), ALPHA_MAX, np.uint8)
         if sel:
-            a = np.where(np.isin(_cls, list(sel)), a, DIM_ALPHA).astype(np.uint8)
-        rgba = np.concatenate([_rgb, a[:, None]], axis=1)
+            a = np.where(np.isin(key, list(sel)), a, DIM_ALPHA).astype(np.uint8)
+        rgba = np.concatenate([rgb, a[:, None]], axis=1)
         return pa.FixedSizeListArray.from_arrays(pa.array(rgba.ravel()), 4)
 
     return (fill_colors,)
@@ -671,12 +716,13 @@ def _(anywidget, traitlets):
           const mkPaint = (key, text, title) => {
             const b = document.createElement("button");
             b.textContent = text; b.title = title; b.style.cssText = btnCss;
-            b.onclick = () => { paint = key; stylePaint(); send("set"); };
+            b.onclick = () => { paint = key; sel.clear(); stylePaint(); send("set"); };
             return [key, b];
           };
           const paintBtns = [
             mkPaint("agreement", "agreement", "alpha and hexagon size follow agreement"),
             mkPaint("nlcd", "NLCD", "regular hexagons, NLCD's colours, no fade"),
+            mkPaint("clusters", "AlphaEarth", "the embedding on its own: k-means clusters of the cell vectors, no labels"),
           ];
           const stylePaint = () => {
             paintBtns.forEach(([k, b]) => {
@@ -888,6 +934,7 @@ def _(HudControls, mo):
 def _(
     ArrowTable,
     CLASSES,
+    CLUSTER_HEX,
     HOLD,
     RES,
     aef_stats,
@@ -915,9 +962,8 @@ def _(
     except Exception:
         _c = {}
     _paint = _c.get("paint", "agreement")
-    _fade = _paint == "agreement"
     _sel = {int(x) for x in _c.get("sel", [])}
-    _geo = geo if _fade else geo_full  # scaled hexagons, or the regular ones
+    _geo = geo if _paint == "agreement" else geo_full  # scaled hexagons, or the regular ones
     with layer.hold_sync():
         if HOLD["geo"] is not _geo:
             # The trait takes an arro3 Table on assignment (the constructor converts
@@ -929,26 +975,45 @@ def _(
             layer._rows_per_chunk = max(1, _geo.num_rows)
             layer.table = ArrowTable.from_arrow(_geo)
             HOLD["geo"] = _geo
-        layer.get_fill_color = fill_colors(_fade, _sel)
+        layer.get_fill_color = fill_colors(_paint, _sel)
 
     _cls = cells["cls"].to_numpy()
     _ag = cells["agree"].to_numpy(zero_copy_only=False)
     _codes, _n = np.unique(_cls, return_counts=True)
     _tot = int(_n.sum()) or 1
     _legend = []
-    for _code, _cnt in sorted(zip(_codes, _n), key=lambda t: -t[1]):
-        if int(_code) not in CLASSES:
-            continue
-        _a = _ag[_cls == _code]
-        _a = _a[~np.isnan(_a)]
-        _legend.append({
-            "code": int(_code),
-            "name": CLASSES[int(_code)][0],
-            "hex": "#%02x%02x%02x" % CLASSES[int(_code)][1],
-            "pct": round(100 * int(_cnt) / _tot, 1),
-            "p50": f"{np.median(_a):.2f}" if len(_a) else "none",
-            "note": "" if len(_a) else "(unscored)",
-        })
+    if _paint == "clusters":
+        # one chip per cluster, its NLCD make-up as the note (top 3 classes)
+        _clu = cells["cluster"].to_numpy()
+        for _k in range(int(_clu.max()) + 1):
+            _m = _clu == _k
+            if not _m.any():
+                continue
+            _cc, _cn = np.unique(_cls[_m], return_counts=True)
+            _top = sorted(zip(_cn, _cc), reverse=True)[:3]
+            _mix = ", ".join(f"{100 * n / _m.sum():.0f}% {CLASSES.get(int(c), ('?',))[0]}" for n, c in _top)
+            _legend.append({
+                "code": 100 + _k,
+                "name": f"cluster {_k}",
+                "hex": CLUSTER_HEX[_k % len(CLUSTER_HEX)],
+                "pct": round(100 * int(_m.sum()) / _tot, 1),
+                "p50": f"{np.nanmedian(_ag[_m]):.2f}",
+                "note": _mix,
+            })
+    else:
+        for _code, _cnt in sorted(zip(_codes, _n), key=lambda t: -t[1]):
+            if int(_code) not in CLASSES:
+                continue
+            _a = _ag[_cls == _code]
+            _a = _a[~np.isnan(_a)]
+            _legend.append({
+                "code": int(_code),
+                "name": CLASSES[int(_code)][0],
+                "hex": "#%02x%02x%02x" % CLASSES[int(_code)][1],
+                "pct": round(100 * int(_cnt) / _tot, 1),
+                "p50": f"{np.median(_a):.2f}" if len(_a) else "none",
+                "note": "" if len(_a) else "(unscored)",
+            })
     hud.widget.legend = json.dumps(_legend)
     hud.widget.status = "\n".join([nlcd_stats, aef_stats, score_stats])
 
@@ -970,14 +1035,14 @@ def _(
             _lon, _lat = _unproject(_vs, float(_c["px"]), float(_c["py"]), float(_c["w"]), float(_c["h"]))
             _cell = int(coordinates_to_cells(np.array([_lat]), np.array([_lon]), RES)[0].as_py())
             _r = con.execute(
-                "SELECT name, agree, alt_name, purity, homogeneity FROM cells WHERE cell = ?", [_cell]
+                "SELECT name, agree, alt_name, purity, homogeneity, cluster FROM cells WHERE cell = ?", [_cell]
             ).fetchone()
             if _r is None:
                 _story = f"<span style='opacity:.7'>({_lat:.4f}, {_lon:.4f}): no cell here</span>"
             else:
-                _nm, _ag, _alt, _pur, _hom = _r
+                _nm, _ag, _alt, _pur, _hom, _ck = _r
                 _story = (
-                    f"<b>{_nm}</b> at {_lat:.4f}, {_lon:.4f}: agreement "
+                    f"<b>{_nm}</b> at {_lat:.4f}, {_lon:.4f}: cluster {_ck}, agreement "
                     + ("unscored" if _ag is None or np.isnan(_ag) else f"{_ag:.2f}")
                     + (f", looks more like <i>{_alt}</i>" if _alt and _alt != "none" and _ag is not None and not np.isnan(_ag) and _ag < 0.5 else "")
                     + f", NLCD purity {_pur:.2f}, homogeneity {_hom:.3f}"
@@ -985,7 +1050,17 @@ def _(
         except Exception as _e:
             _story = f"<span style='opacity:.7'>click: {_e}</span>"
 
-    if _sel:
+    if _sel and _paint == "clusters":
+        _rows = con.execute(
+            """
+            SELECT 'cluster ' || cluster AS name, count(*) AS cells, round(median(agree), 2) AS p50,
+                   round(100 * avg(CASE WHEN agree < 0.5 THEN 1 ELSE 0 END), 0) AS pct_low,
+                   mode(name) AS usual_alt
+            FROM cells WHERE cluster IN (SELECT UNNEST(?)) GROUP BY cluster ORDER BY cells DESC
+            """,
+            [[k - 100 for k in _sel]],
+        ).fetchall()
+    elif _sel:
         _rows = con.execute(
             """
             SELECT name, count(*) AS cells, round(median(agree), 2) AS p50,
@@ -997,7 +1072,7 @@ def _(
         ).fetchall()
         _selline = " · ".join(
             f"<b>{nm}</b>: {cnt:,} cells, agreement p50 {p50:.2f}, {pct:.0f}% below 0.5"
-            + (f", usually looks like <i>{alt}</i>" if alt else "")
+            + ((f", mostly <i>{alt}</i>" if _paint == "clusters" else f", usually looks like <i>{alt}</i>") if alt else "")
             for nm, cnt, p50, pct, alt in _rows
         )
     else:
