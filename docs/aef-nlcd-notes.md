@@ -314,3 +314,45 @@ everything for every paint; a `labels` toggle. What held and what did not:
   clusters H3 at COV_FLAT 0.8 / ALPHA_FLAT 190 (`geo_flat`).
 - Kernel-side tile cache `(x, y, z) -> Tile` (4,000 entries) so any raster
   layer rebuild does not refetch from S3.
+
+## `xsql-aef-nlcd-deck.py` (2026-08-24, late): the map as its own deck.gl widget
+
+Why: `H3HexagonLayer.coverage` is a layer-wide scalar (lonboard `t.Float`, deck
+`{type: "number", min: 0, max: 1}`; deck 9.3.10 `column-layer.ts` and
+`h3-hexagon-layer.ts` have no `getCoverage`), so per-cell coverage on lonboard
+meant kernel-built polygons. Stephen: "we could just use deck.gl in marimo with a
+patch instead of lonboard. there's custom deck maps in here." kepler.gl's
+`EnhancedColumnLayer` (one instanced float, shader string-patch) became ~25 lines
+in a bespoke anywidget on the HRRR counties film's chassis.
+
+- Stack: maplibre-gl 5.24.0 + `@deck.gl/mapbox` 9.3.10 `MapboxOverlay
+  interleaved` (labels over everything via `beforeId: "watername_ocean"`),
+  `@deck.gl/layers` (ColumnLayer, BitmapLayer), `@deck.gl/geo-layers`
+  (TileLayer, H3HexagonLayer), `h3-js` 4.5.0, all esm.sh with the film's
+  `?deps=@deck.gl/core@9.3.10` pins. maplibre 6.6.0 is current; 5.24.0 chosen for
+  `@deck.gl/mapbox`'s peer range.
+- Traits: `cells` u64 / `colors` rgba / `cov` f32 (kernel -> browser, one
+  `hold_sync`), `config` JSON; `view` (lon/lat/zoom/w/h on `moveend`) and `pick`
+  (browser -> kernel). NLCD tiles: TileLayer `getTileData` -> `model.send` ->
+  kernel `nlcd_tile_png` (Web Mercator tile -> Albers pixel centres through
+  `albers_fwd`, nearest COG level by ground resolution, same `_read_window`
+  cache as the fold) -> PNG buffer -> `createImageBitmap`. Raster modes none /
+  all / wide (below hex_zoom, by the widget's zoom).
+- Two things the first drive hid, both found with a live probe
+  (`window.__aef` under `config.debug`): (1) the subclass was defined but not
+  installed (needs `_subLayerProps: {"hexagon-cell": {type: ...}}`), and the
+  stock ColumnLayer drew full-size hexes that looked plausible; (2) a Bytes
+  trait read from a 0 ms timer after its change event was empty (N stayed 0
+  while the event saw 46,440 bytes): copy in the handler. Proof of coverage:
+  COV_FLAT 0.3 draws small hexagons; agreement shrinks per cell; the inverted
+  paint shows dots vs solid.
+- Low-precision H3 (one hexagon shape per view) leaves hairline diagonal gaps
+  at coverage 1; `overfill` 1.03 on the coverage array hides them.
+- Picking: deck's `onClick` gave `layer: null, index: -1` on every click
+  (counties film, same); h3-js `latLngToCell` on the click's coordinate at the
+  frame's res, then the kernel's DuckDB lookup.
+- Driven (home): open 8-10 s; res 8/9 folds 4-6 s, `send 0.00 s`; res + to res
+  10 in 8 s; all toggle states; pick; highlight; labels; analyze; isolate; zero
+  console errors. Payload per 150k-cell frame ~2.4 MB (ids + rgba + f32)
+  against ~17 MB of rings. Not yet flown by Stephen; a heavy frame's JS load
+  time is not measured.

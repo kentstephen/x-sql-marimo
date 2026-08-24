@@ -869,6 +869,85 @@ dropped). Numbers and design in `docs/aef-nlcd-notes.md`.
   0.1-0.5 s at home; the status now sub-times it (join/score/kmeans/table/
   hex/colours) to find the slow piece there.
 
+`xsql-aef-nlcd-deck.py` (2026-08-24, late; PLAYWRIGHT-PASSED, NOT YET FLOWN BY
+STEPHEN) is the CONUS agreement notebook with the map as ITS OWN deck.gl widget
+instead of lonboard. Stephen's call ("we could just use deck.gl in marimo with a
+patch instead of lonboard"), for one accessor: deck's `H3HexagonLayer` takes one
+`coverage` for the whole layer (verified: lonboard `t.Float`, deck `{type:
+"number"}`), which is why the lonboard build drew polygons built in the kernel.
+kepler.gl's answer, a ColumnLayer subclass with an `instanceCoverage` attribute,
+is ~20 lines of the widget's JS. Folds, frame, scores, k-means, strip, analyze
+and the SQL tables are the CONUS notebook's cells by copy; the map, wiring and
+frame-output changed. Runs from the root. Things to know:
+
+- **The widget** (`DeckMap`, one anywidget): maplibre-gl 5.24.0 (Carto Positron
+  from basemaps.cartocdn.com) with deck 9.3.10 as a `MapboxOverlay`
+  `interleaved: true`, every deck layer `beforeId: "watername_ocean"` so labels
+  stay over everything; the `labels` button flips `visibility` on the style's
+  `text-field` layers (no style reload). esm.sh imports pinned like the HRRR
+  counties film (`?deps=@deck.gl/core@9.3.10`, one core; plus `h3-js@4.5.0`).
+  Layers have REAL ids (`nlcd`, `hexes`): none of lonboard's `undefined`-id
+  collision, no two-pass swaps, `visible` works.
+- **`CoverageColumnLayer extends ColumnLayer`**: `getShaders()` string-patches
+  the vertex shader (`in float instanceCoverage;` after `instancePickingColors`;
+  every `column.coverage` -> `(column.coverage * instanceCoverage)`, two
+  sites in deck 9.3.10) and `addInstanced({instanceCoverage: {size: 1,
+  accessor: "getCoverage"}})`. `CoverageH3Layer extends H3HexagonLayer`
+  overrides `_getForwardProps` to forward `getCoverage` to the sublayer, and
+  the layer is built with `_subLayerProps: {"hexagon-cell": {type:
+  CoverageColumnLayer}}`, which is HOW the subclass gets installed (deck's
+  `getSubLayerClass` reads it). WITHOUT that prop the stock ColumnLayer draws
+  and coverage is silently ignored: the first drive of this notebook looked
+  right and was not (a live probe of `layerManager.getLayers()` showed
+  `hexes-hexagon-cell: ColumnLayer` with no `instanceCoverage`; the proof is
+  COV_FLAT 0.3 drawing small hexagons, `covtest` in the session's
+  scratchpad). `highPrecision: false` always (`"auto"` falls back to the
+  polygon path at res <= 5 or with a pentagon, and that path has no
+  coverage). Low-precision mode draws every cell with the centre cell's
+  shape, so full-coverage cells leave hairline diagonal gaps; the widget
+  multiplies the coverage array by `config.overfill` (1.03).
+- **COPY BYTES TRAITS THE MOMENT THEY CHANGE.** Reading a Bytes trait from a
+  0 ms timer after its `change:` event found nothing (the event handler saw
+  46,440 bytes; the deferred `loadCells` left N = 0; the same function run by
+  hand seconds later worked): marimo's bridge hands over a DataView that is
+  not readable a tick later. `grab(k)` slices the buffer inside the change
+  handler; the loaders read the copies. The counties film never hit this
+  because its loaders run synchronously in the handler.
+- **What crosses the bridge per frame**: `cells` uint64 LE, `colors` rgba u8,
+  `cov` float32, under one `hold_sync` (the JS rebuilds once via a 0 ms
+  timer); 150k cells = 2.4 MB against ~17 MB of polygon rings before. deck
+  draws from `{length: N, attributes: {getFillColor, getCoverage}}` with
+  `getHexagon: (_, {index}) => hexes[index]` (h3-js `cellToLatLng` per cell
+  on data change). The frame keeps `cellid`, `fill()` -> (N, 4) uint8 and
+  `coverage()` -> (N,) float32; `_rings_table`/`_parse_wkb`/`_scaled`/`geo*`
+  are gone, and so is arro3 and `_rows_per_chunk`.
+- **The NLCD raster is a deck `TileLayer` whose tiles the KERNEL renders**:
+  `getTileData` posts `{kind: "tile", id, x, y, z}` over `model.send`, the
+  widget's `on_msg` spawns `nlcd_tile_png(z, x, y)` (the tile's 256 output
+  pixel centres in lon/lat -> closed-form Albers -> nearest pixel of the COG
+  level nearest the tile's ground resolution; the same `_read_window` and
+  tile cache the fold uses, so a fold after the raster fetches ~nothing),
+  and the PNG comes back as a custom-message buffer -> `createImageBitmap`.
+  Raster modes in `config.raster`: `none` (no paint), `all` (raster paint),
+  `wide` (H3 paints: visible only below `hex_zoom`, decided by the widget's
+  own zoom, so there is no tile-cache race).
+- **Camera to kernel is the `view` trait** (JSON lon/lat/zoom AND canvas
+  w/h on maplibre `moveend`), so `view_to_bbox` uses the measured canvas
+  (VIEW_W/H only seed); the kernel loop (settle, coalesce, `_spawn`) is the
+  CONUS notebook's. **Picking**: deck's `onClick` fired with `layer: null,
+  index: -1` on every click (the counties film saw the same), so the widget
+  falls back to h3-js `latLngToCell` at the frame's res on the click's
+  coordinate; the kernel's `_on_pick` does the DuckDB lookup and white
+  highlight. The strip no longer captures canvas clicks.
+- **Driven (playwright, home): open 8-10 s; zoom-in fold res 8/9 in 4-6 s
+  (`send 0.00 s`); every paint toggle state; pick; highlight disagreement;
+  labels off; res + -> res 10 in 8 s; analyze; legend isolate; zero console
+  errors (one deck warning about a normalized attribute, fixed with
+  `normalized: true`).** The maplibre fullscreen control fullscreens the map
+  container and the strip docks into it as before (fullscreen itself not
+  driven). Not measured yet: a 150k-cell frame's JS-side load/paint time. The lonboard build
+  `xsql-aef-nlcd-conus.py` stays as is.
+
 `xsql-mapterhorn-explorer.py` (EXPERIMENTAL, open defects below) draws Mapterhorn terrain
 worldwide as extruded H3 columns: the DEM half of the parked
 `archive/xsql-duckdb-terrain-h3.py` standing alone, on the canopy notebook's chassis
