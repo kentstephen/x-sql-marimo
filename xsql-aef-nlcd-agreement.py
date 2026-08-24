@@ -608,7 +608,7 @@ def _(COV_MIN, cells, cells_to_wkb_polygons, np, pa):
         rings = pa.ListArray.from_arrays(pa.array(np.arange(0, 7 * n + 1, 7, dtype=np.int32)), coords)
         polys = pa.ListArray.from_arrays(pa.array(np.arange(0, n + 1, dtype=np.int32)), rings)
         geom = pa.field(
-            "geometry", polys.type, metadata={"ARROW:extension:name": "geoarrow.polygon"}
+            "geometry", polys.type, metadata={"ARROW:extension:name": "geoarrow.polygon", "ARROW:extension:metadata": '{"crs": "OGC:CRS84"}'}
         )
         # The other columns are what lonboard's feature panel shows on a click
         # (pickable=True, Stephen: "we can't just rely on the legend"): names, not
@@ -911,7 +911,7 @@ def _(CartoStyle, Map, MaplibreBasemap, PolygonLayer, np, pa):
     _coords = pa.FixedSizeListArray.from_arrays(pa.array(_xy.ravel()), 2)
     _rings = pa.ListArray.from_arrays(pa.array([0, 5], pa.int32()), _coords)
     _polys = pa.ListArray.from_arrays(pa.array([0, 1], pa.int32()), _rings)
-    _geom = pa.field("geometry", _polys.type, metadata={"ARROW:extension:name": "geoarrow.polygon"})
+    _geom = pa.field("geometry", _polys.type, metadata={"ARROW:extension:name": "geoarrow.polygon", "ARROW:extension:metadata": '{"crs": "OGC:CRS84"}'})
     layer = PolygonLayer(
         table=pa.Table.from_arrays([_polys], schema=pa.schema([_geom])),
         get_fill_color=pa.FixedSizeListArray.from_arrays(pa.array([0, 0, 0, 0], pa.uint8()), 4),
