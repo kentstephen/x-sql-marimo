@@ -815,9 +815,11 @@ width, docks into fullscreen.
   at both zooms, raster back at zoom 5). **Paints are toggles, none
   required**: clicking the active paint sends `paint: null` (HOLD["paint"]
   None: hexes parked, raster removed, basemap only, status "no paint").
-  **NLCD H3 and clusters H3 draw at `COV_FLAT` 0.8 coverage and
-  `ALPHA_FLAT` 190** (`geo_flat` in the frame; `geo_full` is gone), the
-  basemap showing between the hexagons; agreement keeps its own scaling.
+  **NLCD H3 and clusters H3 draw at `COV_FLAT` coverage (0.8 for an hour,
+  back to 1.0 the same night, his call) and `ALPHA_FLAT` 190** (`geo_flat`
+  in the frame; `geo_full` is gone); agreement keeps its own scaling. This
+  notebook's toggle-off still DROPS the frame and refolds on re-select (the
+  deck notebook keeps it); port if it is ever flown again.
   H3 cells on an icosahedron
 edge have 8-10 vertices: the ring builder parses WKB by its own vertex count
 (the two white diagonals across CONUS on his screen were those cells
@@ -939,14 +941,29 @@ frame-output changed. Runs from the root. Things to know:
   falls back to h3-js `latLngToCell` at the frame's res on the click's
   coordinate; the kernel's `_on_pick` does the DuckDB lookup and white
   highlight. The strip no longer captures canvas clicks.
+- **THE FOUR BUTTONS ARE VISIBILITY, ONE LAYER AT A TIME (2026-08-24, late,
+  Stephen: "all it's doing is hiding it from the map. When you click it
+  again, it comes back"; "if another button is selected, then we go to that
+  layer... we're not stacking them").** `NLCD raster` / `NLCD H3` /
+  `agreement H3` / `AlphaEarth clusters H3`: click one and the map goes to
+  it, click the one that is on and it disappears (nothing on). What changed
+  from the first build: hiding is a config flip (`show_raster`/`show_hexes`
+  -> deck `visible`) and the kernel KEEPS THE FRAME; a hexagon paint coming
+  back is `_paint()` of the held frame (0.6 s driven) plus a non-forced
+  `_serve` (held when the camera is still inside the box, a fold only if it
+  left). The first build dropped the frame on hide and refolded on show,
+  which read as "it didn't come back" on his first try. While hidden (or on
+  the raster) the camera does not fold. Stacking and per-layer styling were
+  raised by him as later, maybe. NLCD H3 and clusters H3 are back at FULL
+  coverage (`COV_FLAT` 1.0, both notebooks; the 0.8 lasted an hour).
 - **Driven (playwright, home): open 8-10 s; zoom-in fold res 8/9 in 4-6 s
-  (`send 0.00 s`); every paint toggle state; pick; highlight disagreement;
+  (`send 0.00 s`); hide -> basemap only, show -> 0.6 s, raster, NLCD H3,
+  hide, clusters, all screenshot-verified; pick; highlight disagreement;
   labels off; res + -> res 10 in 8 s; analyze; legend isolate; zero console
   errors (one deck warning about a normalized attribute, fixed with
   `normalized: true`).** The maplibre fullscreen control fullscreens the map
   container and the strip docks into it as before (fullscreen itself not
-  driven). Not measured yet: a 150k-cell frame's JS-side load/paint time. The lonboard build
-  `xsql-aef-nlcd-conus.py` stays as is.
+  driven). Not measured yet: a 150k-cell frame's JS-side load/paint time.
 
 `xsql-mapterhorn-explorer.py` (EXPERIMENTAL, open defects below) draws Mapterhorn terrain
 worldwide as extruded H3 columns: the DEM half of the parked

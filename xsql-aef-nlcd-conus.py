@@ -214,9 +214,10 @@ def _():
                    "#009E73", "#D55E00", "#999999", "#7B4EA3", "#6B3F1D"]
     ALPHA_MIN, ALPHA_MAX = 30, 235
     COV_MIN = 0.30
-    # NLCD H3 / AlphaEarth clusters H3: regular hexagons, slightly shrunken and a
-    # little below the agreement paint's top alpha (Stephen: coverage 0.8, lower opacity)
-    COV_FLAT = 0.80
+    # NLCD H3 / AlphaEarth clusters H3: regular hexagons at full coverage (0.8 was
+    # tried 2026-08-24 and put back, Stephen's call), a little below the agreement
+    # paint's top alpha
+    COV_FLAT = 1.00
     ALPHA_FLAT = 190
     DIM_ALPHA = 22
     # seconds between removing the raster layer and adding its replacement: deck

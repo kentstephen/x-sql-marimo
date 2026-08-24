@@ -213,9 +213,10 @@ def _():
                    "#009E73", "#D55E00", "#999999", "#7B4EA3", "#6B3F1D"]
     ALPHA_MIN, ALPHA_MAX = 30, 235
     COV_MIN = 0.30
-    # NLCD H3 / AlphaEarth clusters H3: regular hexagons, slightly shrunken and a
-    # little below the agreement paint's top alpha (Stephen: coverage 0.8, lower opacity)
-    COV_FLAT = 0.80
+    # NLCD H3 / AlphaEarth clusters H3: regular hexagons at full coverage (0.8 was
+    # tried 2026-08-24 and put back, Stephen's call), a little below the agreement
+    # paint's top alpha
+    COV_FLAT = 1.00
     ALPHA_FLAT = 190
     DIM_ALPHA = 22
 
@@ -1031,6 +1032,10 @@ def _(anywidget, traitlets):
             "font:13px ui-sans-serif,system-ui,sans-serif;cursor:pointer;" +
             "padding:.2rem .6rem;border-radius:5px;border:1px solid " +
             "rgba(127,127,127,.45);background:transparent;color:inherit";
+          // The four buttons are VISIBILITY (Stephen): one layer on the map at a time;
+          // click another and the map goes to that layer; click the one that is on
+          // and it disappears. No stacking. Hiding keeps the fold: the kernel flips
+          // the widget's visibility and the frame stays, so coming back is instant.
           let paint = "agreement";
           const sel = new Set();
           let seq = 0;
@@ -1039,22 +1044,25 @@ def _(anywidget, traitlets):
               act: act, paint: paint, sel: Array.from(sel), inv: inv.checked, n: ++seq }, extra || {})));
             model.save_changes();
           };
+          const onCss = (b, on) => {
+            b.style.borderColor = on ? "#2b6cb0" : "rgba(127,127,127,.45)";
+            b.style.fontWeight = on ? "600" : "400";
+          };
           const paintBox = document.createElement("span");
           paintBox.style.cssText = "display:inline-flex;gap:.3rem;align-items:center";
           const pl = document.createElement("span");
-          pl.textContent = "paint";
+          pl.textContent = "layer";
           const mkPaint = (key, text, title) => {
             const b = document.createElement("button");
             b.textContent = text; b.title = title; b.style.cssText = btnCss;
-            // a toggle: the active paint clicked again turns every paint off (null)
             b.onclick = () => { paint = paint === key ? null : key; sel.clear(); stylePaint(); send("set"); renderLegend(); };
             return [key, b];
           };
           const paintBtns = [
-            mkPaint("raster", "NLCD raster", "NLCD as its own tiles, no hexagons, at any zoom"),
-            mkPaint("nlcd", "NLCD H3", "NLCD's majority class per hexagon, regular hexagons, flat colours"),
-            mkPaint("agreement", "agreement H3", "NLCD's colours; hexagon size and alpha follow how well AlphaEarth backs the class"),
-            mkPaint("clusters", "AlphaEarth clusters H3", "the embedding on its own: k-means clusters of the cell vectors, no labels"),
+            mkPaint("raster", "NLCD raster", "NLCD as its own tiles, at any zoom; click again to hide"),
+            mkPaint("nlcd", "NLCD H3", "NLCD's majority class per hexagon, flat colours; click again to hide"),
+            mkPaint("agreement", "agreement H3", "NLCD's colours; hexagon size and alpha follow how well AlphaEarth backs the class; click again to hide"),
+            mkPaint("clusters", "AlphaEarth clusters H3", "the embedding on its own: k-means clusters of the cell vectors, no labels; click again to hide"),
           ];
           const invLab = document.createElement("label");
           invLab.style.cssText = "display:inline-flex;align-items:center;gap:.35rem;cursor:pointer";
@@ -1063,12 +1071,7 @@ def _(anywidget, traitlets):
           invLab.appendChild(inv); invLab.appendChild(document.createTextNode("highlight disagreement"));
           invLab.title = "agreement H3: the least-backed (smallest) cells solid, the agreeing ones faint";
           inv.addEventListener("change", () => send("set"));
-          const stylePaint = () => {
-            paintBtns.forEach(([k, b]) => {
-              b.style.borderColor = k === paint ? "#2b6cb0" : "rgba(127,127,127,.45)";
-              b.style.fontWeight = k === paint ? "600" : "400";
-            });
-          };
+          const stylePaint = () => { paintBtns.forEach(([k, b]) => onCss(b, k === paint)); };
           stylePaint();
           paintBox.append(pl, ...paintBtns.map(([, b]) => b), invLab);
           // res: the offset from the ladder (-2..+2). + refolds the CURRENT view one
@@ -1400,16 +1403,16 @@ def _(anywidget, asyncio, traitlets):
             if (signal) signal.addEventListener("abort", () => { pending.delete(id); resolve(null); });
           });
 
-          const rasterOn = () => {
-            const m = cfg.raster || "wide";
-            if (m === "none") return false;
-            if (m === "all") return true;
-            return map ? map.getZoom() < (cfg.hex_zoom || 9) : true;
-          };
+          // the raster shows where its switch is on and the hexagons are not drawn
+          // (their switch off, or no frame, or below hex_zoom); the hexagons show
+          // where their switch is on. Both are `visible` flips: the tiles and the
+          // frame stay in the browser, nothing is refetched or refolded.
+          const hexesDrawn = () => cfg.show_hexes !== false && !!dataObj && !!map && map.getZoom() >= (cfg.hex_zoom || 9);
+          const rasterOn = () => cfg.show_raster !== false && !hexesDrawn();
 
           function layers() {
             const out = [];
-            if ((cfg.raster || "wide") !== "none") out.push(new TileLayer({
+            out.push(new TileLayer({
               id: "nlcd",
               getTileData,
               tileSize: cfg.tile || 256,
@@ -1431,6 +1434,7 @@ def _(anywidget, asyncio, traitlets):
               filled: true, stroked: false, extruded: false,
               highPrecision: false,
               coverage: 1,
+              visible: cfg.show_hexes !== false,
               _subLayerProps: {"hexagon-cell": {type: CoverageColumnLayer}},
               pickable: true,
               beforeId: cfg.labels_slot || "watername_ocean",
@@ -1492,7 +1496,7 @@ def _(anywidget, asyncio, traitlets):
             if (cfg.debug) window.__aef = {overlay, map, model, reload, get N() { return N; }, get colors() { return colors; }, get cov() { return cov; }, get dataObj() { return dataObj; }};
             map.on("load", () => { labels(cfg.labels !== false); update(); sendView(); });
             map.on("moveend", sendView);
-            map.on("zoom", () => { if ((cfg.raster || "wide") === "wide") update(); });
+            map.on("zoom", () => update());
             map.on("error", (e) => { if (e && e.error && e.error.message) say("map: " + e.error.message); });
             new ResizeObserver(() => { try { map.resize(); } catch (e) {} }).observe(mapEl);
             document.addEventListener("fullscreenchange", () => { setTimeout(() => { try { map.resize(); } catch (e) {} }, 50); });
@@ -1531,13 +1535,14 @@ def _(anywidget, asyncio, traitlets):
 def _(DeckMap, HOME, LABELS_SLOT, RASTER_TILE, json):
     # ---- the map: built ONCE, empty; never re-runs for a parameter -----------------
     deck = DeckMap(config=json.dumps({
-        "height": 720, "home": dict(HOME), "raster": "wide", "labels": True,
+        "height": 720, "home": dict(HOME), "show_raster": True, "show_hexes": True, "labels": True,
         "hex_zoom": 9.0, "labels_slot": LABELS_SLOT, "tile": RASTER_TILE,
     }))
     HOLD = {
         "frame": None, "sent": None, "box": None, "res": None, "vs": None,
         "busy": False, "pending": None, "task": None, "loop": None,
-        "paint": "agreement", "sel": set(), "hit": None, "memo": {}, "h_cam": None, "h_ctl": None, "h_pick": None,
+        "paint": "agreement", "show_raster": True, "show_hexes": True,
+        "sel": set(), "hit": None, "memo": {}, "h_cam": None, "h_ctl": None, "h_pick": None,
         "dres": 0,  # the strip's res offset; a statement about the box it was set on
         "inv": False,  # reversed alpha: disagreeing cells solid
         "labels": True,
@@ -1599,16 +1604,21 @@ def _(
         c.update(kw)
         deck.config = json.dumps(c)
 
-    def _raster_mode(paint):
-        """What the raster is for a paint: absent (no paint), at every zoom (the
-        raster paint), or only below HEX_ZOOM (an H3 paint; the widget decides by
-        its own zoom, so there is no tile cache to fight)."""
-        return "none" if paint is None else ("all" if paint == "raster" else "wide")
+    def _show():
+        """The widget's visibility for the paint: the raster at any zoom under
+        `raster`; the hexagons (with the raster where they are not drawn, below
+        HEX_ZOOM) under a hexagon paint; nothing under None."""
+        HOLD["show_raster"] = HOLD["paint"] is not None
+        HOLD["show_hexes"] = HOLD["paint"] not in (None, "raster")
+        _cfg(show_raster=HOLD["show_raster"], show_hexes=HOLD["show_hexes"])
 
-    _cfg(raster=_raster_mode(HOLD["paint"]), extent=list(nlcd_bounds), hex_zoom=HEX_ZOOM)
+    _show()
+    _cfg(extent=list(nlcd_bounds), hex_zoom=HEX_ZOOM)
 
     def _hexes_off(msg):
-        """No fold on screen: the widget draws no hexagon layer."""
+        """No fold for this camera (below HEX_ZOOM): the frame is dropped and the
+        widget draws no hexagon layer. Hiding the hexagons is NOT this: that is a
+        visibility flip in the browser and the frame stays."""
         if HOLD["sent"] is not None:
             with deck.hold_sync():
                 deck.cells, deck.colors, deck.cov = b"", b"", b""
@@ -1643,7 +1653,7 @@ def _(
     def _paint():
         """Hand the current frame's cells, colours and coverage to the widget."""
         fr = HOLD["frame"]
-        if fr is None or HOLD["paint"] in (None, "raster"):
+        if fr is None:
             return
         rgba = fr["fill"](HOLD["paint"], HOLD["sel"], HOLD["hit"], HOLD["inv"])
         cov = fr["coverage"](HOLD["paint"], HOLD["inv"])
@@ -1660,14 +1670,15 @@ def _(
 
     async def _serve(vs, force=False):
         vsd = _vsd(vs)
-        if HOLD["paint"] is None:
-            _hexes_off(f"zoom {vsd['zoom']:.1f} · no paint (basemap only) · pick one in the strip")
-            return
-        if HOLD["paint"] == "raster":
-            _hexes_off(f"zoom {vsd['zoom']:.1f} · NLCD raster (its own tiles) · pick an H3 paint for the fold")
-            return
         if vsd["zoom"] < HEX_ZOOM:
             _hexes_off(f"zoom {vsd['zoom']:.1f} · NLCD as its own tiles · zoom in past {HEX_ZOOM:g} for the agreement hexes")
+            return
+        if not HOLD["show_hexes"]:
+            # hidden (nothing on, or the raster): no fold for a camera nobody is
+            # looking at through the hexes; the held frame stays, and a hexagon
+            # paint coming back serves this view
+            what = "NLCD raster (its own tiles)" if HOLD["paint"] == "raster" else "nothing on"
+            _say(f"zoom {vsd['zoom']:.1f} · {what} · pick a hexagon paint for the fold")
             return
         view = view_to_bbox(vsd)
         box = pad_box(view)
@@ -1898,20 +1909,29 @@ def _(
         except Exception:
             return
         _was = HOLD["paint"]
-        HOLD["paint"] = c.get("paint", "agreement")  # None when every paint is off
+        HOLD["paint"] = c.get("paint", "agreement")  # None: the layer that was on was clicked off
         HOLD["sel"] = {int(x) for x in c.get("sel", [])}
         HOLD["inv"] = bool(c.get("inv", False))
         fr = HOLD["frame"]
-        if _raster_mode(HOLD["paint"]) != _raster_mode(_was):
-            _cfg(raster=_raster_mode(HOLD["paint"]))
-        if HOLD["paint"] != _was and (HOLD["paint"] in (None, "raster") or _was in (None, "raster")):
-            # into or out of the hexagon paints: park the hexes, or fold the current view
-            vs = HOLD["vs"] if HOLD["vs"] is not None else dict(HOME)
-            if HOLD["busy"]:
-                HOLD["pending"] = vs
-            else:
-                HOLD["task"] = _spawn(_serve(vs, force=True))
-            return
+        if HOLD["paint"] != _was:
+            # VISIBILITY. One layer at a time: the raster, one of the hexagon paints,
+            # or nothing. A config flip in the browser; the frame is KEPT, so a
+            # hexagon paint coming back is a repaint of the held frame (instant) and
+            # a fold only if the camera left the box meanwhile.
+            _show()
+            if HOLD["paint"] in (None, "raster"):
+                z = _vsd(HOLD["vs"])["zoom"]
+                kept = " · fold kept" if fr is not None else ""
+                _say(f"zoom {z:.1f} · " + ("NLCD raster (its own tiles)" if HOLD["paint"] == "raster" else "nothing on") + kept)
+                return
+            if _was in (None, "raster"):
+                vs = HOLD["vs"] if HOLD["vs"] is not None else dict(HOME)
+                _paint()
+                if HOLD["busy"]:
+                    HOLD["pending"] = vs
+                else:
+                    HOLD["task"] = _spawn(_serve(vs))
+                return
         if c.get("act") == "dres":
             HOLD["dres"] = max(-2, min(2, int(c.get("dres", 0))))
             _say_dres()
@@ -1929,7 +1949,7 @@ def _(
             _cfg(labels=HOLD["labels"])
             return
         if c.get("act") == "analyze":
-            hud.widget.panel = _analyze_html(fr) if fr is not None else "<span style='opacity:.7'>no fold in view (zoom in past 9 with an H3 paint on)</span>"
+            hud.widget.panel = _analyze_html(fr) if fr is not None else "<span style='opacity:.7'>no fold in view (zoom in past 9 with the hexagons on)</span>"
             return
         if fr is not None:
             hud.widget.panel = _selection_panel(fr)

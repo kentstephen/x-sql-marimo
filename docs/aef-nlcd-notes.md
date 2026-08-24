@@ -356,3 +356,10 @@ in a bespoke anywidget on the HRRR counties film's chassis.
   console errors. Payload per 150k-cell frame ~2.4 MB (ids + rgba + f32)
   against ~17 MB of rings. Not yet flown by Stephen; a heavy frame's JS load
   time is not measured.
+- Late: the buttons' meaning corrected after Stephen flew it: VISIBILITY, one
+  layer at a time (click another = switch, click the one that is on = hide, no
+  stacking). Hide is a config flip and the frame is kept; show = repaint of the
+  held frame (0.6 s driven) + non-forced serve. The first build dropped the
+  frame on hide and refolded on show ("it didn't come back"). COV_FLAT back to
+  1.0 in both notebooks. Driven: hide / show / raster / NLCD H3 / hide /
+  clusters, screenshots, zero console errors.
