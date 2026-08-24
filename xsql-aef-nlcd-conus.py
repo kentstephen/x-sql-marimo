@@ -1006,12 +1006,12 @@ def _(anywidget, traitlets):
         function render({ model, el }) {
           const box = document.createElement("div");
           box.style.cssText =
-            "display:flex;flex-wrap:wrap;align-items:center;gap:.9rem;" +
-            "font:12px ui-sans-serif,system-ui,sans-serif;padding:.2rem 0 0;" +
-            "user-select:none";
+            "display:flex;flex-wrap:wrap;align-items:center;gap:.6rem 1rem;" +
+            "font:13px ui-sans-serif,system-ui,sans-serif;padding:.35rem 0 0;" +
+            "user-select:none;width:100%";
           const btnCss =
-            "font:12px ui-sans-serif,system-ui,sans-serif;cursor:pointer;" +
-            "padding:.1rem .45rem;border-radius:4px;border:1px solid " +
+            "font:13px ui-sans-serif,system-ui,sans-serif;cursor:pointer;" +
+            "padding:.2rem .6rem;border-radius:5px;border:1px solid " +
             "rgba(127,127,127,.45);background:transparent;color:inherit";
           let paint = "agreement";
           const sel = new Set();
@@ -1032,16 +1032,17 @@ def _(anywidget, traitlets):
             return [key, b];
           };
           const paintBtns = [
-            mkPaint("agreement", "agreement", "alpha and hexagon size follow agreement"),
-            mkPaint("nlcd", "NLCD", "regular hexagons, NLCD's colours, no fade"),
-            mkPaint("clusters", "AlphaEarth", "the embedding on its own: k-means clusters of the cell vectors"),
+            mkPaint("raster", "NLCD raster", "NLCD as its own tiles, no hexagons, at any zoom"),
+            mkPaint("nlcd", "NLCD H3", "NLCD's majority class per hexagon, regular hexagons, flat colours"),
+            mkPaint("agreement", "agreement H3", "NLCD's colours; hexagon size and alpha follow how well AlphaEarth backs the class"),
+            mkPaint("clusters", "AlphaEarth clusters H3", "the embedding on its own: k-means clusters of the cell vectors, no labels"),
           ];
           const invLab = document.createElement("label");
           invLab.style.cssText = "display:inline-flex;align-items:center;gap:.35rem;cursor:pointer";
           const inv = document.createElement("input");
           inv.type = "checkbox"; inv.checked = false;
-          invLab.appendChild(inv); invLab.appendChild(document.createTextNode("reverse"));
-          invLab.title = "agreement paint: the least-backed (smallest) cells solid, the agreeing ones faint";
+          invLab.appendChild(inv); invLab.appendChild(document.createTextNode("highlight disagreement"));
+          invLab.title = "agreement H3: the least-backed (smallest) cells solid, the agreeing ones faint";
           inv.addEventListener("change", () => send("set"));
           const stylePaint = () => {
             paintBtns.forEach(([k, b]) => {
@@ -1081,7 +1082,7 @@ def _(anywidget, traitlets):
           const legendBox = document.createElement("div");
           legendBox.style.cssText =
             "display:flex;flex-wrap:wrap;align-items:center;" +
-            "gap:.1rem .55rem;flex:1;min-width:14rem";
+            "gap:.15rem .7rem;flex:1 1 100%;min-width:14rem;font-size:13px";
           const renderLegend = () => {
             let items = [];
             try { items = JSON.parse(model.get("legend") || "[]"); }
@@ -1122,12 +1123,13 @@ def _(anywidget, traitlets):
           renderLegend();
           box.append(paintBox, resBox, legendBox);
           const panel = document.createElement("div");
-          panel.style.cssText = "font:13px ui-sans-serif,system-ui,sans-serif;padding:.15rem 0";
+          panel.style.cssText = "font:13.5px ui-sans-serif,system-ui,sans-serif;padding:.25rem 0";
           const status = document.createElement("div");
           status.style.cssText =
-            "font:12.5px ui-monospace,SFMono-Regular,Menlo,monospace;" +
-            "opacity:.85;padding:.15rem 0;min-height:1.2em;white-space:pre-line";
+            "font:13px ui-monospace,SFMono-Regular,Menlo,monospace;" +
+            "opacity:.85;padding:.2rem 0;min-height:1.2em;white-space:pre-line";
           const wrap = document.createElement("div");
+          wrap.style.cssText = "width:100%;box-sizing:border-box";
           wrap.dataset.aefStrip = "1";
           wrap.append(box, panel, status);
           const killOld = (root) => {
@@ -1156,11 +1158,11 @@ def _(anywidget, traitlets):
               if (getComputedStyle(fe).position === "static") fe.style.position = "relative";
               wrap.style.cssText =
                 "position:absolute;left:0;right:0;bottom:0;z-index:30;" +
-                "background:rgba(255,255,255,.94);color:#111;" +
-                "padding:.5rem 1.2rem;box-shadow:0 -1px 4px rgba(0,0,0,.18)";
+                "background:rgba(255,255,255,.94);color:#111;box-sizing:border-box;" +
+                "padding:.6rem 1.4rem .7rem;box-shadow:0 -1px 4px rgba(0,0,0,.18)";
               fe.appendChild(wrap);
             } else {
-              wrap.style.cssText = "";
+              wrap.style.cssText = "width:100%;box-sizing:border-box";
               el.appendChild(wrap);
             }
           };
@@ -1334,7 +1336,7 @@ def _(
     def _paint():
         """Hand the current frame's hexagons + colours to the one layer."""
         fr = HOLD["frame"]
-        if fr is None:
+        if fr is None or HOLD["paint"] == "raster":
             return
         geo = fr["geo"] if HOLD["paint"] == "agreement" else fr["geo_full"]
         with layer.hold_sync():
@@ -1350,6 +1352,9 @@ def _(
 
     async def _serve(vs, force=False):
         vsd = _vsd(vs)
+        if HOLD["paint"] == "raster":
+            _hexes_off(f"zoom {vsd['zoom']:.1f} · NLCD raster (its own tiles) · pick an H3 paint for the fold")
+            return
         if vsd["zoom"] < HEX_ZOOM:
             _hexes_off(f"zoom {vsd['zoom']:.1f} · NLCD as its own tiles · zoom in past {HEX_ZOOM:g} for the agreement hexes")
             return
@@ -1453,10 +1458,19 @@ def _(
             c = json.loads(change["new"] or "{}")
         except Exception:
             return
+        _was = HOLD["paint"]
         HOLD["paint"] = c.get("paint", "agreement")
         HOLD["sel"] = {int(x) for x in c.get("sel", [])}
         HOLD["inv"] = bool(c.get("inv", False))
         fr = HOLD["frame"]
+        if HOLD["paint"] != _was and (HOLD["paint"] == "raster" or _was == "raster"):
+            # into or out of the raster paint: park the hexes, or fold the current view
+            vs = HOLD["vs"] if HOLD["vs"] is not None else dict(HOME)
+            if HOLD["busy"]:
+                HOLD["pending"] = vs
+            else:
+                HOLD["task"] = _spawn(_serve(vs, force=True))
+            return
         if c.get("act") == "dres":
             HOLD["dres"] = max(-2, min(2, int(c.get("dres", 0))))
             _say_dres()
