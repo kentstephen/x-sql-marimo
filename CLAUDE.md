@@ -685,8 +685,9 @@ duckdb as a backend"). Full recon and numbers in `docs/ftw-cdl-notes.md`.
   0.1 s. DuckDB `CASE` cannot return a `UTINYINT[N]`: colours go through a
   VALUES join.
 
-`xsql-aef-nlcd-agreement.py` (2026-08-24, HEADLESS + PLAYWRIGHT-PASSED, NOT YET
-FLOWN BY STEPHEN) is Annual NLCD 2024 coloured as it is, with each hexagon's ALPHA
+`archive/xsql-aef-nlcd-agreement.py` (ARCHIVED 2026-08-24 late, Stephen: "put the
+other nlcd notebooks in archive"; the deck notebook below is the live one. Built
+2026-08-24, headless + playwright-passed, not flown by him) is Annual NLCD 2024 coloured as it is, with each hexagon's ALPHA
 and COVERAGE (the hexagon scaled about its centre) set by how well the AlphaEarth
 Foundations embedding backs NLCD's word there. One box (Folsom Lake / Auburn
 foothills), one year, no camera fold (the conus-counties one-shot chassis with a
@@ -765,8 +766,9 @@ zoomable map); runs from the root. Full record in `docs/aef-nlcd-notes.md`.
   the same notebook (data side solved in `docs/imagery-and-terrain-notes.md`;
   render side never stabilized; a second deck layer under marimo is the risk).
 
-`xsql-aef-nlcd-conus.py` (2026-08-24, FLOWN BY STEPHEN on molab and at home,
-reshaped twice the same day) is the agreement notebook anywhere in CONUS. SHAPE
+`archive/xsql-aef-nlcd-conus.py` (ARCHIVED 2026-08-24 late; superseded by the deck
+notebook, which carries every fold cell of this one by copy. Flown by Stephen on
+molab and at home, reshaped twice the same day) is the agreement notebook anywhere in CONUS. SHAPE
 SINCE THE EVENING: **below `HEX_ZOOM` (9) the map is NLCD as its own tiles**
 (`RasterLayer.from_geotiff` on the COG, lonboard's raster-cog-nlcd example as
 is: the COG's colormap in the render callback, nodata -> alpha 0, plus
@@ -871,8 +873,9 @@ dropped). Numbers and design in `docs/aef-nlcd-notes.md`.
   0.1-0.5 s at home; the status now sub-times it (join/score/kmeans/table/
   hex/colours) to find the slow piece there.
 
-`xsql-aef-nlcd-deck.py` (2026-08-24, late; PLAYWRIGHT-PASSED, NOT YET FLOWN BY
-STEPHEN) is the CONUS agreement notebook with the map as ITS OWN deck.gl widget
+`xsql-aef-nlcd-deck.py` (2026-08-24, late; FLOWN BY STEPHEN: "seems fine now. this
+is unusual but very intriguing"; pushed; the two lonboard AEF notebooks went to
+`archive/` at his call) is the CONUS agreement notebook with the map as ITS OWN deck.gl widget
 instead of lonboard. Stephen's call ("we could just use deck.gl in marimo with a
 patch instead of lonboard"), for one accessor: deck's `H3HexagonLayer` takes one
 `coverage` for the whole layer (verified: lonboard `t.Float`, deck `{type:
@@ -982,6 +985,13 @@ frame-output changed. Runs from the root. Things to know:
   `normalized: true`).** The maplibre fullscreen control fullscreens the map
   container and the strip docks into it as before (fullscreen itself not
   driven). Not measured yet: a 150k-cell frame's JS-side load/paint time.
+- **The res offset resets ONLY when the camera leaves the served box** (the
+  agreed rule; Stephen re-stated it after a suspected reset on the highlight
+  checkbox, which only repaints). The one other way a serve can fire without
+  a move is a container resize (fullscreen: `map.resize()` -> maplibre
+  `moveend` -> a larger footprint outside the box). Not changed; he then
+  said it seems fine. If it comes back, key the reset on lon/lat/zoom, not
+  the footprint.
 
 `xsql-mapterhorn-explorer.py` (EXPERIMENTAL, open defects below) draws Mapterhorn terrain
 worldwide as extruded H3 columns: the DEM half of the parked

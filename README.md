@@ -17,6 +17,9 @@ uv run marimo edit xsql-hrrr-counties.py --sandbox
 # variable from us-west-2, minutes over a home link, seconds next to the bucket.
 uv run marimo edit xsql-hrrr-heat-hex.py --sandbox
 
+# AlphaEarth x NLCD agreement, anywhere in CONUS, on a bespoke deck.gl widget
+uv run marimo edit xsql-aef-nlcd-deck.py --sandbox
+
 # EXPERIMENTAL: worldwide Mapterhorn terrain as extruded H3 columns (open defects)
 uv run marimo edit xsql-mapterhorn-explorer.py --sandbox
 ```
@@ -144,6 +147,44 @@ Source Cooperative under `s3://us-west-2.opendata.source.coop/dynamical/` and th
 counties film can be pointed at it with `SOURCE = "forecast"`. Notes:
 `docs/hrrr-counties-notes.md`, `docs/hrrr-heat-hex-notes.md`.
 
+## AlphaEarth × NLCD: is the word backed?
+
+`xsql-aef-nlcd-deck.py`. Annual NLCD 2024 coloured as it is, on H3 hexagons whose
+size and opacity say how well the AlphaEarth Foundations embedding backs NLCD's
+word there. Anywhere in CONUS: below zoom 9 the map is NLCD as its own tiles; from
+zoom 9 the ground in view is folded live (NLCD's majority class per cell and the
+64-band mean embedding per cell, both as the h3 UDF inside DataFusion), per-class
+prototypes are built from the view, and a cell's agreement is the sigmoid of its
+cosine margin between its own class and the nearest other. Four layers, one on the
+map at a time (click again to hide): the NLCD raster, NLCD per hexagon, the
+agreement paint, and the embedding on its own as spherical k-means clusters with
+their NLCD make-up in the legend. Click a hexagon for its story; "analyze what's in
+view" tabulates the view. The score is consistency, not correctness: in one box
+37% of cells flip to an adjacent NLCD word.
+
+The map is its own deck.gl widget (maplibre interleaved, labels over everything)
+rather than lonboard, for one accessor: deck's `H3HexagonLayer` takes a single
+`coverage` for the whole layer, so per-cell size needed kepler.gl's trick, a
+`ColumnLayer` subclass with an `instanceCoverage` attribute, ~25 lines of the
+widget's JS. Cell ids, an rgba array and a float32 coverage cross the bridge;
+nothing is tessellated in the kernel.
+
+**Data, all on [Source Cooperative](https://source.coop/):**
+
+- [kylebarron/usgs-landcover](https://source.coop/kylebarron/usgs-landcover): Annual
+  NLCD (USGS, public domain) as a cloud-optimized GeoTIFF mirror with overviews,
+  `annual-nlcd/c1/v1/cu/mosaic`, EPSG:5070 30 m, the COG's own colormap.
+- [tge-labs/aef-mosaic](https://source.coop/tge-labs/aef-mosaic): the AlphaEarth
+  Foundations Satellite Embedding dataset as one Zarr v3 mosaic (int8, 64 bands,
+  ~10 m, 2017-2025), read natively for the finest rung.
+- [tge-labs/aef](https://source.coop/tge-labs/aef): the same embeddings as per-UTM-tile
+  COGs with mean-renormalised overviews (40 m to 2,560 m), read for every wider rung.
+  "The AlphaEarth Foundations Satellite Embedding dataset is produced by Google and
+  Google DeepMind" (CC-BY 4.0).
+
+Basemap: [CARTO](https://carto.com/) Positron on OpenStreetMap data. Notes:
+`docs/aef-nlcd-notes.md`.
+
 ## The terrain explorer (experimental)
 
 `xsql-mapterhorn-explorer.py` draws [Mapterhorn](https://mapterhorn.com/) terrain
@@ -156,7 +197,9 @@ can refold millions of cells). A demo to poke at, not a tool to lean on.
 
 `archive/` holds what was built on the way here, kept for reference and not
 maintained: fire-risk buildings, the human-footprint pair, flood exposure, canopy
-height, the Annual NLCD notebooks and their DataFusion-vs-DuckDB benchmark, NLCD
+height, the two lonboard builds of the AlphaEarth × NLCD notebook (the one-box
+one-shot and the CONUS camera fold the deck widget replaced), the Annual NLCD
+notebooks and their DataFusion-vs-DuckDB benchmark, NLCD
 boundaries over imagery, the parked NLCD × terrain extrusion, and the NAIP, 3DEP and
 Overture GeoParquet helpers. None of the maintained notebooks imports any of it. They
 still run, from a pinned `archive/pyproject.toml`:

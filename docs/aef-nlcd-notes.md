@@ -372,3 +372,6 @@ in a bespoke anywidget on the HRRR counties film's chassis.
   exact boundaries, no seams (his screenshots at res 9 fullscreen still showed
   hairlines on the column path even at overfill 1.02). Agreement stays on the
   coverage column. Driven at DPR 2: seamless, pick works on either layer.
+- 2026-08-24, end: Stephen flew the deck notebook ("seems fine now. this is
+  unusual but very intriguing"). The one-shot and the lonboard CONUS notebook moved
+  to `archive/`; README credits the three source.coop datasets.
