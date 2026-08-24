@@ -16,6 +16,7 @@
 #     "numpy",
 #     "duckdb>=1.5.5",
 #     "pyproj",
+#     "pillow",
 # ]
 # ///
 """NLCD backed or not by AlphaEarth, anywhere in CONUS, at any zoom.
@@ -80,18 +81,25 @@ def _():
     from h3ronpy.vector import coordinates_to_cells, cells_to_wkb_polygons
     from pyproj import Transformer
 
+    import io
+    from PIL import Image
     from arro3.core import Table as ArrowTable
-    from lonboard import Map, PolygonLayer
+    from lonboard import Map, PolygonLayer, RasterLayer
+    from lonboard.raster import EncodedImage
+    from async_geotiff.tms import generate_tms
     from lonboard.basemap import CartoStyle, MaplibreBasemap
 
     return (
         ArrowTable,
         CartoStyle,
+        EncodedImage,
         GeoTIFF,
+        Image,
         Map,
         MaplibreBasemap,
         ObjectStore,
         PolygonLayer,
+        RasterLayer,
         S3Store,
         Transformer,
         Window,
@@ -101,6 +109,8 @@ def _():
         cells_to_wkb_polygons,
         coordinates_to_cells,
         duckdb,
+        generate_tms,
+        io,
         json,
         math,
         mo,
@@ -184,6 +194,11 @@ def _():
     VIEW_W, VIEW_H = 1400, 720
     PAD = 1.3
     SETTLE = 0.35  # seconds the camera must rest before a fold
+    # Below this zoom the map is NLCD as a picture (RasterLayer.from_geotiff, the
+    # COG's own tiles and colormap, served by the kernel); from it up, the
+    # agreement hexagons fold live for the small box in view (Stephen: "show
+    # something cheap like the raster, then when you zoom in the agreement hexes").
+    HEX_ZOOM = 9.0
     HOME = {"longitude": -96.0, "latitude": 38.5, "zoom": 4.0}
 
     TAU = 0.02
@@ -239,6 +254,7 @@ def _():
         CLUSTER_HEX,
         COV_MIN,
         DIM_ALPHA,
+        HEX_ZOOM,
         HOME,
         K_CLUSTERS,
         MAX_RES,
@@ -390,10 +406,13 @@ def _(XarrayContext, coordinates_to_cells, pa, udf):
 
 @app.cell
 async def _(
+    EncodedImage,
     GeoTIFF,
+    Image,
     NLCD_LEVEL_FOR_RES,
     NLCD_NODATA,
     NLCD_PREFIX,
+    RasterLayer,
     S3Store,
     Window,
     YEAR_NLCD,
@@ -401,6 +420,8 @@ async def _(
     albers_inv,
     asyncio,
     ctx,
+    generate_tms,
+    io,
     math,
     np,
     time,
@@ -415,6 +436,26 @@ async def _(
     )
     _levels = [_g, *_g.overviews]
     _L, _B, _R, _T = _g.bounds
+
+    # ---- the cheap paint: NLCD as its own tiles, lonboard's raster-cog-nlcd
+    # example as is (the COG's colormap, nodata -> alpha 0), plus max_zoom so a
+    # zoom past the pyramid does not wrap onto the coarsest overview (0.16 ships
+    # the clamp commented out; repo lesson from the deforest notebook).
+    _cmap = _g.colormap.as_array()
+
+    def _render_nlcd(tile):
+        arr = np.asarray(np.ma.filled(tile.array.as_masked(), NLCD_NODATA))[0]
+        rgba = np.empty((*arr.shape, 4), dtype=np.uint8)
+        rgba[..., :3] = _cmap[arr]
+        rgba[..., 3] = np.where(arr == NLCD_NODATA, 0, 255).astype(np.uint8)
+        buf = io.BytesIO()
+        Image.fromarray(rgba, mode="RGBA").save(buf, format="PNG")
+        return EncodedImage(data=buf.getvalue(), media_type="image/png")
+
+    _tms = generate_tms(_g)
+    nlcd_raster = RasterLayer.from_geotiff(
+        _g, render_tile=_render_nlcd, min_zoom=0, max_zoom=len(_tms.tileMatrices) - 1, opacity=1.0
+    )
 
     TILE = 512
     TILE_BUDGET = 384 * 1024 * 1024
@@ -517,7 +558,7 @@ async def _(
             f"{t1 - t0:.1f} s · fold {out.num_rows:,} {time.time() - t1:.1f} s"
         )
 
-    return (nlcd_fold,)
+    return nlcd_fold, nlcd_raster
 
 
 @app.cell
@@ -725,17 +766,57 @@ def _(
     _PAL = np.array([tuple(int(h[i:i + 2], 16) for i in (1, 3, 5)) for h in CLUSTER_HEX], np.uint8)
     con = duckdb.connect()
 
-    def _hex_table(cells, xy):
-        n = xy.shape[0]
-        coords = pa.FixedSizeListArray.from_arrays(pa.array(xy.ravel()), 2)
-        rings = pa.ListArray.from_arrays(pa.array(np.arange(0, 7 * n + 1, 7, dtype=np.int32)), coords)
+    def _rings_table(cells, coords, lens, sheet):
+        """A geoarrow.polygon column: one polygon per ring (variable vertex counts),
+        with a SHEET polygon (the fold box, `sheet` = (W, S, E, N)) as row 0 under
+        the hexagons. The sheet hides the NLCD tile layer beneath the hexagons
+        (its `opacity` is ignored at runtime under marimo, the crops lesson) so
+        the fade shows a blank ground, inside the one polygon layer, no layer
+        toggling. Cells on an H3 icosahedron edge have 8-10 vertices: the two
+        white diagonals across CONUS on Stephen's screen were those cells being
+        dropped by a fixed-7-vertex parser."""
+        W, S, E, N = sheet
+        ring0 = np.array([[W, S], [E, S], [E, N], [W, N], [W, S]])
+        allc = np.concatenate([ring0, coords.reshape(-1, 2)])
+        alll = np.concatenate([[5], lens])
+        n = len(alll)
+        fsl = pa.FixedSizeListArray.from_arrays(pa.array(allc.ravel()), 2)
+        ring_off = np.concatenate([[0], np.cumsum(alll)]).astype(np.int32)
+        rings = pa.ListArray.from_arrays(pa.array(ring_off), fsl)
         polys = pa.ListArray.from_arrays(pa.array(np.arange(0, n + 1, dtype=np.int32)), rings)
         geom = pa.field("geometry", polys.type, metadata={"ARROW:extension:name": "geoarrow.polygon", "ARROW:extension:metadata": '{"crs": "OGC:CRS84"}'})
-        return pa.Table.from_arrays(
-            [polys, cells["cell"]], schema=pa.schema([geom, cells.schema.field("cell")])
-        )
+        cellcol = pa.concat_arrays([pa.array([0], pa.uint64()), cells["cell"].combine_chunks().cast(pa.uint64())])
+        return pa.Table.from_arrays([polys, cellcol], schema=pa.schema([geom, pa.field("cell", pa.uint64())]))
 
-    def build_frame(nlcd_cells, aef_cells):
+    def _parse_wkb(blobs):
+        """(coords (P, 2), lens (n,)) from h3ronpy polygon WKB: one ring each,
+        npts at byte 9, coords from byte 13. Grouped by byte length so each
+        group parses with one frombuffer."""
+        L = np.array([len(b) for b in blobs])
+        coords = np.empty((int(((L - 13) // 16).sum()), 2), np.float64)
+        lens = ((L - 13) // 16).astype(np.int64)
+        starts = np.concatenate([[0], np.cumsum(lens)[:-1]])
+        for ln in np.unique(L):
+            idx = np.where(L == ln)[0]
+            npts = (ln - 13) // 16
+            raw = np.frombuffer(b"".join(blobs[i] for i in idx), dtype=np.uint8).reshape(-1, ln)
+            xy = np.ascontiguousarray(raw[:, 13:]).view("<f8").reshape(-1, npts, 2)
+            for k, i in enumerate(idx):
+                coords[starts[i] : starts[i] + npts] = xy[k]
+        return coords, lens
+
+    def _scaled(coords, lens, factor):
+        """Each ring scaled about its own centroid (mean of its vertices minus the
+        closing one) by factor (per ring)."""
+        ends = np.cumsum(lens)
+        starts = ends - lens
+        # centroid over the open ring
+        sums = np.add.reduceat(coords, starts, axis=0) - coords[ends - 1]
+        ctr = sums / (lens - 1)[:, None]
+        f = np.repeat(factor, lens)[:, None]
+        return np.repeat(ctr, lens, axis=0) + (coords - np.repeat(ctr, lens, axis=0)) * f
+
+    def build_frame(nlcd_cells, aef_cells, box):
         """Join the two folds, score, cluster, build both hexagon tables."""
         import time as _time
         _tt = {"t": _time.time()}
@@ -822,37 +903,38 @@ def _(
 
         lap("table")
         blobs = cells_to_wkb_polygons(cells["cell"].combine_chunks()).to_pylist()
-        ok = np.array([len(b) == 125 for b in blobs])
-        if not ok.all():
-            cells = cells.filter(pa.array(ok))
-            blobs = [b for b, o in zip(blobs, ok) if o]
-            agree, cls, clu, hom = agree[ok], cls[ok], clu[ok], hom[ok]
-        raw = np.frombuffer(b"".join(blobs), dtype=np.uint8).reshape(-1, 125)
-        xy = np.ascontiguousarray(raw[:, 13:]).view("<f8").reshape(-1, 7, 2)
-        ctr = xy[:, :6].mean(1, keepdims=True)
+        coords, lens = _parse_wkb(blobs)
         cov = np.where(np.isnan(agree), 1.0, COV_MIN + (1 - COV_MIN) * np.clip(agree, 0, 1))
-        geo = _hex_table(cells, ctr + (xy - ctr) * cov[:, None, None])
-        geo_full = _hex_table(cells, xy)
+        geo = _rings_table(cells, _scaled(coords, lens, cov), lens, box)
+        geo_full = _rings_table(cells, coords, lens, box)
         lap("hex")
-
         rgb = np.array([CLASSES.get(int(c), ("?", (128, 128, 128)))[1] for c in cls], np.uint8)
         alpha_agree = np.where(
             np.isnan(agree), ALPHA_MAX, ALPHA_MIN + (ALPHA_MAX - ALPHA_MIN) * np.clip(agree, 0, 1)
         ).astype(np.uint8)
+        # reversed: the least-backed (smallest) cells solid, the agreeing ones faint
+        # (Stephen: "so the smallest coverage cells are noticeable")
+        alpha_inv = np.where(
+            np.isnan(agree), ALPHA_MIN, ALPHA_MIN + (ALPHA_MAX - ALPHA_MIN) * (1 - np.clip(agree, 0, 1))
+        ).astype(np.uint8)
         rgb_clu = _PAL[clu % len(_PAL)]
         cellid = cells["cell"].to_numpy()
 
-        def fill(paint, sel, hit=None):
+        def fill(paint, sel, hit=None, inv=False):
             if paint == "clusters":
                 c, key = rgb_clu, 100 + clu
             else:
                 c, key = rgb, cls
-            a = alpha_agree if paint == "agreement" else np.full(len(cls), ALPHA_MAX, np.uint8)
+            if paint == "agreement":
+                a = alpha_inv if inv else alpha_agree
+            else:
+                a = np.full(len(cls), ALPHA_MAX, np.uint8)
             if sel:
                 a = np.where(np.isin(key, list(sel)), a, DIM_ALPHA).astype(np.uint8)
             rgba = np.concatenate([c, a[:, None]], axis=1)
             if hit is not None:
                 rgba[cellid == hit] = (255, 255, 255, 255)
+            rgba = np.concatenate([np.array([[248, 248, 246, 235]], np.uint8), rgba])  # the sheet
             return pa.FixedSizeListArray.from_arrays(pa.array(rgba.ravel()), 4)
 
         lap("colours")
@@ -865,6 +947,9 @@ def _(
             "cells": cells, "geo": geo, "geo_full": geo_full, "fill": fill,
             "cls": cls, "clu": clu, "agree": agree, "has_aef": has_aef, "score": score,
         }
+
+    def fr_rgba0():
+        return pa.FixedSizeListArray.from_arrays(pa.array([0, 0, 0, 0], pa.uint8()), 4)
 
     def legend_for(frame, paint):
         cls, clu, agree = frame["cls"], frame["clu"], frame["agree"]
@@ -901,7 +986,7 @@ def _(
                 })
         return items
 
-    return build_frame, con, legend_for
+    return build_frame, con, fr_rgba0, legend_for
 
 
 @app.cell
@@ -933,7 +1018,7 @@ def _(anywidget, traitlets):
           let seq = 0;
           const send = (act, extra) => {
             model.set("ctl", JSON.stringify(Object.assign({
-              act: act, paint: paint, sel: Array.from(sel), n: ++seq }, extra || {})));
+              act: act, paint: paint, sel: Array.from(sel), inv: inv.checked, n: ++seq }, extra || {})));
             model.save_changes();
           };
           const paintBox = document.createElement("span");
@@ -951,6 +1036,13 @@ def _(anywidget, traitlets):
             mkPaint("nlcd", "NLCD", "regular hexagons, NLCD's colours, no fade"),
             mkPaint("clusters", "AlphaEarth", "the embedding on its own: k-means clusters of the cell vectors"),
           ];
+          const invLab = document.createElement("label");
+          invLab.style.cssText = "display:inline-flex;align-items:center;gap:.35rem;cursor:pointer";
+          const inv = document.createElement("input");
+          inv.type = "checkbox"; inv.checked = false;
+          invLab.appendChild(inv); invLab.appendChild(document.createTextNode("reverse"));
+          invLab.title = "agreement paint: the least-backed (smallest) cells solid, the agreeing ones faint";
+          inv.addEventListener("change", () => send("set"));
           const stylePaint = () => {
             paintBtns.forEach(([k, b]) => {
               b.style.borderColor = k === paint ? "#2b6cb0" : "rgba(127,127,127,.45)";
@@ -958,7 +1050,7 @@ def _(anywidget, traitlets):
             });
           };
           stylePaint();
-          paintBox.append(pl, ...paintBtns.map(([, b]) => b));
+          paintBox.append(pl, ...paintBtns.map(([, b]) => b), invLab);
           // res: the offset from the ladder (-2..+2). + refolds the CURRENT view one
           // step finer (zooming in never does on its own); the offset resets when
           // the camera leaves the served box, and the kernel echoes it back.
@@ -1142,10 +1234,13 @@ def _(CartoStyle, HOME, Map, MaplibreBasemap, PolygonLayer, np, pa):
         height=720,
     )
     HOLD = {
+        "placeholder": layer.table,  # what the hexagon layer holds below HEX_ZOOM
+        "raster": None,  # the RasterLayer the wiring last inserted
         "frame": None, "geo_sent": None, "box": None, "res": None, "vs": None,
         "busy": False, "pending": None, "task": None, "loop": None,
         "paint": "agreement", "sel": set(), "hit": None, "memo": {}, "h_cam": None, "h_ctl": None,
         "dres": 0,  # the strip's res offset; a statement about the box it was set on
+        "inv": False,  # reversed alpha: disagreeing cells solid
     }
     deck  # the cell's LAST statement: what marimo displays
     return HOLD, deck, layer
@@ -1161,6 +1256,7 @@ def _(HudControls, mo):
 @app.cell
 def _(
     ArrowTable,
+    HEX_ZOOM,
     HOLD,
     HOME,
     SETTLE,
@@ -1171,12 +1267,14 @@ def _(
     contains,
     coordinates_to_cells,
     deck,
+    fr_rgba0,
     hud,
     json,
     layer,
     legend_for,
     math,
     nlcd_fold,
+    nlcd_raster,
     np,
     pad_box,
     res_for_view,
@@ -1196,11 +1294,35 @@ def _(
         except Exception:
             pass
 
+    # The raster goes in through deck.layers FROM HERE (the deforest rule): a
+    # constants edit rebuilds it and rewires without destroying the Map.
+    if HOLD["raster"] is not nlcd_raster:
+        deck.layers = [nlcd_raster, layer]
+        HOLD["raster"] = nlcd_raster
+
+    def _hexes_off(msg):
+        """Below HEX_ZOOM: the picture shows, the hexagon layer holds its placeholder."""
+        with layer.hold_sync():
+            if HOLD["geo_sent"] is not HOLD["placeholder"]:
+                layer._rows_per_chunk = 1
+                layer.table = HOLD["placeholder"]
+                HOLD["geo_sent"] = HOLD["placeholder"]
+                layer.get_fill_color = pa_rgba0
+        HOLD["frame"], HOLD["box"], HOLD["res"], HOLD["hit"] = None, None, None, None
+        try:
+            hud.widget.legend = "[]"
+            hud.widget.panel = ""
+        except Exception:
+            pass
+        _say(msg)
+
     def _say_dres():
         try:
             hud.widget.dres = str(HOLD["dres"])
         except Exception:
             pass
+
+    pa_rgba0 = fr_rgba0()
 
     def _vsd(vs):
         if vs is None:
@@ -1220,7 +1342,7 @@ def _(
                 layer._rows_per_chunk = max(1, geo.num_rows)
                 layer.table = ArrowTable.from_arrow(geo)
                 HOLD["geo_sent"] = geo
-            layer.get_fill_color = fr["fill"](HOLD["paint"], HOLD["sel"], HOLD["hit"])
+            layer.get_fill_color = fr["fill"](HOLD["paint"], HOLD["sel"], HOLD["hit"], HOLD["inv"])
         try:
             hud.widget.legend = json.dumps(legend_for(fr, HOLD["paint"]))
         except Exception:
@@ -1228,6 +1350,9 @@ def _(
 
     async def _serve(vs, force=False):
         vsd = _vsd(vs)
+        if vsd["zoom"] < HEX_ZOOM:
+            _hexes_off(f"zoom {vsd['zoom']:.1f} · NLCD as its own tiles · zoom in past {HEX_ZOOM:g} for the agreement hexes")
+            return
         view = view_to_bbox(vsd)
         box = pad_box(view)
         inside = HOLD["box"] is not None and contains(HOLD["box"], view)
@@ -1258,7 +1383,7 @@ def _(
                 return
             t1 = time.time()
             loop = asyncio.get_running_loop()
-            fr = await loop.run_in_executor(None, build_frame, nl, ae)
+            fr = await loop.run_in_executor(None, build_frame, nl, ae, box)
             stats = f"res {res} · {s1} · {s2} · frame {time.time() - t1:.1f} s"
             HOLD["memo"][key] = (fr, stats)
             if len(HOLD["memo"]) > 12:
@@ -1330,6 +1455,7 @@ def _(
             return
         HOLD["paint"] = c.get("paint", "agreement")
         HOLD["sel"] = {int(x) for x in c.get("sel", [])}
+        HOLD["inv"] = bool(c.get("inv", False))
         fr = HOLD["frame"]
         if c.get("act") == "dres":
             HOLD["dres"] = max(-2, min(2, int(c.get("dres", 0))))

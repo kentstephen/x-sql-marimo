@@ -223,3 +223,33 @@ change and I have to wait for the refold, which I don't want". Now:
 
 Driven at home: open 21.6 s; zoom in x6 held; `+` -> res 6 in 3.2 s; zoom in
 x3 held with "finer available (res 7)".
+
+### The reshape: NLCD tiles below zoom 9, hexes above (2026-08-24, evening)
+
+Stephen, after flying the live CONUS fold: "it doesn't really work"; "can we
+just show something cheap, like the raster for the NLCD, and then when you
+zoom in it shows the agreement hexes". Then the lonboard raster-cog-nlcd
+example link ("we should incorporate his tooling when we can").
+
+- `RasterLayer.from_geotiff` on the source.coop NLCD COG, the example's render
+  callback (colormap from the file, nodata -> alpha 0), `min_zoom=0`,
+  `max_zoom=len(tms.tileMatrices)-1` (0.16 ships the clamp commented out).
+  Inserted through `deck.layers` from the wiring cell. Open: 9 s, no AEF read.
+- `HEX_ZOOM` 9: below it `_serve` parks the polygon layer on its placeholder and
+  reports "NLCD as its own tiles · zoom in past 9 for the agreement hexes";
+  above it the fold runs as before (res 8 at zoom 9.5: 8 files at 160 m, 10k
+  cells, 3.8-4.2 s).
+- `nlcd_raster.opacity = 0` under the hexes did nothing at runtime (the crops
+  lesson holds for RasterLayer too). Fix: a sheet polygon (the fold box, fill
+  (248, 248, 246, 235)) as row 0 of the hexagon table, inside the one polygon
+  layer. The fade now shows the sheet, not NLCD's picture.
+- The ring builder takes any vertex count (`_parse_wkb` groups blobs by byte
+  length, `_scaled` scales each ring about its own centroid): icosahedron-edge
+  cells (8-10 vertices) were being dropped, which drew two white diagonals
+  across CONUS on Stephen's molab screenshot.
+- `reverse` checkbox: agreement alpha inverted (least-backed solid, agreeing
+  faint), Stephen's experiment "so the smallest coverage cells are noticeable".
+  Driven: both states paint.
+- The live coarse AEF rungs (res 5-7 from the 2560-320 m overviews) still exist
+  in `aef_fold` but are unreachable below HEX_ZOOM; the res − button can reach
+  res 7 from a zoom-9 view.

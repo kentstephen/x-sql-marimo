@@ -765,12 +765,25 @@ zoomable map); runs from the root. Full record in `docs/aef-nlcd-notes.md`.
   the same notebook (data side solved in `docs/imagery-and-terrain-notes.md`;
   render side never stabilized; a second deck layer under marimo is the risk).
 
-`xsql-aef-nlcd-conus.py` (2026-08-24, DRIVEN HEADLESS, NOT YET FLOWN BY STEPHEN)
-is the agreement notebook as a CAMERA-DRIVEN fold anywhere in CONUS: NLCD from
-its overview pyramid (the nlcd-zoom tile reader by copy) and AlphaEarth from
-whichever copy can serve the rung, joined per view, scored, clustered, drawn as
-scaled hexagon polygons with the same strip (three paints, legend, click).
-Numbers and design in `docs/aef-nlcd-notes.md`.
+`xsql-aef-nlcd-conus.py` (2026-08-24, FLOWN BY STEPHEN on molab and at home,
+reshaped twice the same day) is the agreement notebook anywhere in CONUS. SHAPE
+SINCE THE EVENING: **below `HEX_ZOOM` (9) the map is NLCD as its own tiles**
+(`RasterLayer.from_geotiff` on the COG, lonboard's raster-cog-nlcd example as
+is: the COG's colormap in the render callback, nodata -> alpha 0, plus
+`min_zoom`/`max_zoom` passed through; inserted via `deck.layers` from the
+wiring cell, the deforest rule), no AlphaEarth read at all (open 9 s); **from
+`HEX_ZOOM` up the agreement hexagons fold live** for the small box in view
+(3-12 s at home) on the polygon layer. Stephen's call after the live CONUS
+fold proved unusable (open 21 s at home, 95 s on molab where every piece,
+CPU included, is 4-5x slower: "show something cheap like the raster, then
+when you zoom in the agreement hexes"). The raster's `opacity` is IGNORED at
+runtime (crops lesson), so a WHITE SHEET polygon (the fold box, row 0 of the
+same polygon layer) hides the tiles under the hexagons. Strip: three paints,
+a `reverse` checkbox (agreement alpha inverted: the least-backed cells solid,
+Stephen's experiment), `res − / +`, legend, click. H3 cells on an icosahedron
+edge have 8-10 vertices: the ring builder parses WKB by its own vertex count
+(the two white diagonals across CONUS on his screen were those cells
+dropped). Numbers and design in `docs/aef-nlcd-notes.md`.
 
 - **Two AlphaEarth sources by rung.** res 11: the mosaic (native 10 m window;
   res 10's padded box would be ~1.8 GB raw, so it stays on the COGs). res 5-10:
