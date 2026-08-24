@@ -913,6 +913,15 @@ frame-output changed. Runs from the root. Things to know:
   ALPHA_FLAT 190). Stephen's screenshot of "strokes" around every cell was
   COV_FLAT 0.8 in a kernel not reloaded after the revert to 1.0: constants
   edits need a reload of the notebook.
+- **TWO HEXAGON LAYERS, one on the map at a time (2026-08-24, late; Stephen:
+  "cell coverage needs work for these two. what about a separate h3 hexagon
+  layer for those two").** `hexes-flat`: NLCD H3 and clusters H3 on the STOCK
+  `H3HexagonLayer` with `highPrecision: true` (every cell's own boundary,
+  tessellated in the browser; no shared mesh, no drift, no overfill; colours
+  through a `getFillColor` accessor over the rgba array, `updateTriggers` on
+  the data object). `hexes`: agreement on the coverage column. `config.flat`
+  picks; both pickable; the gold ring reads either id. Seamless in a DPR-2
+  drive at res 8 across the whole view.
 - **Pick = a GOLD OUTLINE** (`#ffc828`, 3 px PathLayer from h3-js
   `cellToBoundary` of the hit, `config.hit`), the cell's own colour kept
   (the white recolour is gone from `fill()`'s use). Stephen: "gold or

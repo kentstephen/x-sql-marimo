@@ -1432,7 +1432,24 @@ def _(anywidget, asyncio, traitlets):
                 return new BitmapLayer(p, {data: null, image: p.data, bounds: [west, south, east, north]});
               },
             }));
-            if (dataObj) out.push(new CoverageH3Layer({
+            // Two hexagon layers, one on the map at a time. The FLAT paints (NLCD,
+            // clusters) need no coverage, so they take the stock H3HexagonLayer on
+            // its highPrecision path: every cell's own boundary, tessellated in the
+            // browser, no shared mesh, no drift, no gaps (Stephen: "a separate h3
+            // hexagon layer for those two"). Agreement keeps the coverage column.
+            if (dataObj && cfg.flat) out.push(new H3HexagonLayer({
+              id: "hexes-flat",
+              data: {length: N},
+              getHexagon: (_, {index}) => hexes[index],
+              getFillColor: (_, {index}) => [colors[4 * index], colors[4 * index + 1], colors[4 * index + 2], colors[4 * index + 3]],
+              updateTriggers: {getFillColor: [dataObj]},
+              filled: true, stroked: false, extruded: false,
+              highPrecision: true,
+              visible: cfg.show_hexes !== false,
+              pickable: true,
+              beforeId: cfg.labels_slot || "watername_ocean",
+            }));
+            if (dataObj && !cfg.flat) out.push(new CoverageH3Layer({
               id: "hexes",
               data: dataObj,
               getHexagon: (_, {index}) => hexes[index],
@@ -1497,7 +1514,7 @@ def _(anywidget, asyncio, traitlets):
                 // deck's GPU pick first; when it returns nothing (it did on every
                 // click here, as in the counties film: interleaved inside marimo's
                 // shadow DOM), the click's lon/lat -> h3-js cell at the frame's res
-                let cell = info && info.layer && info.layer.id === "hexes" && info.index >= 0 ? hexes[info.index] : null;
+                let cell = info && info.layer && (info.layer.id === "hexes" || info.layer.id === "hexes-flat") && info.index >= 0 ? hexes[info.index] : null;
                 let how = "gpu";
                 if (!cell && info && info.coordinate && res >= 0) {
                   try { const h = latLngToCell(info.coordinate[1], info.coordinate[0], res); if (hexIndex.has(h)) cell = h; how = "h3"; }
@@ -1628,7 +1645,7 @@ def _(
         HEX_ZOOM) under a hexagon paint; nothing under None."""
         HOLD["show_raster"] = HOLD["paint"] is not None
         HOLD["show_hexes"] = HOLD["paint"] not in (None, "raster")
-        _cfg(show_raster=HOLD["show_raster"], show_hexes=HOLD["show_hexes"])
+        _cfg(show_raster=HOLD["show_raster"], show_hexes=HOLD["show_hexes"], flat=HOLD["paint"] in ("nlcd", "clusters"))
 
     _show()
     _cfg(extent=list(nlcd_bounds), hex_zoom=HEX_ZOOM)

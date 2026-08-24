@@ -368,3 +368,7 @@ in a bespoke anywidget on the HRRR counties film's chassis.
   at res 7); at overfill 1.0 cells tile exactly at the centre with a hairline
   at the far edge; 1.08 shows dark overlap seams. 1.02. The uniform gaps in
   Stephen's screenshot were COV_FLAT 0.8 in a stale kernel.
+- Flat paints moved to a stock high-precision H3HexagonLayer (`hexes-flat`):
+  exact boundaries, no seams (his screenshots at res 9 fullscreen still showed
+  hairlines on the column path even at overfill 1.02). Agreement stays on the
+  coverage column. Driven at DPR 2: seamless, pick works on either layer.
