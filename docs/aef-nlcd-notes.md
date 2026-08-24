@@ -198,3 +198,28 @@ pixel centres now go through the affine transform. Re-driven: res 5 30% below
 would be ~1.8 GB raw from the mosaic). Full rung table: open 21 s; res 6 3.3 s;
 res 7 8.6 s; res 8 12.3 s (107k cells); res 9 6.9 s; res 10 7.3 s; res 11
 6.6 s (mosaic, 202 MB, 118k cells).
+
+### Hold on zoom-in, res offset, coarser ladder (2026-08-24, after Stephen flew it on molab)
+
+Stephen's reads from molab: "coarser is more interesting than fine" (the tiny
+hexagons are hard to see) and "when I zoom in to look at something the hexes
+change and I have to wait for the refold, which I don't want". Now:
+
+- `BASE_RES` 6 (was 7): one step coarser at every zoom, a quarter of the bytes
+  and a seventh of the polygons per rung.
+- **Zooming in inside the served box never refolds.** The served hexagons cover
+  the view and the browser scales them; the status says `held · finer
+  available (res N: press res +)`. Only leaving the box (pan past its edge,
+  zoom out past it) refolds on its own, and that is the coarse, cheap direction.
+- **`res − / +` in the strip**: the offset from the ladder (-2..+2). `+` refolds
+  the CURRENT view one step finer (7x the cells and the read); the offset is a
+  statement about the box it was set on and resets to 0 when the camera leaves
+  it (the mapterhorn rule). The kernel echoes the offset in force through a
+  `dres` trait so the strip shows it.
+- Molab status line for a res 10 view: AEF 2 files 3.5 s, fold 0.6 s, FRAME
+  5.6 s (0.1-0.5 s at home): the frame build is now sub-timed in the status
+  (join / score / kmeans / table / hex / colours) to find the slow piece there;
+  k-means is float32 with 12 Lloyd steps.
+
+Driven at home: open 21.6 s; zoom in x6 held; `+` -> res 6 in 3.2 s; zoom in
+x3 held with "finer available (res 7)".

@@ -161,7 +161,9 @@ def _():
     # finer every PER_RES zoom units, clamped, then coarsened until the view's
     # expected cell count fits CELL_BUDGET (polygons, not H3HexagonLayer, so the
     # budget is vertices: 150k hexagons is ~1M vertices).
-    ZOOM0, PER_RES, BASE_RES = 6.2, 1.4, 7
+    # BASE_RES 6 (was 7): one step coarser at every zoom, Stephen's call after
+    # flying it (the coarse hexagons read better and cost a quarter of the bytes).
+    ZOOM0, PER_RES, BASE_RES = 6.2, 1.4, 6
     MIN_RES, MAX_RES = 5, 11
     CELL_BUDGET = 150_000
     # Which NLCD overview each res reads (30 m native, ten doublings).
@@ -351,9 +353,10 @@ def _(
         w = (b[2] - b[0]) * 111.32 * math.cos(math.radians((b[1] + b[3]) / 2))
         return abs(w * (b[3] - b[1]) * 110.57)
 
-    def res_for_view(vs, box):
-        """The ladder's res for this zoom, coarsened until the box fits CELL_BUDGET."""
-        r = max(MIN_RES, min(MAX_RES, BASE_RES + math.floor((vs["zoom"] - ZOOM0) / PER_RES)))
+    def res_for_view(vs, box, dres=0):
+        """The ladder's res for this zoom (+ the strip's offset), coarsened until the
+        box fits CELL_BUDGET."""
+        r = max(MIN_RES, min(MAX_RES, BASE_RES + dres + math.floor((vs["zoom"] - ZOOM0) / PER_RES)))
         while r > MIN_RES and box_km2(box) / _CELL_KM2[r] > CELL_BUDGET:
             r -= 1
         return r
@@ -909,6 +912,7 @@ def _(anywidget, traitlets):
         `ctl` (canvas pixel + rect); the one element docks into fullscreen."""
 
         ctl = traitlets.Unicode("").tag(sync=True)
+        dres = traitlets.Unicode("0").tag(sync=True)  # kernel -> browser: the offset in force
         status = traitlets.Unicode("").tag(sync=True)
         legend = traitlets.Unicode("").tag(sync=True)
         panel = traitlets.Unicode("").tag(sync=True)
@@ -955,6 +959,33 @@ def _(anywidget, traitlets):
           };
           stylePaint();
           paintBox.append(pl, ...paintBtns.map(([, b]) => b));
+          // res: the offset from the ladder (-2..+2). + refolds the CURRENT view one
+          // step finer (zooming in never does on its own); the offset resets when
+          // the camera leaves the served box, and the kernel echoes it back.
+          const resBox = document.createElement("span");
+          resBox.style.cssText = "display:inline-flex;gap:.3rem;align-items:center";
+          const rl = document.createElement("span"); rl.textContent = "res";
+          const rv = document.createElement("span");
+          rv.style.cssText = "font-weight:600;font-variant-numeric:tabular-nums;min-width:1.6rem;text-align:center";
+          const mkRes = (d, text, title) => {
+            const b = document.createElement("button");
+            b.textContent = text; b.title = title; b.style.cssText = btnCss;
+            b.onclick = () => {
+              const cur = parseInt(model.get("dres") || "0", 10);
+              const nxt = Math.max(-2, Math.min(2, cur + d));
+              if (nxt !== cur) send("dres", { dres: nxt });
+            };
+            return b;
+          };
+          const rMinus = mkRes(-1, "−", "refold this view one step coarser");
+          const rPlus = mkRes(+1, "+", "refold this view one step finer (7x the cells, and the read)");
+          const paintR = () => {
+            const v = parseInt(model.get("dres") || "0", 10);
+            rv.textContent = (v > 0 ? "+" : "") + v;
+          };
+          model.on("change:dres", paintR);
+          paintR();
+          resBox.append(rl, rMinus, rv, rPlus);
           const legendBox = document.createElement("div");
           legendBox.style.cssText =
             "display:flex;flex-wrap:wrap;align-items:center;" +
@@ -997,7 +1028,7 @@ def _(anywidget, traitlets):
           };
           model.on("change:legend", renderLegend);
           renderLegend();
-          box.append(paintBox, legendBox);
+          box.append(paintBox, resBox, legendBox);
           const panel = document.createElement("div");
           panel.style.cssText = "font:13px ui-sans-serif,system-ui,sans-serif;padding:.15rem 0";
           const status = document.createElement("div");
@@ -1114,6 +1145,7 @@ def _(CartoStyle, HOME, Map, MaplibreBasemap, PolygonLayer, np, pa):
         "frame": None, "geo_sent": None, "box": None, "res": None, "vs": None,
         "busy": False, "pending": None, "task": None, "loop": None,
         "paint": "agreement", "sel": set(), "hit": None, "memo": {}, "h_cam": None, "h_ctl": None,
+        "dres": 0,  # the strip's res offset; a statement about the box it was set on
     }
     deck  # the cell's LAST statement: what marimo displays
     return HOLD, deck, layer
@@ -1164,6 +1196,12 @@ def _(
         except Exception:
             pass
 
+    def _say_dres():
+        try:
+            hud.widget.dres = str(HOLD["dres"])
+        except Exception:
+            pass
+
     def _vsd(vs):
         if vs is None:
             return dict(HOME)
@@ -1188,14 +1226,26 @@ def _(
         except Exception:
             pass
 
-    async def _serve(vs):
+    async def _serve(vs, force=False):
         vsd = _vsd(vs)
         view = view_to_bbox(vsd)
         box = pad_box(view)
-        res = res_for_view(vsd, box)
-        if HOLD["box"] is not None and HOLD["res"] == res and contains(HOLD["box"], view):
-            _say(HOLD.get("last_status", "") + " · held")
-            return
+        inside = HOLD["box"] is not None and contains(HOLD["box"], view)
+        if inside and not force:
+            # ZOOMING IN NEVER REFOLDS (Stephen: "you don't necessarily want the res
+            # to change right away"): the served hexagons cover the view and the
+            # browser scales them. Finer detail is the strip's res + button. Only a
+            # camera that LEAVES the served box, or a coarser ladder res (zoomed
+            # out, cheap), refolds on its own.
+            ladder = res_for_view(vsd, box, HOLD["dres"])
+            if ladder >= HOLD["res"]:
+                note = f" · finer available (res {ladder}: press res +)" if ladder > HOLD["res"] else ""
+                _say(HOLD.get("last_status", "") + " · held" + note)
+                return
+        if not inside and HOLD["box"] is not None:
+            HOLD["dres"] = 0  # a raised offset does not follow you to a new box
+            _say_dres()
+        res = res_for_view(vsd, box, HOLD["dres"])
         key = (res, tuple(round(v, 3) for v in box))
         t0 = time.time()
         _say(f"res {res} · folding…")
@@ -1281,6 +1331,15 @@ def _(
         HOLD["paint"] = c.get("paint", "agreement")
         HOLD["sel"] = {int(x) for x in c.get("sel", [])}
         fr = HOLD["frame"]
+        if c.get("act") == "dres":
+            HOLD["dres"] = max(-2, min(2, int(c.get("dres", 0))))
+            _say_dres()
+            vs = HOLD["vs"] if HOLD["vs"] is not None else dict(HOME)
+            if HOLD["busy"]:
+                HOLD["pending"] = vs
+            else:
+                HOLD["task"] = _spawn(_serve(vs, force=True))
+            return
         if c.get("act") == "click" and fr is not None:
             try:
                 vs = _vsd(HOLD["vs"] if HOLD["vs"] is not None else deck.view_state)

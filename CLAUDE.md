@@ -803,10 +803,20 @@ Numbers and design in `docs/aef-nlcd-notes.md`.
   via `HOLD["h_cam"]` / `HOLD["h_ctl"]` on re-run) and does NOT rely on marimo
   re-running on ctl. Same lonboard lessons as the one-shot: arro3 Table on
   assignment, `_rows_per_chunk` reset per swap.
-- **Ladder:** BASE_RES 7 at ZOOM0 6.2, PER_RES 1.4, res 5-11, then coarsened
-  until the padded box fits `CELL_BUDGET` 150k hexagons (polygons: the budget is
-  vertices). VIEW_W/H is still the 1400x720 guess (the HFP ruler is not ported).
-  Prototypes and k-means are PER VIEW: cluster colours change between folds.
+- **Ladder:** BASE_RES 6 at ZOOM0 6.2 (one step coarser than nlcd-zoom's,
+  Stephen's call from molab: "coarser is more interesting"), PER_RES 1.4, res
+  5-11, then coarsened until the padded box fits `CELL_BUDGET` 150k hexagons.
+  **ZOOMING IN INSIDE THE SERVED BOX NEVER REFOLDS** (his call: the refold wait
+  on a zoom-in was the thing he did not want); the status says `held · finer
+  available (res N: press res +)`, and the strip's `res − / +` refolds the
+  current view at an offset (-2..+2) that resets when the camera leaves the
+  box (the mapterhorn rule; kernel echoes it via a `dres` trait). Leaving the
+  box (pan off, zoom out) refolds on its own. Driven: all four paths. VIEW_W/H
+  is still the 1400x720 guess (the HFP ruler is not ported). Prototypes and
+  k-means are PER VIEW: cluster colours change between folds. On molab the
+  AEF read is fast (2 files 3.5 s) but the FRAME build measured 5.6 s against
+  0.1-0.5 s at home; the status now sub-times it (join/score/kmeans/table/
+  hex/colours) to find the slow piece there.
 
 `xsql-mapterhorn-explorer.py` (EXPERIMENTAL, open defects below) draws Mapterhorn terrain
 worldwide as extruded H3 columns: the DEM half of the parked
