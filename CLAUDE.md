@@ -781,9 +781,29 @@ runtime (crops lesson), so a WHITE SHEET polygon (the fold box, row 0 of the
 same polygon layer) hides the tiles under the hexagons. Strip: four paints
 (`NLCD raster` = tiles only at any zoom, fold skipped; `NLCD H3`; `agreement
 H3`; `AlphaEarth clusters H3`), a `highlight disagreement` checkbox (agreement
-alpha inverted: the least-backed cells solid), `res − / +`, `analyze what's in
-view` / `× clear` (the crops button: per-class and per-cluster tables in the
-panel), legend, click; 13px, full width, docks into fullscreen. H3 cells on an icosahedron
+alpha AND coverage inverted: the least-backed cells full-size and solid),
+`res − / +`, `analyze what's in view` / `× clear` (the crops button: per-class
+and per-cluster tables in the panel), `labels`, legend, click; 13px, full
+width, docks into fullscreen.
+- **BASEMAP UNDER THE HEXES, LABELS OVER EVERYTHING (2026-08-24, night; Stephen:
+  "we need to see the base map under the hexagons ... labels over").** The
+  basemap is Positron in `mode="interleaved"` and every deck layer carries
+  `before_id=LABELS_SLOT` (`"watername_ocean"`, the slot lonboard's own viz()
+  uses for Carto styles), so maplibre's labels paint over the raster and the
+  hexagons; the `labels` button swaps Positron / PositronNoLabels. A
+  labels-only `BitmapTileLayer` on top was tried first and NEVER DREW beside
+  the RasterLayer (the deforest two-tile-layer collision). The white sheet
+  under the hexagons is gone. The NLCD raster hides itself under the hexagons
+  by RENDERING TRANSPARENT TILES at the fine levels (`RASTER_HIDE_Z`, 60 m
+  and finer) whenever an H3 paint is selected: deterministic on the tile's
+  level, because deck requests tiles BEFORE `view_state` syncs to the kernel,
+  so any camera-set flag lost the race and opaque tiles were cached under the
+  hexes (measured with a render log: deck draws level z ~ floor(zoom) - 4
+  here; z5 = 60 m starts at zoom 9 = HEX_ZOOM). **OPEN DEFECT:** picking
+  `NLCD raster` at deep zoom after an H3 paint shows only the basemap: deck
+  keeps the transparent tiles; a fresh RasterLayer swapped in via
+  `deck.layers` (the deforest route) did not remount in the drive. Zoom out
+  past 9 and back, or pick the raster paint before zooming in, and it shows. H3 cells on an icosahedron
 edge have 8-10 vertices: the ring builder parses WKB by its own vertex count
 (the two white diagonals across CONUS on his screen were those cells
 dropped). Numbers and design in `docs/aef-nlcd-notes.md`.

@@ -273,3 +273,31 @@ the view; and the crops notebook's "analyze what's in view" (no time series).
 - Seen in the clusters paint over pure cornland: four clusters that are each
   100% "cultivated crops": the embedding splits the one NLCD word into kinds
   of cropland (rotation, most likely). The third tier doing its job.
+
+### Basemap under, labels over (2026-08-24, late night)
+
+Stephen: the basemap must be visible under the agreement hexes; labels over
+everything for every paint; a `labels` toggle. What held and what did not:
+
+- Labels-only `BitmapTileLayer` on top of the raster: never drew (two tile
+  layers, the deforest collision). Dropped.
+- INTERLEAVED basemap (`MaplibreBasemap(style=Positron, mode="interleaved")`)
+  with `before_id="watername_ocean"` on the raster and the polygon layer: labels
+  from the basemap itself paint over both. Verified at CONUS and at zoom 10.
+  The `labels` button swaps the style to PositronNoLabels and back (works).
+- The sheet under the hexes is gone; the basemap shows through the fade.
+- The raster under the hexes: `opacity` ignored; a camera-set flag for
+  transparent tiles LOST THE RACE every time (render log: all fine tiles
+  rendered with the flag still False; deck requests tiles before view_state
+  syncs). Deterministic rule instead: with an H3 paint, levels >= RASTER_HIDE_Z
+  (60 m and finer) render a 1x1 transparent PNG. Level per zoom measured: z1 at
+  5.x, z2 at 6.x, z3 at 7.x, z4 at 8.x, z5 at 9.x, so z5 lines up with
+  HEX_ZOOM 9.
+- OPEN: `NLCD raster` selected at deep zoom after an H3 paint shows nothing (the
+  transparent tiles stay cached). A nudge of `max_zoom` did not refetch; a fresh
+  RasterLayer via `deck.layers` did not remount in the drive (deforest's route
+  works there for a constants edit; here the swap happens inside a ctl
+  handler). Workaround: zoom out past 9 and back in with the raster paint on.
+  Stephen: "you're done with this."
+- Kernel-side tile cache `(x, y, z) -> Tile` (4,000 entries) so any raster
+  layer rebuild does not refetch from S3.

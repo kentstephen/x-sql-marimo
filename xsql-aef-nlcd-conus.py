@@ -85,12 +85,14 @@ def _():
     from PIL import Image
     from arro3.core import Table as ArrowTable
     from lonboard import Map, PolygonLayer, RasterLayer
+    from lonboard._geoarrow.ops import Bbox
     from lonboard.raster import EncodedImage
     from async_geotiff.tms import generate_tms
     from lonboard.basemap import CartoStyle, MaplibreBasemap
 
     return (
         ArrowTable,
+        Bbox,
         CartoStyle,
         EncodedImage,
         GeoTIFF,
@@ -199,6 +201,9 @@ def _():
     # agreement hexagons fold live for the small box in view (Stephen: "show
     # something cheap like the raster, then when you zoom in the agreement hexes").
     HEX_ZOOM = 9.0
+    # maplibre layer id deck draws BEFORE (under) in the interleaved basemap: the
+    # first label layer of Carto's Positron/Dark styles (lonboard's viz() uses it).
+    LABELS_SLOT = "watername_ocean"
     HOME = {"longitude": -96.0, "latitude": 38.5, "zoom": 4.0}
 
     TAU = 0.02
@@ -257,6 +262,7 @@ def _():
         HEX_ZOOM,
         HOME,
         K_CLUSTERS,
+        LABELS_SLOT,
         MAX_RES,
         MIN_CLASS_CELLS,
         MIN_RES,
@@ -406,14 +412,17 @@ def _(XarrayContext, coordinates_to_cells, pa, udf):
 
 @app.cell
 async def _(
+    Bbox,
     EncodedImage,
     GeoTIFF,
+    LABELS_SLOT,
     Image,
     NLCD_LEVEL_FOR_RES,
     NLCD_NODATA,
     NLCD_PREFIX,
     RasterLayer,
     S3Store,
+    Transformer,
     Window,
     YEAR_NLCD,
     albers_fwd,
@@ -437,13 +446,42 @@ async def _(
     _levels = [_g, *_g.overviews]
     _L, _B, _R, _T = _g.bounds
 
-    # ---- the cheap paint: NLCD as its own tiles, lonboard's raster-cog-nlcd
-    # example as is (the COG's colormap, nodata -> alpha 0), plus max_zoom so a
-    # zoom past the pyramid does not wrap onto the coarsest overview (0.16 ships
-    # the clamp commented out; repo lesson from the deforest notebook).
+    # ---- the cheap paint: NLCD as its own tiles. lonboard's raster-cog-nlcd
+    # example (the COG's colormap, nodata -> alpha 0), built the way
+    # RasterLayer.from_geotiff builds it but with a fetch that carries the tile's
+    # z: a tile layer's `opacity` is ignored at runtime under marimo (the crops
+    # lesson), so the way the raster gets out from under the hexagons is to
+    # RENDER TRANSPARENT tiles at the fine levels (z >= RASTER_HIDE_Z) while the
+    # hexes are on (`raster_state["hexes"]`). Tiles already cached opaque before
+    # the hexes came on stay until the next pan or zoom re-requests them.
     _cmap = _g.colormap.as_array()
+    _levels_r = [_g, *_g.overviews]
+    _tms = generate_tms(_g)
+    # Measured (driven, log of level per zoom): deck draws level z ~ floor(zoom) - 4 here
+    # (z3 = 240 m at zoom 7.x, z4 at 8.x, z5 = 60 m at 9.x), so the hidden levels start
+    # at the one that begins with HEX_ZOOM 9.
+    RASTER_HIDE_Z = len(_tms.tileMatrices) - 2  # 60 m and finer
+    raster_state = {"hexes": False, "raster_paint": False, "blank": None, "zoom": None}
+    _tile_cache = {}  # (x, y, z) -> Tile, so a fresh raster layer does not refetch from S3
 
-    def _render_nlcd(tile):
+    async def _fetch_nlcd(x, y, z):
+        key = (x, y, z)
+        if key not in _tile_cache:
+            image = _levels_r[len(_levels_r) - 1 - z]
+            _tile_cache[key] = await image.fetch_tile(x, y, boundless=False)
+            if len(_tile_cache) > 4000:
+                _tile_cache.pop(next(iter(_tile_cache)))
+        return (_tile_cache[key], z)
+
+    def _blank_png():
+        if raster_state["blank"] is None:
+            buf = io.BytesIO()
+            Image.new("RGBA", (1, 1), (0, 0, 0, 0)).save(buf, format="PNG")
+            raster_state["blank"] = buf.getvalue()
+        return EncodedImage(data=raster_state["blank"], media_type="image/png")
+
+    def _render_opaque(tz):
+        tile, z = tz
         arr = np.asarray(np.ma.filled(tile.array.as_masked(), NLCD_NODATA))[0]
         rgba = np.empty((*arr.shape, 4), dtype=np.uint8)
         rgba[..., :3] = _cmap[arr]
@@ -452,10 +490,37 @@ async def _(
         Image.fromarray(rgba, mode="RGBA").save(buf, format="PNG")
         return EncodedImage(data=buf.getvalue(), media_type="image/png")
 
-    _tms = generate_tms(_g)
-    nlcd_raster = RasterLayer.from_geotiff(
-        _g, render_tile=_render_nlcd, min_zoom=0, max_zoom=len(_tms.tileMatrices) - 1, opacity=1.0
-    )
+    def _render_under_hexes(tz):
+        # DETERMINISTIC: a tile's level implies the zoom, so with an H3 paint selected
+        # the fine levels are always transparent (deck requests tiles before the
+        # camera even syncs to the kernel, so a camera-set flag always lost the race
+        # and opaque tiles were cached under the hexagons).
+        if tz[1] >= RASTER_HIDE_Z:
+            return _blank_png()
+        return _render_opaque(tz)
+
+    _tf84 = Transformer.from_crs(_g.crs, "EPSG:4326", always_xy=True)
+    _wb = _tf84.transform_bounds(*_g.bounds)
+
+    def make_nlcd_raster(under_hexes):
+        """A FRESH RasterLayer (deck caches tiles per layer instance, and a tile
+        rendered transparent stays transparent, so switching between the raster
+        paint and an H3 paint at deep zoom needs a new layer: inserted through
+        deck.layers, the deforest rule)."""
+        return RasterLayer(
+            _tile_matrix_set=_tms,
+            _crs=_g.crs,
+            _fetch_tile=_fetch_nlcd,
+            _render_tile=_render_under_hexes if under_hexes else _render_opaque,
+            min_zoom=0,
+            max_zoom=len(_tms.tileMatrices) - 1,
+            _bounds=Bbox(*_wb),
+            _center=(_wb[0] + (_wb[2] - _wb[0]) / 2, _wb[1] + (_wb[3] - _wb[1]) / 2),
+            opacity=1.0,
+            before_id=LABELS_SLOT,
+        )
+
+    nlcd_raster = make_nlcd_raster(True)
 
     TILE = 512
     TILE_BUDGET = 384 * 1024 * 1024
@@ -558,7 +623,7 @@ async def _(
             f"{t1 - t0:.1f} s · fold {out.num_rows:,} {time.time() - t1:.1f} s"
         )
 
-    return nlcd_fold, nlcd_raster
+    return make_nlcd_raster, nlcd_fold, nlcd_raster, raster_state
 
 
 @app.cell
@@ -766,27 +831,20 @@ def _(
     _PAL = np.array([tuple(int(h[i:i + 2], 16) for i in (1, 3, 5)) for h in CLUSTER_HEX], np.uint8)
     con = duckdb.connect()
 
-    def _rings_table(cells, coords, lens, sheet):
-        """A geoarrow.polygon column: one polygon per ring (variable vertex counts),
-        with a SHEET polygon (the fold box, `sheet` = (W, S, E, N)) as row 0 under
-        the hexagons. The sheet hides the NLCD tile layer beneath the hexagons
-        (its `opacity` is ignored at runtime under marimo, the crops lesson) so
-        the fade shows a blank ground, inside the one polygon layer, no layer
-        toggling. Cells on an H3 icosahedron edge have 8-10 vertices: the two
-        white diagonals across CONUS on Stephen's screen were those cells being
-        dropped by a fixed-7-vertex parser."""
-        W, S, E, N = sheet
-        ring0 = np.array([[W, S], [E, S], [E, N], [W, N], [W, S]])
-        allc = np.concatenate([ring0, coords.reshape(-1, 2)])
-        alll = np.concatenate([[5], lens])
-        n = len(alll)
-        fsl = pa.FixedSizeListArray.from_arrays(pa.array(allc.ravel()), 2)
-        ring_off = np.concatenate([[0], np.cumsum(alll)]).astype(np.int32)
+    def _rings_table(cells, coords, lens):
+        """A geoarrow.polygon column: one polygon per ring, variable vertex counts
+        (cells on an H3 icosahedron edge have 8-10 vertices: the two white
+        diagonals across CONUS on Stephen's screen were those cells being dropped
+        by a fixed-7-vertex parser). No sheet under the hexagons any more: the
+        basemap must show through the fade (Stephen), and the NLCD raster hides
+        itself by rendering transparent tiles while the hexes are on."""
+        n = len(lens)
+        fsl = pa.FixedSizeListArray.from_arrays(pa.array(coords.ravel()), 2)
+        ring_off = np.concatenate([[0], np.cumsum(lens)]).astype(np.int32)
         rings = pa.ListArray.from_arrays(pa.array(ring_off), fsl)
         polys = pa.ListArray.from_arrays(pa.array(np.arange(0, n + 1, dtype=np.int32)), rings)
         geom = pa.field("geometry", polys.type, metadata={"ARROW:extension:name": "geoarrow.polygon", "ARROW:extension:metadata": '{"crs": "OGC:CRS84"}'})
-        cellcol = pa.concat_arrays([pa.array([0], pa.uint64()), cells["cell"].combine_chunks().cast(pa.uint64())])
-        return pa.Table.from_arrays([polys, cellcol], schema=pa.schema([geom, pa.field("cell", pa.uint64())]))
+        return pa.Table.from_arrays([polys, cells["cell"].combine_chunks().cast(pa.uint64())], schema=pa.schema([geom, pa.field("cell", pa.uint64())]))
 
     def _parse_wkb(blobs):
         """(coords (P, 2), lens (n,)) from h3ronpy polygon WKB: one ring each,
@@ -816,7 +874,7 @@ def _(
         f = np.repeat(factor, lens)[:, None]
         return np.repeat(ctr, lens, axis=0) + (coords - np.repeat(ctr, lens, axis=0)) * f
 
-    def build_frame(nlcd_cells, aef_cells, box):
+    def build_frame(nlcd_cells, aef_cells):
         """Join the two folds, score, cluster, build both hexagon tables."""
         import time as _time
         _tt = {"t": _time.time()}
@@ -905,13 +963,13 @@ def _(
         blobs = cells_to_wkb_polygons(cells["cell"].combine_chunks()).to_pylist()
         coords, lens = _parse_wkb(blobs)
         cov = np.where(np.isnan(agree), 1.0, COV_MIN + (1 - COV_MIN) * np.clip(agree, 0, 1))
-        geo = _rings_table(cells, _scaled(coords, lens, cov), lens, box)
-        geo_full = _rings_table(cells, coords, lens, box)
+        geo = _rings_table(cells, _scaled(coords, lens, cov), lens)
+        geo_full = _rings_table(cells, coords, lens)
         # highlight disagreement: coverage inverted too (the least-backed cells
         # full-size and solid, the agreeing ones small and faint), else the two
         # cues point opposite ways and the map reads as pale blobs with bold dots
         cov_inv = np.where(np.isnan(agree), COV_MIN, COV_MIN + (1 - COV_MIN) * (1 - np.clip(agree, 0, 1)))
-        geo_inv = _rings_table(cells, _scaled(coords, lens, cov_inv), lens, box)
+        geo_inv = _rings_table(cells, _scaled(coords, lens, cov_inv), lens)
         lap("hex")
         rgb = np.array([CLASSES.get(int(c), ("?", (128, 128, 128)))[1] for c in cls], np.uint8)
         alpha_agree = np.where(
@@ -939,7 +997,6 @@ def _(
             rgba = np.concatenate([c, a[:, None]], axis=1)
             if hit is not None:
                 rgba[cellid == hit] = (255, 255, 255, 255)
-            rgba = np.concatenate([np.array([[248, 248, 246, 235]], np.uint8), rgba])  # the sheet
             return pa.FixedSizeListArray.from_arrays(pa.array(rgba.ravel()), 4)
 
         lap("colours")
@@ -1138,6 +1195,13 @@ def _(anywidget, traitlets):
           clB.textContent = "× clear"; clB.style.cssText = btnCss;
           clB.onclick = () => send("clear");
           anBox.append(anB, clB);
+          let labelsOn = true;
+          const lbB = document.createElement("button");
+          lbB.textContent = "labels"; lbB.style.cssText = btnCss; lbB.title = "place labels over the map, on or off";
+          const styleLb = () => { lbB.style.borderColor = labelsOn ? "#2b6cb0" : "rgba(127,127,127,.45)"; lbB.style.fontWeight = labelsOn ? "600" : "400"; };
+          styleLb();
+          lbB.onclick = () => { labelsOn = !labelsOn; styleLb(); send("labels", { labels: labelsOn }); };
+          anBox.append(lbB);
           box.append(paintBox, resBox, anBox, legendBox);
           const panel = document.createElement("div");
           panel.style.cssText = "font:13.5px ui-sans-serif,system-ui,sans-serif;padding:.25rem 0";
@@ -1231,7 +1295,7 @@ def _(anywidget, traitlets):
 
 
 @app.cell
-def _(CartoStyle, HOME, Map, MaplibreBasemap, PolygonLayer, np, pa):
+def _(CartoStyle, HOME, LABELS_SLOT, Map, MaplibreBasemap, PolygonLayer, np, pa):
     # ---- the map: built ONCE on a placeholder; never re-runs for a parameter -----
     _xy = np.array([[[-96.001, 38.501], [-95.999, 38.501], [-95.999, 38.499],
                      [-96.001, 38.499], [-96.001, 38.501]]])
@@ -1245,10 +1309,18 @@ def _(CartoStyle, HOME, Map, MaplibreBasemap, PolygonLayer, np, pa):
         filled=True,
         stroked=False,
         pickable=False,
+        before_id=LABELS_SLOT,
     )
+    # LABELS OVER EVERYTHING, from the basemap itself: the basemap runs INTERLEAVED
+    # (deck draws inside maplibre's layer stack) and every deck layer carries
+    # `before_id=LABELS_SLOT`, the first label layer of Carto's styles (lonboard's
+    # own viz() uses the same slot), so maplibre's labels paint over the hexagons
+    # and the raster. A labels-only tile layer on top was tried first and never
+    # drew: a second tile layer beside the raster is the id collision this repo
+    # met in deforest. The `labels` button swaps Positron / PositronNoLabels.
     deck = Map(
         layers=[layer],
-        basemap=MaplibreBasemap(style=CartoStyle.Positron),
+        basemap=MaplibreBasemap(style=CartoStyle.Positron, mode="interleaved"),
         view_state=dict(HOME),
         height=720,
     )
@@ -1289,14 +1361,18 @@ def _(
     coordinates_to_cells,
     deck,
     fr_rgba0,
+    CartoStyle,
+    MaplibreBasemap,
     hud,
     json,
     layer,
     legend_for,
+    make_nlcd_raster,
     math,
     nlcd_fold,
     nlcd_raster,
     np,
+    raster_state,
     pad_box,
     res_for_view,
     time,
@@ -1317,12 +1393,15 @@ def _(
 
     # The raster goes in through deck.layers FROM HERE (the deforest rule): a
     # constants edit rebuilds it and rewires without destroying the Map.
-    if HOLD["raster"] is not nlcd_raster:
-        deck.layers = [nlcd_raster, layer]
-        HOLD["raster"] = nlcd_raster
+    if HOLD["raster"] is None or HOLD.get("raster_src") is not nlcd_raster:
+        # first wiring, or the NLCD cell re-ran: a fresh raster for the current paint
+        HOLD["raster"] = make_nlcd_raster(HOLD["paint"] != "raster")
+        HOLD["raster_src"] = nlcd_raster
+        deck.layers = [HOLD["raster"], layer]
 
     def _hexes_off(msg):
         """Below HEX_ZOOM: the picture shows, the hexagon layer holds its placeholder."""
+        raster_state["hexes"] = False
         with layer.hold_sync():
             if HOLD["geo_sent"] is not HOLD["placeholder"]:
                 layer._rows_per_chunk = 1
@@ -1410,11 +1489,12 @@ def _(
                 return
             t1 = time.time()
             loop = asyncio.get_running_loop()
-            fr = await loop.run_in_executor(None, build_frame, nl, ae, box)
+            fr = await loop.run_in_executor(None, build_frame, nl, ae)
             stats = f"res {res} · {s1} · {s2} · frame {time.time() - t1:.1f} s"
             HOLD["memo"][key] = (fr, stats)
             if len(HOLD["memo"]) > 12:
                 HOLD["memo"].pop(next(iter(HOLD["memo"])))
+        raster_state["hexes"] = True  # fine NLCD tiles render transparent from now on
         HOLD["frame"], HOLD["box"], HOLD["res"], HOLD["hit"] = fr, box, res, None
         _paint()
         HOLD["last_status"] = f"{stats} · {fr['score']} · {time.time() - t0:.1f} s"
@@ -1450,9 +1530,17 @@ def _(
             loop = HOLD.get("loop")
             return asyncio.run_coroutine_threadsafe(coro, loop) if loop else None
 
+    def _hexes_wanted(vs):
+        """Whether the hexes will be on at this camera: decides, BEFORE deck's tile
+        requests for the new zoom are served, whether the fine NLCD tiles render
+        transparent (the fold lands seconds later; by then the tiles are cached)."""
+        return HOLD["paint"] != "raster" and _vsd(vs)["zoom"] >= HEX_ZOOM
+
     def _on_camera(change):
         vs = change["new"]
         HOLD["vs"] = vs
+        raster_state["hexes"] = _hexes_wanted(vs)
+        raster_state["zoom"] = round(_vsd(vs)["zoom"], 2)
         if HOLD["busy"]:
             HOLD["pending"] = vs
             return
@@ -1547,6 +1635,12 @@ def _(
         if HOLD["paint"] != _was and (HOLD["paint"] == "raster" or _was == "raster"):
             # into or out of the raster paint: park the hexes, or fold the current view
             vs = HOLD["vs"] if HOLD["vs"] is not None else dict(HOME)
+            raster_state["hexes"] = _hexes_wanted(vs)
+            raster_state["raster_paint"] = HOLD["paint"] == "raster"
+            # a fresh raster layer for this paint (deck's per-layer tile cache holds
+            # the other paint's renders); inserted through deck.layers
+            HOLD["raster"] = make_nlcd_raster(HOLD["paint"] != "raster")
+            deck.layers = [HOLD["raster"], layer]
             if HOLD["busy"]:
                 HOLD["pending"] = vs
             else:
@@ -1563,6 +1657,12 @@ def _(
             return
         if c.get("act") == "clear":
             hud.widget.panel = ""
+            return
+        if c.get("act") == "labels":
+            deck.basemap = MaplibreBasemap(
+                style=CartoStyle.Positron if c.get("labels", True) else CartoStyle.PositronNoLabels,
+                mode="interleaved",
+            )
             return
         if c.get("act") == "analyze":
             hud.widget.panel = _analyze_html(fr) if fr is not None else "<span style='opacity:.7'>no fold in view (zoom in past 9, or pick an H3 paint)</span>"
