@@ -734,6 +734,15 @@ def _(
 
     def build_frame(nlcd_cells, aef_cells):
         """Join the two folds, score, cluster, build both hexagon tables."""
+        import time as _time
+        _tt = {"t": _time.time()}
+        _lap = {}
+
+        def lap(name):
+            now = _time.time()
+            _lap[name] = now - _tt["t"]
+            _tt["t"] = now
+
         con.register("nlcd_cells", nlcd_cells)
         if aef_cells is None:
             j = con.execute("SELECT cell, cls, npx, purity FROM nlcd_cells ORDER BY cell").arrow().read_all()
@@ -743,9 +752,10 @@ def _(
             j = con.execute("SELECT * FROM nlcd_cells JOIN aef_cells USING (cell) ORDER BY cell").arrow().read_all()
             has_aef = True
         n = j.num_rows
+        lap("join")
         cls = j["cls"].to_numpy().astype(np.int64)
         if has_aef and n > 0:
-            V = np.stack([j[f"e{i:02d}"].to_numpy() for i in range(64)], axis=1)
+            V = np.stack([j[f"e{i:02d}"].to_numpy() for i in range(64)], axis=1).astype(np.float32)
             hom = np.linalg.norm(V, axis=1)
             V = V / np.maximum(hom, 1e-9)[:, None]
             present, counts = np.unique(cls, return_counts=True)
@@ -768,15 +778,16 @@ def _(
             else:
                 agree = np.full(n, np.nan)
                 alt = np.full(n, -1)
-            # spherical k-means
+            lap("score")
+            # spherical k-means (float32, 12 Lloyd steps: the assignment barely moves after)
             k = min(K_CLUSTERS, n)
             rng = np.random.default_rng(0)
             C = V[rng.integers(n)][None, :]
             for _ in range(1, k):
-                d = np.clip(1 - (V @ C.T).max(1), 1e-12, None)
+                d = np.clip(1 - (V @ C.T).max(1), 1e-12, None).astype(np.float64)
                 C = np.vstack([C, V[rng.choice(n, p=d / d.sum())]])
             clu = np.zeros(n, np.int64)
-            for _ in range(25):
+            for _ in range(12):
                 new = (V @ C.T).argmax(1)
                 if (new == clu).all():
                     break
@@ -788,6 +799,7 @@ def _(
             clu = (V @ C.T).argmax(1)
             order = np.argsort(-np.bincount(clu, minlength=k))
             clu = np.argsort(order)[clu]
+            lap("kmeans")
         else:
             hom = np.full(n, np.nan)
             agree = np.full(n, np.nan)
@@ -805,6 +817,7 @@ def _(
             "alt_name": pa.array([CLASSES.get(int(c), ("none",))[0] for c in alt]),
         })
 
+        lap("table")
         blobs = cells_to_wkb_polygons(cells["cell"].combine_chunks()).to_pylist()
         ok = np.array([len(b) == 125 for b in blobs])
         if not ok.all():
@@ -817,6 +830,7 @@ def _(
         cov = np.where(np.isnan(agree), 1.0, COV_MIN + (1 - COV_MIN) * np.clip(agree, 0, 1))
         geo = _hex_table(cells, ctr + (xy - ctr) * cov[:, None, None])
         geo_full = _hex_table(cells, xy)
+        lap("hex")
 
         rgb = np.array([CLASSES.get(int(c), ("?", (128, 128, 128)))[1] for c in cls], np.uint8)
         alpha_agree = np.where(
@@ -838,11 +852,12 @@ def _(
                 rgba[cellid == hit] = (255, 255, 255, 255)
             return pa.FixedSizeListArray.from_arrays(pa.array(rgba.ravel()), 4)
 
+        lap("colours")
         a_ok = agree[~np.isnan(agree)]
         score = (
             f"{n:,} cells · agreement p50 {np.median(a_ok):.2f} · {(a_ok < 0.5).mean() * 100:.0f}% below 0.5"
             if len(a_ok) else f"{n:,} cells · NLCD only"
-        )
+        ) + " (" + " ".join(f"{k} {v:.1f}" for k, v in _lap.items()) + ")"
         return {
             "cells": cells, "geo": geo, "geo_full": geo_full, "fill": fill,
             "cls": cls, "clu": clu, "agree": agree, "has_aef": has_aef, "score": score,
