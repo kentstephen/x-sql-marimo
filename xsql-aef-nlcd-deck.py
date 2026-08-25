@@ -9,6 +9,7 @@
 #     "h3ronpy>=0.22.0",
 #     "pyarrow>=25.0.0",
 #     "arro3-core",
+#     "geoarrow-rust-core",
 #     "obstore>=0.9.2",
 #     "async-geotiff>=0.4",
 #     "anywidget>=0.9",
@@ -219,6 +220,17 @@ def _():
     COV_FLAT = 1.00
     ALPHA_FLAT = 190
     DIM_ALPHA = 22
+    # Boundaries around clusters of low-agreement cells: the set of cells with
+    # agreement below the strip's threshold (EDGE_THR seeds it) is dissolved in
+    # DuckDB (h3_cells_to_multi_polygon_wkb, H3's own outer-boundary walk, then
+    # ST_Dump into blobs); blobs under EDGE_MIN_CELLS cells (by area against the
+    # res's average cell) are speckle and dropped. Drawn as one PathLayer.
+    EDGE_THR = 0.5
+    EDGE_MIN_CELLS = 7
+    # each ring is painted the NLCD colour of the blob's majority class (Stephen:
+    # "the same color as the NLCD hexes"), at this alpha and width
+    EDGE_ALPHA = 235
+    EDGE_WIDTH = 2  # px
 
     NLCD_PREFIX = "kylebarron/usgs-landcover/annual-nlcd/c1/v1/cu/mosaic"
     NLCD_NODATA = 250
@@ -266,6 +278,10 @@ def _():
         COV_FLAT,
         COV_MIN,
         DIM_ALPHA,
+        EDGE_ALPHA,
+        EDGE_MIN_CELLS,
+        EDGE_THR,
+        EDGE_WIDTH,
         HEX_ZOOM,
         HOME,
         K_CLUSTERS,
@@ -820,14 +836,26 @@ def _(
     MIN_CLASS_CELLS,
     TAU,
     duckdb,
+    io,
     np,
     pa,
+    time,
 ):
     # ---- a FRAME: scores, clusters, coverage and colours for one folded view ------
+    # GeoArrow for the boundaries (the counties film's transport): WKB rings ->
+    # geoarrow.linestring with INTERLEAVED coords (what @geoarrow/deck.gl-layers
+    # reads), through arro3 so the extension metadata survives into the IPC
+    # stream (pyarrow's own table constructor drops it, measured)
+    import pyarrow.ipc as pa_ipc
+    from geoarrow.rust.core import from_wkb as ga_from_wkb, linestring as ga_linestring
+    from arro3.core import Array as ArroArray, Table as ArroTable
     # No hexagon geometry here: the widget's H3HexagonLayer draws from the cell
     # ids, and the per-cell coverage is an attribute (the kepler-style column).
     _PAL = np.array([tuple(int(h[i:i + 2], 16) for i in (1, 3, 5)) for h in CLUSTER_HEX], np.uint8)
     con = duckdb.connect()
+    # h3 + spatial for the low-agreement boundaries (edges_for below); the fold
+    # itself stays the h3 UDF in DataFusion
+    con.execute("INSTALL h3 FROM community; LOAD h3; INSTALL spatial; LOAD spatial")
 
     def build_frame(nlcd_cells, aef_cells):
         """Join the two folds, score, cluster, build both hexagon tables."""
@@ -969,6 +997,99 @@ def _(
             "cls": cls, "clu": clu, "agree": agree, "has_aef": has_aef, "score": score,
         }
 
+    def label_components(a, b, n):
+        """Connected components over undirected edges (a, b) among n nodes, in
+        numpy: min-label hooking + pointer jumping until stable. 73k low cells /
+        91k edges in 0.15 s (361 rounds); the H3 neighbour edges come from DuckDB."""
+        lab = np.arange(n)
+        while True:
+            m = lab.copy()
+            np.minimum.at(m, a, lab[b])
+            np.minimum.at(m, b, lab[a])
+            m = m[m]
+            while True:
+                mm = m[m]
+                if np.array_equal(mm, m):
+                    break
+                m = mm
+            if np.array_equal(m, lab):
+                return lab
+            lab = m
+
+    def edges_for(frame, thr, min_cells, alpha):
+        """Boundaries of the clusters of cells with agreement < thr, one colour per
+        cluster: the NLCD colour of its majority class. DuckDB's h3 extension does
+        the geometry (`h3_grid_ring_unsafe` for the neighbour edges,
+        `h3_cells_to_multi_polygon_wkb` per blob for the dissolve, the H3
+        outer-boundary walk that is 30x faster than ST_Union_Agg of hexagons),
+        numpy labels the components in between (the polygon -> cells unnest,
+        `h3_polygon_wkb_to_cells`, is O(cells x vertices) and measured 23 s on a
+        150k-cell frame with one percolating blob; the labels are 0.15 s). Blob
+        area is the sum of `h3_cell_area` (ST_Transform to Albers measured 8.8 s
+        on the same frame). Blobs under min_cells cells are dropped. Every ring
+        (outer and holes) is one closed LineString; `ipc` is ONE Arrow IPC stream
+        of a geoarrow.linestring table (interleaved coords, EPSG:4326, `color`
+        rgba uint8[4] per ring, `cls`, `km2`), the layout
+        @geoarrow/deck.gl-layers' GeoArrowPathLayer draws directly. Memoised on
+        the frame per (thr, min_cells, alpha). Measured at the 150k budget with
+        half the cells low: 0.25 s end to end."""
+        key = (round(float(thr), 3), int(min_cells), int(alpha))
+        cache = frame.setdefault("edges", {})
+        if key in cache:
+            return cache[key]
+        t0 = time.time()
+        agree = frame["agree"]
+        n_low = int(np.sum(agree < thr))
+        out = {"ipc": b"", "n_low": n_low, "blobs": 0, "max_km2": 0.0, "rings": 0, "ms": 0}
+        if n_low:
+            con.register("edge_cells", frame["cells"])
+            low = con.sql(
+                "SELECT cell, cls, row_number() OVER (ORDER BY cell) - 1 AS i FROM edge_cells WHERE agree < $thr",
+                params={"thr": float(thr)},
+            ).arrow().read_all()
+            con.register("edge_low", low)
+            e = con.sql("""
+                WITH nb AS (SELECT i, UNNEST(h3_grid_ring_unsafe(cell, 1)) AS ncell FROM edge_low)
+                SELECT nb.i AS a, l2.i AS b FROM nb JOIN edge_low l2 ON nb.ncell = l2.cell WHERE nb.i < l2.i
+            """).arrow().read_all()
+            lab = label_components(e["a"].to_numpy(), e["b"].to_numpy(), low.num_rows)
+            con.register("edge_blob", pa.table({"i": np.arange(low.num_rows), "blob": lab}))
+            r = con.sql("""
+                WITH g AS (
+                  SELECT b.blob, mode(l.cls) AS cls, count(*) AS ncell,
+                         sum(h3_cell_area(l.cell, 'km^2')) AS km2,
+                         ST_GeomFromWKB(h3_cells_to_multi_polygon_wkb(list(l.cell))) AS geom
+                  FROM edge_low l JOIN edge_blob b USING (i)
+                  GROUP BY b.blob HAVING count(*) >= $min_cells),
+                p AS (SELECT blob, cls, ncell, km2, UNNEST(ST_Dump(geom)).geom AS poly FROM g),
+                q AS (SELECT blob, cls, ncell, km2, UNNEST(ST_Dump(ST_Boundary(poly))).geom AS ring FROM p),
+                s AS (SELECT count(*) AS blobs, max(km2) AS max_km2 FROM g)
+                SELECT q.blob, q.cls, q.ncell, q.km2, ST_AsWKB(q.ring) AS wkb, s.blobs, s.max_km2
+                FROM q, s ORDER BY q.ncell DESC
+            """, params={"min_cells": int(min_cells)}).arrow().read_all()
+            if r.num_rows:
+                geom = ga_from_wkb(
+                    r["wkb"].combine_chunks().cast(pa.binary()),
+                    to_type=ga_linestring("xy", coord_type="interleaved", crs="EPSG:4326"),
+                )
+                cls = r["cls"].to_numpy().astype(np.int64)
+                rgb = np.array([CLASSES.get(int(c), ("?", (128, 128, 128)))[1] for c in cls], np.uint8)
+                rgba = np.concatenate([rgb, np.full((len(cls), 1), alpha, np.uint8)], axis=1).ravel()
+                color = pa.FixedSizeListArray.from_arrays(pa.array(rgba, pa.uint8()), 4)
+                tbl = pa.table(ArroTable.from_arrays(
+                    [ArroArray.from_arrow(geom), ArroArray.from_arrow(color),
+                     ArroArray.from_arrow(r["cls"].combine_chunks()), ArroArray.from_arrow(r["km2"].combine_chunks())],
+                    names=["geometry", "color", "cls", "km2"],
+                )).combine_chunks()
+                sink = io.BytesIO()
+                with pa_ipc.new_stream(sink, tbl.schema) as w:
+                    w.write_table(tbl)
+                out.update(ipc=sink.getvalue(), rings=int(r.num_rows),
+                           blobs=int(r["blobs"][0].as_py()), max_km2=float(r["max_km2"][0].as_py()))
+        out["ms"] = int(1000 * (time.time() - t0))
+        cache[key] = out
+        return out
+
     def legend_for(frame, paint):
         cls, clu, agree = frame["cls"], frame["clu"], frame["agree"]
         tot = max(1, len(cls))
@@ -1004,7 +1125,7 @@ def _(
                 })
         return items
 
-    return build_frame, con, legend_for
+    return build_frame, con, edges_for, legend_for
 
 
 @app.cell
@@ -1017,6 +1138,7 @@ def _(anywidget, traitlets):
 
         ctl = traitlets.Unicode("").tag(sync=True)
         dres = traitlets.Unicode("0").tag(sync=True)  # kernel -> browser: the offset in force
+        thr0 = traitlets.Unicode("0.5").tag(sync=True)  # kernel -> browser: the threshold slider's seed
         status = traitlets.Unicode("").tag(sync=True)
         legend = traitlets.Unicode("").tag(sync=True)
         panel = traitlets.Unicode("").tag(sync=True)
@@ -1039,9 +1161,11 @@ def _(anywidget, traitlets):
           let paint = "agreement";
           const sel = new Set();
           let seq = 0;
+          let edgesOn = false;
           const send = (act, extra) => {
             model.set("ctl", JSON.stringify(Object.assign({
-              act: act, paint: paint, sel: Array.from(sel), inv: inv.checked, n: ++seq }, extra || {})));
+              act: act, paint: paint, sel: Array.from(sel), inv: inv.checked,
+              edges: edgesOn, thr: parseFloat(thr.value), n: ++seq }, extra || {})));
             model.save_changes();
           };
           const onCss = (b, on) => {
@@ -1074,6 +1198,30 @@ def _(anywidget, traitlets):
           const stylePaint = () => { paintBtns.forEach(([k, b]) => onCss(b, k === paint)); };
           stylePaint();
           paintBox.append(pl, ...paintBtns.map(([, b]) => b), invLab);
+          // boundaries around the clusters of low-agreement cells (dissolved in
+          // the kernel by DuckDB's h3 extension), with the agreement threshold
+          // that defines "low": a slider that commits on change (never input:
+          // every commit is a dissolve and a send)
+          const edgeBox = document.createElement("span");
+          edgeBox.style.cssText = "display:inline-flex;gap:.35rem;align-items:center";
+          const edB = document.createElement("button");
+          edB.textContent = "boundaries"; edB.style.cssText = btnCss;
+          edB.title = "outline every cluster of cells whose agreement is below the threshold; click again to hide";
+          const thr = document.createElement("input");
+          thr.type = "range"; thr.min = "0.05"; thr.max = "0.95"; thr.step = "0.05";
+          thr.value = String(model.get("thr0") || "0.5");
+          thr.style.cssText = "width:7rem;vertical-align:middle";
+          thr.title = "agreement below this is inside a boundary";
+          const thrV = document.createElement("span");
+          thrV.style.cssText = "font-variant-numeric:tabular-nums;min-width:2.6rem";
+          const paintThr = () => { thrV.textContent = "< " + parseFloat(thr.value).toFixed(2); };
+          paintThr();
+          thr.addEventListener("input", paintThr);
+          thr.addEventListener("change", () => { if (edgesOn) send("set"); });
+          const styleEd = () => onCss(edB, edgesOn);
+          styleEd();
+          edB.onclick = () => { edgesOn = !edgesOn; styleEd(); send("set"); };
+          edgeBox.append(edB, thr, thrV);
           // res: the offset from the ladder (-2..+2). + refolds the CURRENT view one
           // step finer (zooming in never does on its own); the offset resets when
           // the camera leaves the served box, and the kernel echoes it back.
@@ -1162,7 +1310,7 @@ def _(anywidget, traitlets):
           styleLb();
           lbB.onclick = () => { labelsOn = !labelsOn; styleLb(); send("labels", { labels: labelsOn }); };
           anBox.append(lbB);
-          box.append(paintBox, resBox, anBox, legendBox);
+          box.append(paintBox, edgeBox, resBox, anBox, legendBox);
           const panel = document.createElement("div");
           panel.style.cssText = "font:13.5px ui-sans-serif,system-ui,sans-serif;padding:.25rem 0";
           const status = document.createElement("div");
@@ -1247,6 +1395,10 @@ def _(anywidget, asyncio, traitlets):
         cells = traitlets.Bytes(b"").tag(sync=True)
         colors = traitlets.Bytes(b"").tag(sync=True)
         cov = traitlets.Bytes(b"").tag(sync=True)
+        # low-agreement boundaries: one GeoArrow IPC stream (geoarrow.linestring,
+        # interleaved coords; the counties film's transport), drawn by a
+        # GeoArrowPathLayer under `config.edges`
+        edges = traitlets.Bytes(b"").tag(sync=True)
         config = traitlets.Unicode("{}").tag(sync=True)
         view = traitlets.Unicode("").tag(sync=True)
         pick = traitlets.Unicode("").tag(sync=True)
@@ -1275,12 +1427,17 @@ def _(anywidget, asyncio, traitlets):
                 self.send({"kind": "tile", "id": c["id"]}, buffers=[png])
 
         _esm = r"""
+        // every deck import pins the same versions AND the same ?deps= per package
+        // (esm.sh hashes a module by its deps list), so the whole graph resolves to
+        // ONE @deck.gl/core; apache-arrow rides along for the GeoArrow layers. The
+        // strings are the HRRR counties film's (crawled: one core, one luma set).
         import maplibregl from "https://esm.sh/maplibre-gl@5.24.0";
-        import {MapboxOverlay} from "https://esm.sh/@deck.gl/mapbox@9.3.10?deps=@deck.gl/core@9.3.10";
-        import {ColumnLayer, BitmapLayer} from "https://esm.sh/@deck.gl/layers@9.3.10?deps=@deck.gl/core@9.3.10";
-        import {TileLayer, H3HexagonLayer} from "https://esm.sh/@deck.gl/geo-layers@9.3.10?deps=@deck.gl/core@9.3.10,@deck.gl/extensions@9.3.10,@deck.gl/layers@9.3.10,@deck.gl/mesh-layers@9.3.10";
+        import {MapboxOverlay} from "https://esm.sh/@deck.gl/mapbox@9.3.10?deps=@deck.gl/core@9.3.10,apache-arrow@18.1.0";
+        import {ColumnLayer, BitmapLayer, PathLayer} from "https://esm.sh/@deck.gl/layers@9.3.10?deps=@deck.gl/core@9.3.10,apache-arrow@18.1.0";
+        import {TileLayer, H3HexagonLayer} from "https://esm.sh/@deck.gl/geo-layers@9.3.10?deps=@deck.gl/core@9.3.10,@deck.gl/extensions@9.3.10,@deck.gl/layers@9.3.10,@deck.gl/mesh-layers@9.3.10,apache-arrow@18.1.0";
+        import {GeoArrowPathLayer} from "https://esm.sh/@geoarrow/deck.gl-layers@0.3.2?deps=@deck.gl/aggregation-layers@9.3.10,@deck.gl/core@9.3.10,@deck.gl/extensions@9.3.10,@deck.gl/geo-layers@9.3.10,@deck.gl/layers@9.3.10,@deck.gl/mesh-layers@9.3.10,apache-arrow@18.1.0";
+        import * as arrow from "https://esm.sh/apache-arrow@18.1.0";
         import {latLngToCell, getResolution, cellToBoundary} from "https://esm.sh/h3-js@4.5.0";
-        import {PathLayer} from "https://esm.sh/@deck.gl/layers@9.3.10?deps=@deck.gl/core@9.3.10";
 
         const STYLES = {
           labels: "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
@@ -1352,12 +1509,19 @@ def _(anywidget, asyncio, traitlets):
           // later, from a timer) the DataView marimo handed over is no longer
           // readable and loadCells silently left N = 0 (measured: the change event
           // saw 46,440 bytes, the deferred read saw nothing, a manual reload worked).
-          const raw = {cells: null, colors: null, cov: null};
+          const raw = {cells: null, colors: null, cov: null, edges: null};
           const grab = (k) => {
             try { const u8 = bytesOf(model.get(k)); raw[k] = u8 && u8.length ? copyOf(u8) : null; }
             catch (e) { raw[k] = null; say("grab " + k + ": " + e.message); }
           };
           let dataObj = null;  // one object per (cells, colors, cov) triple: identity is deck's change signal
+          let edgeTable = null;  // the boundaries: an arrow Table with a geoarrow.linestring column
+          function loadEdges() {
+            const buf = raw.edges;
+            if (!buf || !buf.byteLength) { edgeTable = null; return; }
+            try { edgeTable = arrow.tableFromIPC(new Uint8Array(buf)); }
+            catch (e) { edgeTable = null; say("edges: " + e.message); }
+          }
 
           function loadCells() {
             const buf = raw.cells;
@@ -1461,6 +1625,20 @@ def _(anywidget, asyncio, traitlets):
               pickable: true,
               beforeId: cfg.labels_slot || "watername_ocean",
             }));
+            // boundaries of the low-agreement clusters (dissolved in the kernel by
+            // DuckDB's h3 extension): one PathLayer over every closed ring, drawn
+            // whatever the paint (they are the hexagons' own frame, so they hide
+            // with them below hex_zoom)
+            if (cfg.edges && edgeTable && edgeTable.numRows && (!map || map.getZoom() >= (cfg.hex_zoom || 9))) out.push(new GeoArrowPathLayer({
+              id: "edges",
+              data: edgeTable,
+              getPath: edgeTable.getChild("geometry"),
+              getColor: edgeTable.getChild("color"),
+              widthUnits: "pixels", getWidth: cfg.edge_width || 2, widthMinPixels: 1,
+              jointRounded: true,
+              _validate: false,
+              beforeId: cfg.labels_slot || "watername_ocean",
+            }));
             // the picked cell: its own colour stays, a gold outline from its boundary
             if (cfg.hit && hexIndex.has(cfg.hit)) {
               let ring = null;
@@ -1528,7 +1706,7 @@ def _(anywidget, asyncio, traitlets):
               onError: (e) => say("deck: " + (e && e.message ? e.message : e)),
             });
             map.addControl(overlay);
-            if (cfg.debug) window.__aef = {overlay, map, model, reload, get N() { return N; }, get colors() { return colors; }, get cov() { return cov; }, get dataObj() { return dataObj; }};
+            if (cfg.debug) window.__aef = {overlay, map, model, reload, get N() { return N; }, get colors() { return colors; }, get cov() { return cov; }, get dataObj() { return dataObj; }, get edgeTable() { return edgeTable; }, get raw() { return raw; }, get cfg() { return cfg; }};
             map.on("load", () => { labels(cfg.labels !== false); update(); sendView(); });
             map.on("moveend", sendView);
             map.on("zoom", () => update());
@@ -1541,7 +1719,7 @@ def _(anywidget, asyncio, traitlets):
           let needCells = false;
           const flush = () => {  // cells/colors/cov land as three trait changes: rebuild once
             pendingLoad = null;
-            try { if (needCells) loadCells(); needCells = false; loadAttrs(); update(); }
+            try { if (needCells) loadCells(); needCells = false; loadAttrs(); loadEdges(); update(); }
             catch (e) { say("load: " + e.message); console.error(e); }
           };
           const reload = () => { needCells = true; if (!pendingLoad) pendingLoad = setTimeout(flush, 0); };
@@ -1549,6 +1727,7 @@ def _(anywidget, asyncio, traitlets):
           model.on("change:cells", () => { grab("cells"); reload(); });
           model.on("change:colors", () => { grab("colors"); reattr(); });
           model.on("change:cov", () => { grab("cov"); reattr(); });
+          model.on("change:edges", () => { grab("edges"); reattr(); });
           model.on("change:config", () => {
             const was = cfg;
             try { cfg = JSON.parse(model.get("config") || "{}"); } catch (e) { cfg = {}; }
@@ -1556,7 +1735,7 @@ def _(anywidget, asyncio, traitlets):
             if (cfg.labels !== was.labels) labels(cfg.labels !== false);
             update();
           });
-          try { grab("cells"); grab("colors"); grab("cov"); loadCells(); loadAttrs(); boot(); }
+          try { grab("cells"); grab("colors"); grab("cov"); grab("edges"); loadCells(); loadAttrs(); loadEdges(); boot(); }
           catch (e) { say("boot: " + e.message); console.error(e); }
           return () => { try { map && map.remove(); } catch (e) {} };
         }
@@ -1567,7 +1746,7 @@ def _(anywidget, asyncio, traitlets):
 
 
 @app.cell
-def _(DeckMap, HOME, LABELS_SLOT, RASTER_TILE, json):
+def _(DeckMap, EDGE_THR, HOME, LABELS_SLOT, RASTER_TILE, json):
     # ---- the map: built ONCE, empty; never re-runs for a parameter -----------------
     deck = DeckMap(config=json.dumps({
         "height": 720, "home": dict(HOME), "show_raster": True, "show_hexes": True, "labels": True,
@@ -1581,14 +1760,16 @@ def _(DeckMap, HOME, LABELS_SLOT, RASTER_TILE, json):
         "dres": 0,  # the strip's res offset; a statement about the box it was set on
         "inv": False,  # reversed alpha: disagreeing cells solid
         "labels": True,
+        "edges": False, "thr": EDGE_THR,  # the low-agreement boundaries and their threshold
+        "edges_sent": None,  # (frame, thr) the widget holds
     }
     deck  # the cell's LAST statement: what marimo displays
     return HOLD, deck
 
 
 @app.cell
-def _(HudControls, mo):
-    hud = mo.ui.anywidget(HudControls())
+def _(EDGE_THR, HudControls, mo):
+    hud = mo.ui.anywidget(HudControls(thr0=str(EDGE_THR)))
     hud
     return (hud,)
 
@@ -1597,6 +1778,9 @@ def _(HudControls, mo):
 def _(
     CLASSES,
     CLUSTER_HEX,
+    EDGE_ALPHA,
+    EDGE_MIN_CELLS,
+    EDGE_WIDTH,
     HEX_ZOOM,
     HOLD,
     HOME,
@@ -1607,6 +1791,7 @@ def _(
     con,
     contains,
     deck,
+    edges_for,
     hud,
     json,
     legend_for,
@@ -1648,16 +1833,17 @@ def _(
         _cfg(show_raster=HOLD["show_raster"], show_hexes=HOLD["show_hexes"], flat=HOLD["paint"] in ("nlcd", "clusters"))
 
     _show()
-    _cfg(extent=list(nlcd_bounds), hex_zoom=HEX_ZOOM)
+    _cfg(extent=list(nlcd_bounds), hex_zoom=HEX_ZOOM, edges=HOLD["edges"], edge_width=EDGE_WIDTH)
 
     def _hexes_off(msg):
         """No fold for this camera (below HEX_ZOOM): the frame is dropped and the
         widget draws no hexagon layer. Hiding the hexagons is NOT this: that is a
         visibility flip in the browser and the frame stays."""
-        if HOLD["sent"] is not None:
+        if HOLD["sent"] is not None or HOLD["edges_sent"] is not None:
             with deck.hold_sync():
                 deck.cells, deck.colors, deck.cov = b"", b"", b""
-            HOLD["sent"] = None
+                deck.edges = b""
+            HOLD["sent"], HOLD["edges_sent"] = None, None
         HOLD["frame"], HOLD["box"], HOLD["res"], HOLD["hit"] = None, None, None, None
         try:
             hud.widget.legend = "[]"
@@ -1691,14 +1877,30 @@ def _(
         if fr is None:
             return
         rgba = fr["fill"](HOLD["paint"], HOLD["sel"], None, HOLD["inv"])
-        _cfg(hit=format(HOLD["hit"], "x") if HOLD["hit"] else None)
         cov = fr["coverage"](HOLD["paint"], HOLD["inv"])
+        # the boundaries: dissolved on demand (memoised on the frame per
+        # threshold), sent only when the frame or the threshold changed; while
+        # off, the widget keeps what it has and `config.edges` hides it
+        ed = None
+        if HOLD["edges"]:
+            ed = edges_for(fr, HOLD["thr"], EDGE_MIN_CELLS, EDGE_ALPHA)
+            HOLD["edge_note"] = (
+                f"boundaries: {ed['n_low']:,} cells below {HOLD['thr']:.2f} · {ed['blobs']:,} blobs ≥ {EDGE_MIN_CELLS} cells"
+                + (f" · largest {ed['max_km2']:,.1f} km²" if ed["blobs"] else "")
+                + f" · {ed['rings']:,} rings · {ed['ms']} ms"
+            )
+        else:
+            HOLD["edge_note"] = ""
+        _cfg(hit=format(HOLD["hit"], "x") if HOLD["hit"] else None, edges=HOLD["edges"])
         with deck.hold_sync():
             if HOLD["sent"] is not fr:
                 deck.cells = fr["cellid"].astype("<u8").tobytes()
                 HOLD["sent"] = fr
             deck.colors = rgba.tobytes()
             deck.cov = cov.astype("<f4").tobytes()
+            if ed is not None and HOLD["edges_sent"] != (id(fr), round(HOLD["thr"], 3)):
+                deck.edges = ed["ipc"]
+                HOLD["edges_sent"] = (id(fr), round(HOLD["thr"], 3))
         try:
             hud.widget.legend = json.dumps(legend_for(fr, HOLD["paint"]))
         except Exception:
@@ -1755,7 +1957,7 @@ def _(
         t2 = time.time()
         _paint()
         HOLD["last_status"] = f"{stats} · {fr['score']} · send {time.time() - t2:.2f} s · {time.time() - t0:.1f} s"
-        _say(HOLD["last_status"])
+        _say(HOLD["last_status"] + ("\n" + HOLD["edge_note"] if HOLD.get("edge_note") else ""))
 
     async def refresh(vs):
         """Settle-debounced, coalescing fold (the deforest notebook's loop)."""
@@ -1948,6 +2150,12 @@ def _(
         HOLD["paint"] = c.get("paint", "agreement")  # None: the layer that was on was clicked off
         HOLD["sel"] = {int(x) for x in c.get("sel", [])}
         HOLD["inv"] = bool(c.get("inv", False))
+        _ed_was = (HOLD["edges"], HOLD["thr"])
+        HOLD["edges"] = bool(c.get("edges", False))
+        try:
+            HOLD["thr"] = min(0.99, max(0.01, float(c.get("thr", HOLD["thr"]))))
+        except (TypeError, ValueError):
+            pass
         fr = HOLD["frame"]
         if HOLD["paint"] != _was:
             # VISIBILITY. One layer at a time: the raster, one of the hexagon paints,
@@ -1990,6 +2198,8 @@ def _(
         if fr is not None:
             hud.widget.panel = _selection_panel(fr)
         _paint()
+        if (HOLD["edges"], HOLD["thr"]) != _ed_was and HOLD.get("last_status"):
+            _say(HOLD["last_status"] + ("\n" + HOLD["edge_note"] if HOLD.get("edge_note") else ""))
 
     if HOLD.get("h_ctl") is not None:
         try:

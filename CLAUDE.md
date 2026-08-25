@@ -985,6 +985,47 @@ frame-output changed. Runs from the root. Things to know:
   `normalized: true`).** The maplibre fullscreen control fullscreens the map
   container and the strip docks into it as before (fullscreen itself not
   driven). Not measured yet: a 150k-cell frame's JS-side load/paint time.
+- **BOUNDARIES AROUND THE LOW-AGREEMENT CLUSTERS, EACH IN ITS NLCD COLOUR
+  (2026-08-24, night; Stephen: "cells to boundary around a cluster of low
+  agreement cells ... slider for a threshold"; "add duckdb back in"; "h3 duckdb
+  is faster than h3ronpy cells to poly"; "we should [use deck.gl-geoarrow]";
+  "make the lines the same color as the NLCD hexes"; "con.sql for duckdbpy
+  relations"). Built, driven under `marimo edit` (his mode; his first flight
+  of the earlier build showed nothing because the toggle STARTS OFF and he
+  had not pressed it).** A `boundaries` toggle and a threshold slider
+  (0.05-0.95, commits on `change`, seed `EDGE_THR` 0.5) in the strip.
+  `edges_for(frame, thr, EDGE_MIN_CELLS, EDGE_ALPHA)` in the frame cell, all
+  `con.sql(...)` relations on `con` (h3 + spatial loaded there now): (1) the
+  low cells with a dense index; (2) their H3 neighbour EDGES from
+  `h3_grid_ring_unsafe(cell, 1)` joined back; (3) connected components in
+  NUMPY (`label_components`: min-label hooking + pointer jumping; 73k cells
+  0.15 s); (4) ONE GROUP BY blob: `mode(cls)` (the ring's colour), count,
+  `sum(h3_cell_area)` km², `h3_cells_to_multi_polygon_wkb(list(cell))`,
+  `HAVING count(*) >= EDGE_MIN_CELLS` (7); (5) `ST_Dump` -> `ST_Boundary` ->
+  `ST_Dump` so every outer ring AND hole is one closed LineString. Measured at
+  the 150k budget with half the cells low: 0.25 s end to end; 24 ms on the
+  real res-9 view (100 blobs, 146 rings). TWO ROUTES MEASURED AND REJECTED:
+  Stephen's first idea, unnest each dissolved polygon back to cells
+  (`h3_polygon_wkb_to_cells`) for the majority class, is O(cells x vertices)
+  in H3's polyfill: 0.02 s with small blobs, 23-28 s once a blob percolates
+  (150k cells, one 68k-cell blob with 1,320 holes); and `ST_Transform` to
+  Albers for the area was 8.8 s on the same frame (`h3_cell_area` summed is
+  free). TRANSPORT IS GEOARROW, the counties film's: ring WKB ->
+  `geoarrow.rust.core.from_wkb` to `linestring("xy", coord_type=
+  "interleaved")` -> arro3 Table (pyarrow's `pa.table({...})` DROPS the
+  extension metadata, measured; arro3 keeps it) with `color` (rgba
+  `FixedSizeList<uint8>[4]`: the majority class's NLCD colour at
+  `EDGE_ALPHA` 235), `cls`, `km2` -> one IPC stream in the `edges` Bytes trait
+  (129 KB for 146 rings) -> `arrow.tableFromIPC` in the widget ->
+  `GeoArrowPathLayer` from `@geoarrow/deck.gl-layers@0.3.2` with `getColor:
+  table.getChild("color")`, `EDGE_WIDTH` 2 px, drawn whatever the paint,
+  hidden by `config.edges` when off (the table stays in the browser), cleared
+  with the frame below HEX_ZOOM. EVERY esm.sh import in `DeckMap` now carries
+  `apache-arrow@18.1.0` in its `?deps=` (the counties film's exact strings;
+  re-crawled: 206 modules, ONE `@deck.gl/core`). `geoarrow-rust-core` added
+  to the header. Memoised on the frame per (thr, min_cells, alpha); the
+  status gets a second line with cells below / blobs / largest km² / rings /
+  ms. The fold itself is untouched (DataFusion UDF).
 - **The res offset resets ONLY when the camera leaves the served box** (the
   agreed rule; Stephen re-stated it after a suspected reset on the highlight
   checkbox, which only repaints). The one other way a serve can fire without
