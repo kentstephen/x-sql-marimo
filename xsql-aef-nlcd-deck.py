@@ -222,6 +222,22 @@ def _():
     # paint's top alpha
     COV_FLAT = 1.00
     ALPHA_FLAT = 190
+    # "colour by agreement" (the strip's toggle on the agreement paint): the
+    # hexagons take a perceptual ramp on the agreement value instead of NLCD's
+    # colour; cool = disagreement, warm = agreement (Stephen's default), and the
+    # highlight-disagreement checkbox reverses it so warm = disagreement. viridis
+    # because it has NO RED anywhere: its warm end is yellow, so neither
+    # direction of the flip lands on the weak leg (a blue-white-red cool/warm
+    # would). cividis is the alternative (same axis, flatter). 32 stops each,
+    # matplotlib's tables, interpolated to 256 in the frame cell; no matplotlib
+    # import. Coverage scaling stays; alpha is flat (a ramp's dark end fading to
+    # nothing would read as no data).
+    AGREE_CMAP = "viridis"
+    RAMPS = {
+        "viridis": "440154470d6048186a482374472e7c4538824241863e4a893a548c365d8d32658e2e6d8e2b758e287d8e25848e228c8d1f948c1e9c8920a38625ab822eb37c3aba7648c16e58c7656ccd5a7fd34e93d741a8db34c0df25d5e21aeae51afde725",
+        "cividis": "00224e00285b002e6a0533711c396f293f6e33446d3c4a6c45506c4d556c555b6d5c616e6467706b6d72727274787877807f78888578908b78979177a09875a89e73b0a571b9ab6dc2b369cbb965d3c05fdcc859e6d051efd748f8df3cfee838",
+    }
+    ALPHA_RAMP = 225
     DIM_ALPHA = 22
     # Boundaries around clusters of low-agreement cells: the set of cells with
     # agreement below the strip's threshold (EDGE_THR seeds it) is dissolved in
@@ -266,6 +282,9 @@ def _():
         AEF_LEVEL_FOR_RES,
         AEF_MAX_FILES,
         AEF_NODATA,
+        AGREE_CMAP,
+        ALPHA_RAMP,
+        RAMPS,
         AEF_PREFIX,
         AEF_RES,
         AEF_X0,
@@ -827,9 +846,11 @@ async def _(
 
 @app.cell
 def _(
+    AGREE_CMAP,
     ALPHA_FLAT,
     ALPHA_MAX,
     ALPHA_MIN,
+    ALPHA_RAMP,
     CLASSES,
     CLUSTER_HEX,
     COV_FLAT,
@@ -837,6 +858,7 @@ def _(
     DIM_ALPHA,
     K_CLUSTERS,
     MIN_CLASS_CELLS,
+    RAMPS,
     TAU,
     duckdb,
     io,
@@ -855,6 +877,13 @@ def _(
     # No hexagon geometry here: the widget's H3HexagonLayer draws from the cell
     # ids, and the per-cell coverage is an attribute (the kepler-style column).
     _PAL = np.array([tuple(int(h[i:i + 2], 16) for i in (1, 3, 5)) for h in CLUSTER_HEX], np.uint8)
+    # the agreement ramp: AGREE_CMAP's stops interpolated to a 256-entry LUT
+    _hx = RAMPS[AGREE_CMAP]
+    _stops = np.array([[int(_hx[i + j:i + j + 2], 16) for j in (0, 2, 4)] for i in range(0, len(_hx), 6)], np.float64)
+    _RAMP = np.stack(
+        [np.interp(np.linspace(0, 1, 256), np.linspace(0, 1, len(_stops)), _stops[:, k]) for k in range(3)], 1
+    ).round().astype(np.uint8)
+    RAMP_HEX = ["#%02x%02x%02x" % tuple(int(v) for v in _RAMP[i]) for i in range(0, 256, 17)]  # 16 swatches for the legend
     con = duckdb.connect()
     # h3 + spatial for the low-agreement boundaries (edges_for below); the fold
     # itself stays the h3 UDF in DataFusion
@@ -965,15 +994,23 @@ def _(
             np.isnan(agree), ALPHA_MIN, ALPHA_MIN + (ALPHA_MAX - ALPHA_MIN) * (1 - np.clip(agree, 0, 1))
         ).astype(np.uint8)
         rgb_clu = _PAL[clu % len(_PAL)]
+        # colour by agreement: the ramp on the value (unscored cells grey);
+        # `inv` reverses it (warm = disagreement)
+        _ai = np.where(np.isnan(agree), 0, np.clip(agree, 0, 1) * 255).round().astype(np.int64)
+        _unscored = np.isnan(agree)[:, None]
+        rgb_ramp = np.where(_unscored, 128, _RAMP[_ai]).astype(np.uint8)
+        rgb_ramp_inv = np.where(_unscored, 128, _RAMP[255 - _ai]).astype(np.uint8)
 
-        def fill(paint, sel, hit=None, inv=False):
+        def fill(paint, sel, hit=None, inv=False, ramp=False):
             """(N, 4) uint8 rgba for a paint: the widget's getFillColor attribute."""
             if paint == "clusters":
                 c, key = rgb_clu, 100 + clu
+            elif paint == "agreement" and ramp:
+                c, key = (rgb_ramp_inv if inv else rgb_ramp), cls
             else:
                 c, key = rgb, cls
             if paint == "agreement":
-                a = alpha_inv if inv else alpha_agree
+                a = np.full(len(cls), ALPHA_RAMP, np.uint8) if ramp else (alpha_inv if inv else alpha_agree)
             else:
                 a = np.full(len(cls), ALPHA_FLAT, np.uint8)
             if sel:
@@ -1093,10 +1130,18 @@ def _(
         cache[key] = out
         return out
 
-    def legend_for(frame, paint):
+    def legend_for(frame, paint, ramp=False, inv=False):
         cls, clu, agree = frame["cls"], frame["clu"], frame["agree"]
         tot = max(1, len(cls))
         items = []
+        if paint == "agreement" and ramp and frame["has_aef"]:
+            # the ramp bar, cool to warm left to right; the labels say which end
+            # is which (the highlight checkbox swaps them, not the bar)
+            items.append({
+                "ramp": RAMP_HEX, "cmap": AGREE_CMAP,
+                "lo": "agreement" if inv else "disagreement",
+                "hi": "disagreement" if inv else "agreement",
+            })
         if paint == "clusters" and frame["has_aef"]:
             for k in range(int(clu.max()) + 1 if len(clu) else 0):
                 m = clu == k
@@ -1167,7 +1212,7 @@ def _(anywidget, traitlets):
           let edgesOn = false;
           const send = (act, extra) => {
             model.set("ctl", JSON.stringify(Object.assign({
-              act: act, paint: paint, sel: Array.from(sel), inv: inv.checked,
+              act: act, paint: paint, sel: Array.from(sel), inv: inv.checked, acol: acol,
               edges: edgesOn, thr: parseFloat(thr.value), n: ++seq }, extra || {})));
             model.save_changes();
           };
@@ -1198,9 +1243,18 @@ def _(anywidget, traitlets):
           invLab.appendChild(inv); invLab.appendChild(document.createTextNode("highlight disagreement"));
           invLab.title = "agreement H3: the least-backed (smallest) cells solid, the agreeing ones faint";
           inv.addEventListener("change", () => send("set"));
-          const stylePaint = () => { paintBtns.forEach(([k, b]) => onCss(b, k === paint)); };
+          // colour by agreement: the agreement paint's hexagons on a cool-to-warm
+          // ramp (cool = disagreement) instead of NLCD's colours; the highlight
+          // checkbox reverses the ramp. Coverage still follows agreement.
+          let acol = false;
+          const acB = document.createElement("button");
+          acB.textContent = "colour by agreement"; acB.style.cssText = btnCss;
+          acB.title = "agreement H3: colour the hexagons by agreement (cool = disagreement, warm = agreement) instead of NLCD's colours; highlight disagreement reverses the ramp";
+          const styleAc = () => { onCss(acB, acol); acB.style.opacity = paint === "agreement" ? "1" : ".5"; };
+          acB.onclick = () => { acol = !acol; styleAc(); send("set"); };
+          const stylePaint = () => { paintBtns.forEach(([k, b]) => onCss(b, k === paint)); styleAc(); };
           stylePaint();
-          paintBox.append(pl, ...paintBtns.map(([, b]) => b), invLab);
+          paintBox.append(pl, ...paintBtns.map(([, b]) => b), invLab, acB);
           // boundaries around the clusters of low-agreement cells (dissolved in
           // the kernel by DuckDB's h3 extension), with the agreement threshold
           // that defines "low": a slider that commits on change (never input:
@@ -1272,6 +1326,19 @@ def _(anywidget, traitlets):
               legendBox.appendChild(x);
             }
             items.forEach((it) => {
+              if (it.ramp) {
+                // the agreement ramp bar with its end labels
+                const r = document.createElement("span");
+                r.style.cssText = "display:inline-flex;align-items:center;gap:.35rem;font:12px ui-sans-serif,system-ui,sans-serif";
+                r.title = it.cmap + ": colour by agreement";
+                r.innerHTML =
+                  '<span style="opacity:.75">' + it.lo + '</span>' +
+                  '<span style="display:inline-block;width:9rem;height:10px;border-radius:2px;' +
+                  "background:linear-gradient(to right," + it.ramp.join(",") + ')"></span>' +
+                  '<span style="opacity:.75">' + it.hi + '</span>';
+                legendBox.appendChild(r);
+                return;
+              }
               const b = document.createElement("button");
               const on = sel.has(it.code);
               b.style.cssText =
@@ -1782,6 +1849,7 @@ def _(DeckMap, EDGE_THR, HOME, LABELS_SLOT, RASTER_TILE, json):
         "sel": set(), "hit": None, "memo": {}, "h_cam": None, "h_ctl": None, "h_pick": None,
         "dres": 0,  # the strip's res offset; a statement about the box it was set on
         "inv": False,  # reversed alpha: disagreeing cells solid
+        "acol": False,  # colour by agreement (the ramp) instead of NLCD's colours
         "labels": True,
         "edges": False, "thr": EDGE_THR,  # the low-agreement boundaries and their threshold
         "edges_sent": None,  # (frame, thr) the widget holds
@@ -1902,7 +1970,7 @@ def _(
         fr = HOLD["frame"]
         if fr is None:
             return
-        rgba = fr["fill"](HOLD["paint"], HOLD["sel"], None, HOLD["inv"])
+        rgba = fr["fill"](HOLD["paint"], HOLD["sel"], None, HOLD["inv"], HOLD["acol"])
         cov = fr["coverage"](HOLD["paint"], HOLD["inv"])
         # the boundaries: dissolved on demand (memoised on the frame per
         # threshold), sent only when the frame or the threshold changed; while
@@ -1928,7 +1996,7 @@ def _(
                 deck.edges = ed["ipc"]
                 HOLD["edges_sent"] = (id(fr), round(HOLD["thr"], 3))
         try:
-            hud.widget.legend = json.dumps(legend_for(fr, HOLD["paint"]))
+            hud.widget.legend = json.dumps(legend_for(fr, HOLD["paint"], HOLD["acol"], HOLD["inv"]))
         except Exception:
             pass
 
@@ -2071,7 +2139,7 @@ def _(
         th = "padding:.1rem .6rem .1rem 0;text-align:left;opacity:.6;font-weight:500"
         table = (
             f"<table style='border-collapse:collapse;font-size:13px;margin:.2rem 0'><tr><th style='{th}'>NLCD class</th><th style='{th}'>of cells</th>"
-            f"<th style='{th}'>area</th><th style='{th}'>agreement p50</th><th style='{th}'>below 0.5</th><th style='{th}'>usually looks like</th></tr>"
+            f"<th style='{th}'>area</th><th style='{th}'>agreement p50</th><th style='{th}'>below 0.5</th><th style='{th}' title='the class whose per-view AlphaEarth prototype the disagreeing cells sit closest to; a suggestion relative to this scene'>AlphaEarth usually suggests</th></tr>"
             + "".join(rows) + "</table>"
         )
         clus = ""
@@ -2110,7 +2178,7 @@ def _(
                        mode(alt_name) FILTER (WHERE agree < 0.5)
                 FROM cur_cells WHERE cls IN (SELECT UNNEST(?)) GROUP BY name ORDER BY 2 DESC
             """, [list(HOLD["sel"])]).fetchall()
-            word = "usually looks like"
+            word = "AlphaEarth usually suggests"
         return " · ".join(
             f"<b>{nm}</b>: {cnt:,} cells"
             + (f", agreement p50 {p50:.2f}, {pct:.0f}% below 0.5" if p50 is not None else "")
@@ -2151,7 +2219,11 @@ def _(
                 hud.widget.panel = (
                     f"<b>{nm}</b>{where}: cluster {ck}, agreement "
                     + (f"{ag:.2f}" if scored else "unscored")
-                    + (f", looks more like <i>{alt}</i>" if scored and ag < 0.5 and alt != "none" else "")
+                    # the runner-up: the class whose PER-VIEW prototype the cell's
+                    # vector is closest to, a suggestion relative to the classes in
+                    # this scene, not a classification (Stephen: "AEF suggests it
+                    # could be this")
+                    + (f", AlphaEarth suggests it could be <i>{alt}</i> (relative to this view)" if scored and ag < 0.5 and alt != "none" else "")
                     + f", NLCD purity {pur:.2f}"
                     + (f", homogeneity {hom:.3f}" if hom is not None and not np.isnan(hom) else "")
                 )
@@ -2219,6 +2291,7 @@ def _(
         HOLD["paint"] = c.get("paint", "agreement")  # None: the layer that was on was clicked off
         HOLD["sel"] = {int(x) for x in c.get("sel", [])}
         HOLD["inv"] = bool(c.get("inv", False))
+        HOLD["acol"] = bool(c.get("acol", False))
         _ed_was = (HOLD["edges"], HOLD["thr"])
         HOLD["edges"] = bool(c.get("edges", False))
         try:
@@ -2323,7 +2396,7 @@ def _(HOLD, con, mo, tables_btn):
         SELECT cls, name, count(*) AS cells,
                round(median(agree), 3) AS agree_p50,
                round(avg(CASE WHEN agree < 0.5 THEN 1 ELSE 0 END) * 100, 1) AS pct_below_half,
-               mode(alt_name) FILTER (WHERE agree < 0.5) AS usual_alternative
+               mode(alt_name) FILTER (WHERE agree < 0.5) AS aef_usually_suggests
         FROM view_cells GROUP BY cls, name ORDER BY cells DESC
         """,
         engine=con,

@@ -1048,6 +1048,34 @@ frame-output changed. Runs from the root. Things to know:
   `moveend` -> a larger footprint outside the box). Not changed; he then
   said it seems fine. If it comes back, key the reset on lon/lat/zoom, not
   the footprint.
+- **COLOUR BY AGREEMENT (2026-08-24, night; driven, committed).** A toggle
+  button in the strip after the highlight checkbox (dimmed when the paint is
+  not agreement; `acol` in every ctl send, `HOLD["acol"]`): on the agreement
+  paint the hexagons take `AGREE_CMAP` (viridis; cividis is the swap-in, both
+  32-stop tables embedded as hex in `RAMPS`, interpolated to a 256 LUT in the
+  frame cell, no matplotlib import) on the agreement value instead of NLCD's
+  colour, alpha flat at `ALPHA_RAMP` 225, coverage scaling unchanged (size and
+  colour say the same thing); unscored cells grey. Cool = disagreement, warm =
+  agreement; `highlight disagreement` REVERSES the ramp (warm = disagreement).
+  viridis because it has no red anywhere: the warm end is yellow, so neither
+  direction of the flip lands on Stephen's weak leg. The legend gets a
+  gradient bar (`{"ramp": RAMP_HEX, "lo", "hi"}` item; the bar is always cool
+  to warm, the END LABELS swap on highlight). Driven at Folsom Lake: the lake
+  solid yellow, low cells small and dark; ticked, the lake's cells go tiny and
+  dark and the least-backed go large and yellow; labels follow; zero errors.
+- **Runner-up wording**: "looks more like X" is gone. The alternative class is
+  the one whose PER-VIEW prototype the cell's vector sits closest to, a
+  suggestion relative to this scene, not a classification (Stephen: "AEF
+  suggests it could be this"): pick panel `AlphaEarth suggests it could be X
+  (relative to this view)`, analyze table and selection panel `AlphaEarth
+  usually suggests` (title attribute says why), SQL column
+  `aef_usually_suggests`.
+- **TODO (Stephen, not now): res offset and variable zoom are not tidy.** The
+  ladder, the "zoom in inside the box never refolds" rule and the strip's
+  `res − / +` offset all work but do not read as one design (the mapterhorn
+  explorer has the same open item). A piece of its own: what zoom should buy
+  automatically, what the offset is for, whether the reset should key on
+  lon/lat/zoom. Record in `docs/aef-nlcd-deck-plan.md`.
 
 `xsql-mapterhorn-explorer.py` (EXPERIMENTAL, open defects below) draws Mapterhorn terrain
 worldwide as extruded H3 columns: the DEM half of the parked
