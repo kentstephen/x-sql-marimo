@@ -134,7 +134,7 @@ def _():
 @app.cell(hide_code=True)
 def _(mo):
     mo.md("""
-    [![Open in molab](https://molab.marimo.io/molab-shield.svg)](https://molab.marimo.io/github/github.com/kentstephen/x-sql-marimo/blob/main/xsql-aef-nlcd-conus.py)
+    [![Open in molab](https://molab.marimo.io/molab-shield.svg)](https://molab.marimo.io/github/github.com/kentstephen/x-sql-marimo/blob/main/xsql-aef-nlcd-deck.py)
 
     # NLCD, backed or not by AlphaEarth, across CONUS
 
