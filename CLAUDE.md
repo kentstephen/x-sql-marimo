@@ -1026,6 +1026,21 @@ frame-output changed. Runs from the root. Things to know:
   to the header. Memoised on the frame per (thr, min_cells, alpha); the
   status gets a second line with cells below / blobs / largest km² / rings /
   ms. The fold itself is untouched (DataFusion UDF).
+- **PHOTON SEARCH FIELD in the strip (2026-08-24, night; Stephen: "add a photon
+  geocoder just like in the recent cdl zarr ftw repo"; driven).** cdl-ftw's field
+  by copy (11rem, this strip's 13px), after the labels button: Enter sends
+  `ctl {act: "search", q}`; the kernel's `_search` runs `_photon_first`
+  (photon.komoot.io, limit 1, biased on the camera's lon/lat) in an executor,
+  picks the zoom from the hit's extent (3.5-13.5, the cdl formula on the
+  measured canvas width), and sends `{kind: "fly"}` on the widget's CUSTOM
+  MESSAGE channel; the widget's `msg:custom` handler calls maplibre
+  `map.flyTo`, whose `moveend` sends `view` back and the ordinary camera loop
+  folds. No kernel-side camera state is set. Driven: Enter -> "→ Folsom Lake,
+  California · zoom 11.0" in 0.5 s, res-9 agreement fold on screen 7.7 s after
+  Enter; a nonsense query says `no match: …`. Cost one round: `_search` was
+  first defined BELOW `_on_ctl` in the wiring cell and the click did nothing
+  (silent NameError in the comm handler, the marimo mangling lesson); it is
+  above it now, and the search branch reports any exception in the status.
 - **The res offset resets ONLY when the camera leaves the served box** (the
   agreed rule; Stephen re-stated it after a suspected reset on the highlight
   checkbox, which only repaints). The one other way a serve can fire without

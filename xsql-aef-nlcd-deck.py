@@ -79,6 +79,8 @@ def _():
     import os
     import tempfile
     import time
+    import urllib.parse
+    import urllib.request
 
     import numpy as np
     import pyarrow as pa
@@ -124,6 +126,7 @@ def _():
         time,
         traitlets,
         udf,
+        urllib,
         xr,
     )
 
@@ -1310,6 +1313,21 @@ def _(anywidget, traitlets):
           styleLb();
           lbB.onclick = () => { labelsOn = !labelsOn; styleLb(); send("labels", { labels: labelsOn }); };
           anBox.append(lbB);
+          // the search field: Photon (cdl-ftw's), Enter geocodes camera-biased on the
+          // kernel and the first hit flies the map; the fold follows the moveend
+          const search = document.createElement("input");
+          search.type = "search";
+          search.placeholder = "find a place…";
+          search.title = "Photon geocoder: Enter flies to the first hit";
+          search.style.cssText =
+            "width:11rem;font:13px ui-sans-serif,system-ui,sans-serif;" +
+            "padding:.15rem .45rem;border:1px solid rgba(127,127,127,.45);" +
+            "border-radius:4px;background:transparent;color:inherit";
+          search.addEventListener("keydown", (e) => {
+            const q = search.value.trim();
+            if (e.key === "Enter" && q) { e.preventDefault(); send("search", { q: q }); }
+          });
+          anBox.append(search);
           box.append(paintBox, edgeBox, resBox, anBox, legendBox);
           const panel = document.createElement("div");
           panel.style.cssText = "font:13.5px ui-sans-serif,system-ui,sans-serif;padding:.25rem 0";
@@ -1557,6 +1575,11 @@ def _(anywidget, asyncio, traitlets):
           const pending = new Map();
           let tseq = 0;
           model.on("msg:custom", (msg, buffers) => {
+            if (msg && msg.kind === "fly" && map) {
+              // the geocoder's hit: maplibre flies, moveend sends the view, the kernel folds
+              map.flyTo({center: [msg.lon, msg.lat], zoom: msg.zoom, duration: msg.duration || 2000});
+              return;
+            }
             if (!msg || msg.kind !== "tile") return;
             const p = pending.get(msg.id);
             if (!p) return;
@@ -1785,6 +1808,7 @@ def _(
     HOLD,
     HOME,
     SETTLE,
+    VIEW_W,
     aef_fold,
     asyncio,
     build_frame,
@@ -1795,6 +1819,7 @@ def _(
     hud,
     json,
     legend_for,
+    math,
     nlcd_bounds,
     nlcd_fold,
     nlcd_tile_png,
@@ -1802,6 +1827,7 @@ def _(
     pad_box,
     res_for_view,
     time,
+    urllib,
     view_to_bbox,
 ):
     # ---- wiring: the camera loop and the strip. Re-runs freely (un-observes its
@@ -2141,6 +2167,49 @@ def _(
     deck.observe(_on_pick, names="pick")
     HOLD["h_pick"] = _on_pick
 
+    # ---- the search field: Photon, camera-biased, one ~0.3 s call on a thread;
+    # the hit goes to the widget as a `fly` message (maplibre flyTo), whose
+    # moveend sends the view back and the ordinary camera loop folds it. No
+    # kernel-side camera state is touched here (cdl-ftw's geocoder, ported).
+    def _photon_first(query, vs):
+        params = {"q": query, "limit": 1, "lang": "en"}
+        if isinstance(vs, dict) and vs.get("longitude") is not None:
+            params["lon"] = round(vs["longitude"], 4)
+            params["lat"] = round(vs["latitude"], 4)
+        url = "https://photon.komoot.io/api/?" + urllib.parse.urlencode(params)
+        req = urllib.request.Request(url, headers={"User-Agent": "x-sql-marimo aef nlcd deck notebook"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.load(r)
+        feats = data.get("features") or []
+        if not feats:
+            return None
+        f = feats[0]
+        p = f.get("properties", {})
+        lon, lat = f["geometry"]["coordinates"][:2]
+        name = ", ".join(str(v) for v in (p.get("name"), p.get("city"), p.get("state")) if v) or query
+        return name, float(lon), float(lat), p.get("extent")
+
+    async def _search(q):
+        vs = _vsd(HOLD.get("vs"))
+        try:
+            hit = await asyncio.get_running_loop().run_in_executor(None, _photon_first, q, vs)
+        except Exception as e:
+            _say(f"search error: {type(e).__name__}: {e}")
+            return
+        if hit is None:
+            _say(f"no match: {q}")
+            return
+        name, lon, lat, ext = hit
+        w = vs.get("w") or VIEW_W
+        if ext and len(ext) == 4:
+            span = max(abs(ext[2] - ext[0]), abs(ext[1] - ext[3]) * 2, 0.01)
+            zoom = math.log2(360.0 * (w / 512) / span) - 0.3
+        else:
+            zoom = 10.0
+        zoom = max(3.5, min(13.5, zoom))
+        deck.send({"kind": "fly", "lon": lon, "lat": lat, "zoom": zoom, "duration": 2000})
+        _say(f"→ {name} · zoom {zoom:.1f}")
+
     def _on_ctl(change):
         try:
             c = json.loads(change["new"] or "{}")
@@ -2194,6 +2263,15 @@ def _(
             return
         if c.get("act") == "analyze":
             hud.widget.panel = _analyze_html(fr) if fr is not None else "<span style='opacity:.7'>no fold in view (zoom in past 9 with the hexagons on)</span>"
+            return
+        if c.get("act") == "search":
+            q = str(c.get("q") or "").strip()
+            try:
+                if q:
+                    _say(f"searching: {q}")
+                    HOLD["stask"] = _spawn(_search(q))
+            except Exception as e:  # comm-handler exceptions are silent
+                _say(f"search error: {type(e).__name__}: {e}")
             return
         if fr is not None:
             hud.widget.panel = _selection_panel(fr)
