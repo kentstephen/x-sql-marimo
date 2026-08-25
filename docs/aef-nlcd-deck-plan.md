@@ -7,9 +7,9 @@ committed). Kept for the record and for the TODO at the bottom.
 ## What was built (as left mid-work, before the drive)
 
 `xsql-aef-nlcd-deck.py` has edits on top of `6012769` (the Photon search commit).
-`marimo check` passed after the colour edits; nothing since has been run in a browser.
+`marimo check` passed after the color edits; nothing since has been run in a browser.
 
-### 1. Colour by agreement (built, not driven)
+### 1. Color by agreement (built, not driven)
 
 - Constants cell: `AGREE_CMAP = "viridis"`, `RAMPS` (viridis + cividis, 32 stops each,
   matplotlib's tables embedded as hex strings; no matplotlib import), `ALPHA_RAMP = 225`.
@@ -17,13 +17,13 @@ committed). Kept for the record and for the TODO at the bottom.
 - Frame cell: `_RAMP` 256-entry LUT interpolated from the stops, `RAMP_HEX` (16
   swatches for the legend bar), `rgb_ramp` / `rgb_ramp_inv` per frame (unscored cells
   grey 128). `fill(paint, sel, hit, inv, ramp=False)`: on the agreement paint with
-  `ramp` the colour is the LUT on the agreement value (reversed when `inv`), alpha flat
-  at `ALPHA_RAMP`; coverage scaling unchanged (size and colour say the same thing).
+  `ramp` the color is the LUT on the agreement value (reversed when `inv`), alpha flat
+  at `ALPHA_RAMP`; coverage scaling unchanged (size and color say the same thing).
 - `legend_for(frame, paint, ramp=False, inv=False)`: prepends `{"ramp": RAMP_HEX,
-  "cmap", "lo", "hi"}` when colouring by agreement; the bar is always cool -> warm
+  "cmap", "lo", "hi"}` when coloring by agreement; the bar is always cool -> warm
   left to right, the END LABELS swap on highlight (default lo = disagreement, hi =
   agreement; highlight flips them so warm = disagreement).
-- Strip JS: a `colour by agreement` toggle button after the highlight checkbox
+- Strip JS: a `color by agreement` toggle button after the highlight checkbox
   (dimmed to .5 opacity when the paint is not agreement), `acol` in every ctl send;
   `renderLegend` draws an item with `ramp` as a linear-gradient bar with its labels.
 - Wiring: `HOLD["acol"]` (False), read from ctl in `_on_ctl`, passed to `fill` and
@@ -51,10 +51,10 @@ say "AEF suggests it could be this".
 1. Rename the `<th>` above.
 2. Drive under `marimo run --headless --port 2808` with the scratch harness
    (`drive_acol.py` was written in this session's scratchpad but never ran: search
-   to Folsom Lake, toggle colour on, screenshot, tick highlight, screenshot, toggle
+   to Folsom Lake, toggle color on, screenshot, tick highlight, screenshot, toggle
    off): confirm the ramp draws, the flip reverses it, the legend bar and labels
    follow, zero console errors.
-3. Commit; add the CLAUDE.md bullets (colour toggle + wording) under the deck
+3. Commit; add the CLAUDE.md bullets (color toggle + wording) under the deck
    notebook's section, and the memory note.
 
 ## TODO, Stephen's (not today)

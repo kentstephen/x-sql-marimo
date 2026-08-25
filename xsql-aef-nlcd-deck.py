@@ -52,7 +52,7 @@ under the map has the four paints as toggles, none required (NLCD raster; agreem
 alpha + coverage; NLCD and AlphaEarth clusters: regular hexagons at coverage
 0.8), the pickable legend, a click that lights the
 hexagon and tells its story. Prototypes and clusters are PER VIEW: they say what
-is typical of a class HERE, and cluster colours are arbitrary per fold.
+is typical of a class HERE, and cluster colors are arbitrary per fold.
 
 Measured from home (2026-08-24): a COG opens in 0.8 s, 162 open concurrently in
 1.8 s and read their 2560 m overviews in 0.7 s; the ~2,000 files that cover CONUS
@@ -147,14 +147,14 @@ def _(mo):
     satellites here) and each hexagon an **agreement**: how clearly it sits closer to
     its own class than to the nearest other one.
 
-    - **agreement** paint: NLCD's colours; faint and shrunken where the embedding does
+    - **agreement** paint: NLCD's colors; faint and shrunken where the embedding does
       not back the word.
-    - **NLCD** paint: regular hexagons, flat colours.
+    - **NLCD** paint: regular hexagons, flat colors.
     - **AlphaEarth** paint: the embedding on its own, k-means clusters, the legend
       saying what each cluster is made of in NLCD terms.
 
     Click a hexagon for its story; click a legend chip to isolate a class or cluster.
-    Prototypes and clusters are recomputed per view (local, honest, colours shift).
+    Prototypes and clusters are recomputed per view (local, honest, colors shift).
 
     | leg | data | engine |
     |---|---|---|
@@ -222,9 +222,9 @@ def _():
     # paint's top alpha
     COV_FLAT = 1.00
     ALPHA_FLAT = 190
-    # "colour by agreement" (the strip's toggle on the agreement paint): the
+    # "color by agreement" (the strip's toggle on the agreement paint): the
     # hexagons take a perceptual ramp on the agreement value instead of NLCD's
-    # colour; cool = disagreement, warm = agreement (Stephen's default), and the
+    # color; cool = disagreement, warm = agreement (Stephen's default), and the
     # highlight-disagreement checkbox reverses it so warm = disagreement. viridis
     # because it has NO RED anywhere: its warm end is yellow, so neither
     # direction of the flip lands on the weak leg (a blue-white-red cool/warm
@@ -246,7 +246,7 @@ def _():
     # res's average cell) are speckle and dropped. Drawn as one PathLayer.
     EDGE_THR = 0.5
     EDGE_MIN_CELLS = 7
-    # each ring is painted the NLCD colour of the blob's majority class (Stephen:
+    # each ring is painted the NLCD color of the blob's majority class (Stephen:
     # "the same color as the NLCD hexes"), at this alpha and width
     EDGE_ALPHA = 235
     EDGE_WIDTH = 2  # px
@@ -866,7 +866,7 @@ def _(
     pa,
     time,
 ):
-    # ---- a FRAME: scores, clusters, coverage and colours for one folded view ------
+    # ---- a FRAME: scores, clusters, coverage and colors for one folded view ------
     # GeoArrow for the boundaries (the counties film's transport): WKB rings ->
     # geoarrow.linestring with INTERLEAVED coords (what @geoarrow/deck.gl-layers
     # reads), through arro3 so the extension metadata survives into the IPC
@@ -994,7 +994,7 @@ def _(
             np.isnan(agree), ALPHA_MIN, ALPHA_MIN + (ALPHA_MAX - ALPHA_MIN) * (1 - np.clip(agree, 0, 1))
         ).astype(np.uint8)
         rgb_clu = _PAL[clu % len(_PAL)]
-        # colour by agreement: the ramp on the value (unscored cells grey);
+        # color by agreement: the ramp on the value (unscored cells grey);
         # `inv` reverses it (warm = disagreement)
         _ai = np.where(np.isnan(agree), 0, np.clip(agree, 0, 1) * 255).round().astype(np.int64)
         _unscored = np.isnan(agree)[:, None]
@@ -1026,7 +1026,7 @@ def _(
                 return cov_inv if inv else cov
             return cov_flat
 
-        lap("colours")
+        lap("colors")
         a_ok = agree[~np.isnan(agree)]
         score = (
             f"{n:,} cells · agreement p50 {np.median(a_ok):.2f} · {(a_ok < 0.5).mean() * 100:.0f}% below 0.5"
@@ -1057,8 +1057,8 @@ def _(
             lab = m
 
     def edges_for(frame, thr, min_cells, alpha):
-        """Boundaries of the clusters of cells with agreement < thr, one colour per
-        cluster: the NLCD colour of its majority class. DuckDB's h3 extension does
+        """Boundaries of the clusters of cells with agreement < thr, one color per
+        cluster: the NLCD color of its majority class. DuckDB's h3 extension does
         the geometry (`h3_grid_ring_unsafe` for the neighbour edges,
         `h3_cells_to_multi_polygon_wkb` per blob for the dissolve, the H3
         outer-boundary walk that is 30x faster than ST_Union_Agg of hexagons),
@@ -1232,8 +1232,8 @@ def _(anywidget, traitlets):
           };
           const paintBtns = [
             mkPaint("raster", "NLCD raster", "NLCD as its own tiles, at any zoom; click again to hide"),
-            mkPaint("nlcd", "NLCD H3", "NLCD's majority class per hexagon, flat colours; click again to hide"),
-            mkPaint("agreement", "agreement H3", "NLCD's colours; hexagon size and alpha follow how well AlphaEarth backs the class; click again to hide"),
+            mkPaint("nlcd", "NLCD H3", "NLCD's majority class per hexagon, flat colors; click again to hide"),
+            mkPaint("agreement", "agreement H3", "NLCD's colors; hexagon size and alpha follow how well AlphaEarth backs the class; click again to hide"),
             mkPaint("clusters", "AlphaEarth clusters H3", "the embedding on its own: k-means clusters of the cell vectors, no labels; click again to hide"),
           ];
           const invLab = document.createElement("label");
@@ -1243,13 +1243,13 @@ def _(anywidget, traitlets):
           invLab.appendChild(inv); invLab.appendChild(document.createTextNode("highlight disagreement"));
           invLab.title = "agreement H3: the least-backed (smallest) cells solid, the agreeing ones faint";
           inv.addEventListener("change", () => send("set"));
-          // colour by agreement: the agreement paint's hexagons on a cool-to-warm
-          // ramp (cool = disagreement) instead of NLCD's colours; the highlight
+          // color by agreement: the agreement paint's hexagons on a cool-to-warm
+          // ramp (cool = disagreement) instead of NLCD's colors; the highlight
           // checkbox reverses the ramp. Coverage still follows agreement.
           let acol = false;
           const acB = document.createElement("button");
-          acB.textContent = "colour by agreement"; acB.style.cssText = btnCss;
-          acB.title = "agreement H3: colour the hexagons by agreement (cool = disagreement, warm = agreement) instead of NLCD's colours; highlight disagreement reverses the ramp";
+          acB.textContent = "color by agreement"; acB.style.cssText = btnCss;
+          acB.title = "agreement H3: color the hexagons by agreement (cool = disagreement, warm = agreement) instead of NLCD's colors; highlight disagreement reverses the ramp";
           const styleAc = () => { onCss(acB, acol); acB.style.opacity = paint === "agreement" ? "1" : ".5"; };
           acB.onclick = () => { acol = !acol; styleAc(); send("set"); };
           const stylePaint = () => { paintBtns.forEach(([k, b]) => onCss(b, k === paint)); styleAc(); };
@@ -1330,7 +1330,7 @@ def _(anywidget, traitlets):
                 // the agreement ramp bar with its end labels
                 const r = document.createElement("span");
                 r.style.cssText = "display:inline-flex;align-items:center;gap:.35rem;font:12px ui-sans-serif,system-ui,sans-serif";
-                r.title = it.cmap + ": colour by agreement";
+                r.title = it.cmap + ": color by agreement";
                 r.innerHTML =
                   '<span style="opacity:.75">' + it.lo + '</span>' +
                   '<span style="display:inline-block;width:9rem;height:10px;border-radius:2px;' +
@@ -1729,7 +1729,7 @@ def _(anywidget, asyncio, traitlets):
               _validate: false,
               beforeId: cfg.labels_slot || "watername_ocean",
             }));
-            // the picked cell: its own colour stays, a gold outline from its boundary
+            // the picked cell: its own color stays, a gold outline from its boundary
             if (cfg.hit && hexIndex.has(cfg.hit)) {
               let ring = null;
               try { ring = cellToBoundary(cfg.hit, true); } catch (e) { ring = null; }
@@ -1849,7 +1849,7 @@ def _(DeckMap, EDGE_THR, HOME, LABELS_SLOT, RASTER_TILE, json):
         "sel": set(), "hit": None, "memo": {}, "h_cam": None, "h_ctl": None, "h_pick": None,
         "dres": 0,  # the strip's res offset; a statement about the box it was set on
         "inv": False,  # reversed alpha: disagreeing cells solid
-        "acol": False,  # colour by agreement (the ramp) instead of NLCD's colours
+        "acol": False,  # color by agreement (the ramp) instead of NLCD's colors
         "labels": True,
         "edges": False, "thr": EDGE_THR,  # the low-agreement boundaries and their threshold
         "edges_sent": None,  # (frame, thr) the widget holds
@@ -1966,7 +1966,7 @@ def _(
         return out
 
     def _paint():
-        """Hand the current frame's cells, colours and coverage to the widget."""
+        """Hand the current frame's cells, colors and coverage to the widget."""
         fr = HOLD["frame"]
         if fr is None:
             return

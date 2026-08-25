@@ -27,7 +27,7 @@ the parked terrain notebook), the MVT decode too; tile-clipped pieces are dissol
 `docs/deforest-divisions-notes.md`.
 
 Since 2026-08-14 the deforestation PAINT is a lonboard RasterLayer serving the COG's own
-pyramid as ramp-coloured PNG tiles (kernel-side fetch/render callbacks; the layer is
+pyramid as ramp-colored PNG tiles (kernel-side fetch/render callbacks; the layer is
 built directly, not via `from_geotiff`, because from_geotiff's fetch is not sparse-aware
 and its zoom clamp ships commented out in 0.16, wrapping overzoom onto coarse overviews).
 The H3 hexagon layer is COMMENTED OUT in the map cell, not deleted; the fold still runs
@@ -184,7 +184,7 @@ to know:
   There is no hover readout for the same reason.
 - **Counties are NOT stroked** (Stephen: "then dont stroke the counties"). Adjacent
   counties from the z8 tiles do not quite meet at deep zoom (~30 m vertex
-  quantisation, 1-3 px hairlines at z10, his "gaps btw counties"); a same-colour 1 px
+  quantisation, 1-3 px hairlines at z10, his "gaps btw counties"); a same-color 1 px
   stroke would hide them and was declined. The other fix, if wanted, is finer county
   geometry (z10 tiles, 16x the fetch), not a stroke.
 - **The window is the HUD's load button** (see the `window` bullet above; the
@@ -506,7 +506,7 @@ duckdb as a backend"). Full recon and numbers in `docs/ftw-cdl-notes.md`.
   TWO CHECKBOXES: **fields** (pixels clipped to inside the FTW fields AND the
   field outlines drawn, in the SAME deck layer: the outline rows are appended
   to the pixel table with fill alpha 0 / line alpha 210, 4-channel
-  `UTINYINT[4]` colours; `stroked` on only while fields is on, so pixels-only
+  `UTINYINT[4]` colors; `stroked` on only while fields is on, so pixels-only
   views pay no path tessellation) and **disagreement** (pixels repainted by
   CDL crop/not-crop x FTW P(field) >= 0.5: agree grey, CDL crop no FTW field
   orange, FTW field on CDL non-crop blue; legend shows the three with acres;
@@ -674,7 +674,7 @@ duckdb as a backend"). Full recon and numbers in `docs/ftw-cdl-notes.md`.
   from each file's row-group stats (the STAC items' bbox is WRONG: US_CA reports
   Montana). `geometry` arrives typed `GEOMETRY('OGC:CRS84')`, which lonboard's
   `from_duckdb` does not recognise: cast `::GEOMETRY`. DuckDB `CASE` cannot
-  return a `UTINYINT[3]` ("Unimplemented type for case expression"): colour
+  return a `UTINYINT[3]` ("Unimplemented type for case expression"): color
   lookups go through a VALUES join.
 - **The join**: ONE `ST_Contains` pass per (frame year, serve level, box) of the
   CDL pixel centres into the polygons -> `lk_n(id, y, x)` on the serve
@@ -682,12 +682,12 @@ duckdb as a backend"). Full recon and numbers in `docs/ftw-cdl-notes.md`.
   same join + `row_number()` majority + purity into `cur`, disagreement bins the
   centres into the 40 m / 160 m FTW grid by index arithmetic. A built box that
   CONTAINS the new one serves it. Measured: fields 2.8 s, pixels 0.7 s, join
-  0.1 s. DuckDB `CASE` cannot return a `UTINYINT[N]`: colours go through a
+  0.1 s. DuckDB `CASE` cannot return a `UTINYINT[N]`: colors go through a
   VALUES join.
 
 `archive/xsql-aef-nlcd-agreement.py` (ARCHIVED 2026-08-24 late, Stephen: "put the
 other nlcd notebooks in archive"; the deck notebook below is the live one. Built
-2026-08-24, headless + playwright-passed, not flown by him) is Annual NLCD 2024 coloured as it is, with each hexagon's ALPHA
+2026-08-24, headless + playwright-passed, not flown by him) is Annual NLCD 2024 colored as it is, with each hexagon's ALPHA
 and COVERAGE (the hexagon scaled about its centre) set by how well the AlphaEarth
 Foundations embedding backs NLCD's word there. One box (Folsom Lake / Auburn
 foothills), one year, no camera fold (the conus-counties one-shot chassis with a
@@ -717,7 +717,7 @@ zoomable map); runs from the root. Full record in `docs/aef-nlcd-notes.md`.
   on a PolygonLayer, `pickable=True` (Stephen: "we can't just rely on the
   legend"): the feature panel shows class name, agreement, "looks more like",
   NLCD purity, homogeneity. NLCD's own colormap kept (Stephen: "color the way it
-  is") on CartoStyle.DarkMatter WITH labels (his call: faint colours read better
+  is") on CartoStyle.DarkMatter WITH labels (his call: faint colors read better
   on dark). SQL cells under the map: per-class table, the confusion PIVOT
   (below-0.5 cells x runner-up class), closest prototype pairs, the 25
   least-backed cells. DuckDB here is ONLY the marimo SQL engine for those tables
@@ -729,7 +729,7 @@ zoomable map); runs from the root. Full record in `docs/aef-nlcd-notes.md`.
   element re-parented into the fullscreen element and back (so the strip under
   the map and the fullscreen bar are the same element with the same state),
   killOld of stale strips, bbox-toolbar hiding. Here: paint buttons
-  (`agreement` = fade + coverage; `NLCD` = regular hexagons, flat colours, a
+  (`agreement` = fade + coverage; `NLCD` = regular hexagons, flat colors, a
   second full-size hexagon table swapped in; `AlphaEarth` = the embedding on
   its own, spherical k-means `K_CLUSTERS` 10 in numpy on an Okabe-Ito palette,
   legend chips = clusters with their NLCD make-up, Stephen's "third tier"), a
@@ -868,10 +868,10 @@ dropped). Numbers and design in `docs/aef-nlcd-notes.md`.
   box (the mapterhorn rule; kernel echoes it via a `dres` trait). Leaving the
   box (pan off, zoom out) refolds on its own. Driven: all four paths. VIEW_W/H
   is still the 1400x720 guess (the HFP ruler is not ported). Prototypes and
-  k-means are PER VIEW: cluster colours change between folds. On molab the
+  k-means are PER VIEW: cluster colors change between folds. On molab the
   AEF read is fast (2 files 3.5 s) but the FRAME build measured 5.6 s against
   0.1-0.5 s at home; the status now sub-times it (join/score/kmeans/table/
-  hex/colours) to find the slow piece there.
+  hex/colors) to find the slow piece there.
 
 `xsql-aef-nlcd-deck.py` (2026-08-24, late; FLOWN BY STEPHEN: "seems fine now. this
 is unusual but very intriguing"; pushed; the two lonboard AEF notebooks went to
@@ -920,14 +920,14 @@ frame-output changed. Runs from the root. Things to know:
   "cell coverage needs work for these two. what about a separate h3 hexagon
   layer for those two").** `hexes-flat`: NLCD H3 and clusters H3 on the STOCK
   `H3HexagonLayer` with `highPrecision: true` (every cell's own boundary,
-  tessellated in the browser; no shared mesh, no drift, no overfill; colours
+  tessellated in the browser; no shared mesh, no drift, no overfill; colors
   through a `getFillColor` accessor over the rgba array, `updateTriggers` on
   the data object). `hexes`: agreement on the coverage column. `config.flat`
   picks; both pickable; the gold ring reads either id. Seamless in a DPR-2
   drive at res 8 across the whole view.
 - **Pick = a GOLD OUTLINE** (`#ffc828`, 3 px PathLayer from h3-js
-  `cellToBoundary` of the hit, `config.hit`), the cell's own colour kept
-  (the white recolour is gone from `fill()`'s use). Stephen: "gold or
+  `cellToBoundary` of the hit, `config.hit`), the cell's own color kept
+  (the white recolor is gone from `fill()`'s use). Stephen: "gold or
   something noticeable instead of just white".
 - **COPY BYTES TRAITS THE MOMENT THEY CHANGE.** Reading a Bytes trait from a
   0 ms timer after its `change:` event found nothing (the event handler saw
@@ -999,7 +999,7 @@ frame-output changed. Runs from the root. Things to know:
   low cells with a dense index; (2) their H3 neighbour EDGES from
   `h3_grid_ring_unsafe(cell, 1)` joined back; (3) connected components in
   NUMPY (`label_components`: min-label hooking + pointer jumping; 73k cells
-  0.15 s); (4) ONE GROUP BY blob: `mode(cls)` (the ring's colour), count,
+  0.15 s); (4) ONE GROUP BY blob: `mode(cls)` (the ring's color), count,
   `sum(h3_cell_area)` km², `h3_cells_to_multi_polygon_wkb(list(cell))`,
   `HAVING count(*) >= EDGE_MIN_CELLS` (7); (5) `ST_Dump` -> `ST_Boundary` ->
   `ST_Dump` so every outer ring AND hole is one closed LineString. Measured at
@@ -1014,7 +1014,7 @@ frame-output changed. Runs from the root. Things to know:
   `geoarrow.rust.core.from_wkb` to `linestring("xy", coord_type=
   "interleaved")` -> arro3 Table (pyarrow's `pa.table({...})` DROPS the
   extension metadata, measured; arro3 keeps it) with `color` (rgba
-  `FixedSizeList<uint8>[4]`: the majority class's NLCD colour at
+  `FixedSizeList<uint8>[4]`: the majority class's NLCD color at
   `EDGE_ALPHA` 235), `cls`, `km2` -> one IPC stream in the `edges` Bytes trait
   (129 KB for 146 rings) -> `arrow.tableFromIPC` in the widget ->
   `GeoArrowPathLayer` from `@geoarrow/deck.gl-layers@0.3.2` with `getColor:
@@ -1054,8 +1054,8 @@ frame-output changed. Runs from the root. Things to know:
   paint the hexagons take `AGREE_CMAP` (viridis; cividis is the swap-in, both
   32-stop tables embedded as hex in `RAMPS`, interpolated to a 256 LUT in the
   frame cell, no matplotlib import) on the agreement value instead of NLCD's
-  colour, alpha flat at `ALPHA_RAMP` 225, coverage scaling unchanged (size and
-  colour say the same thing); unscored cells grey. Cool = disagreement, warm =
+  color, alpha flat at `ALPHA_RAMP` 225, coverage scaling unchanged (size and
+  color say the same thing); unscored cells grey. Cool = disagreement, warm =
   agreement; `highlight disagreement` REVERSES the ramp (warm = disagreement).
   viridis because it has no red anywhere: the warm end is yellow, so neither
   direction of the flip lands on Stephen's weak leg. The legend gets a
@@ -1124,15 +1124,15 @@ the fold is xarray-sql + the h3 UDF, `avg(elev)` per cell. Things to know:
   the matplotlib `_r` twin and DEFAULTS ON, RELATIVE COLORS (panel button) respends
   the ramp on the p2-p98 of the ground in view with the legend following each
   serve, and repaints are generation-counted (`RAMP["gen"]`) so stale cached tables
-  recolour lazily on serve. Any ramp change (flip, mode, cmap pick) repaints
-  through the ORDINARY SERVE PATH (recolour + `put_cells`), with the kernel-side
+  recolor lazily on serve. Any ramp change (flip, mode, cmap pick) repaints
+  through the ORDINARY SERVE PATH (recolor + `put_cells`), with the kernel-side
   cost printed as `repaint N ms` in the status line.
 - **The "reverse cmap is slow / doesn't stick" defect had a found root cause**
   (2026-08-13): a stale static copy of the legend HTML was rebuilt late in the map
   cell and SHADOWED the HtmlLine legend widget, so `legend.value = ...` in the
   observer hit a plain str and raised AttributeError inside a comm handler, where
   exceptions are silent; the button died before its repaint line and the map only
-  caught up on the next fold. Both the shadow and the bespoke colours-only repaint
+  caught up on the next fold. Both the shadow and the bespoke colors-only repaint
   path are deleted. A SECOND layer surfaced on the first flight after that fix
   ("TypeError: arro3.core._core.ChunkedArray is not a sequence"): `recolor()` had
   never actually run, because it fed arro3 ChunkedArray columns into pyarrow's
@@ -1271,7 +1271,7 @@ to the sparse-tile check, the Mollweide pair or the fold SQL carry across by han
 `archive/xsql-canopy-3d.py` draws Meta & WRI's High Resolution Canopy Height Maps (~1 m, uint8
 metres, CC-BY 4.0, `s3://dataforgood-fb-data/forests/v1/alsgedi_global_v6_float/`) as
 an extruded H3HexagonLayer: column height IS mean canopy metres times a stated 3x
-exaggeration, colour (matplotlib Greens) repeats it. One dataset, one encoding; it is
+exaggeration, color (matplotlib Greens) repeats it. One dataset, one encoding; it is
 the survivor of two parked pairings (see archive). Opens pitched over Prairie Creek
 Redwoods. Things to know before touching it:
 
@@ -1299,7 +1299,7 @@ Redwoods. Things to know before touching it:
 `archive/xsql-flood-buildings.py` (EXPERIMENTAL, working but with open defects, see below)
 draws FEMA NFHL flood zones from Carl Boettiger's PMTiles build and joins them onto
 Overture divisions zoomed out (share of each county/locality inside the 1% floodplain)
-and onto individual building footprints past zoom 13 (each coloured by the worst zone
+and onto individual building footprints past zoom 13 (each colored by the worst zone
 its cells touch). One-line pitch: the fire-risk buildings notebook's question asked of
 water instead of fire, with the raster replaced by vector polygons. Things to know:
 
@@ -1492,7 +1492,7 @@ always worked, because it is what already draws the place labels.
 **Fill is an alpha, not a flag.** `filled` decides whether deck builds a fill sublayer at
 all, and flipping it after init does not reliably make one appear. That is the real "the
 fill button does nothing" bug, and re-pushing the table does not fix it either. Keep the
-layer permanently `filled=True` and switch `get_fill_color` between the class colours and
+layer permanently `filled=True` and switch `get_fill_color` between the class colors and
 a transparent constant.
 
 ## Parked experiment (read before rebuilding it)
@@ -1595,7 +1595,7 @@ uv run python archive/tools/patch_lonboard_surface.py   # re-run after ANY insta
 Without it the textured mesh comes back covered in pale quadrilateral facets. lonboard's
 `SurfaceLayer` sends no `NORMAL`, and deck's `SimpleMeshLayer` responds to that with
 `flatShading: !hasNormals` rather than by skipping lighting: one derived normal per
-triangle, lit by the default material. On a colour ramp it passes for texture; on a NAIP
+triangle, lit by the default material. On a color ramp it passes for texture; on a NAIP
 photograph it is a herringbone of translucent facets over the imagery, and **no notebook
 parameter can reach it**. The script injects `material: false` into the shipped JS bundle,
 so `uv sync`, a lonboard upgrade and `--sandbox` all revert it. Hard-reload the browser
